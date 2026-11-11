@@ -3998,33 +3998,56 @@ needs_simt_int8 = pytest.mark.skipif(
 )
 
 
+# Both sides accumulate the quantized int8 products exactly, so what is left is the
+# scale/bias writeback and the cast to out_dtype: a few ULP of the largest output.
+# The reference keeps a float64 intermediate, while the epilogue multiplies by the
+# two scales in float32 and adds the bias afterwards, hence ~2 ULP for fp32. The
+# measured worst cases are 8e-8, 4e-4 and 3e-3 (half a bf16 ULP) of the largest
+# output, i.e. correctly rounded; a dropped K block moves the sum by ~10% of it.
+_SIMT_OUT_TOL = {
+    torch.float32: 1e-6,
+    torch.float16: 1e-3,
+    torch.bfloat16: 1e-2,
+}
+
+
 @pytest.mark.parametrize(("m", "n", "k"), [*GEMM_SHAPES, (257, 137, 1024)])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("bias", [False, True])
 @pytest.mark.parametrize("per_channel", [False, True])
 @needs_simt_int8
-def test_int8_linear_simt_matches_int32_reference(m, n, k, per_channel):
+def test_int8_linear_simt_matches_int32_reference(m, n, k, out_dtype, bias, per_channel):
     """The SIMT tile kernel must agree with the exact int32 product.
 
     The activation is quantized by the same kernel the linear uses, so this
     covers the GEMM and the epilogue only; a second quantizer would add its own
     rounding. The eager backend is not a usable reference here: it needs
     torch._int_mm, which hipBLASLt does not implement on RDNA2.
+
+    m of 1 and 8 take the small-M GEMV, which is the other RDNA2 path.
     """
     torch.manual_seed(0)
     x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
     w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
     wq, ws = ck.quantize_int8_rowwise(w)
     ws = ws.reshape(-1) if per_channel else ws.reshape(-1)[:1]
-    bias = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    bias_t = torch.randn(n, device=DEV, dtype=torch.bfloat16) if bias else None
 
     xq, xs = ck.quantize_int8_rowwise(x)
-    ref = (xq.float() @ wq.float().t()) * xs.reshape(-1)[:, None] * ws.float()[None, :]
-    ref += bias.float()
+    # Products of two int8 are exact in float64, and so is their sum over K (K * 127^2
+    # stays under 2^53), so this is the true int32 product rather than a float32
+    # matmul that would round the wide partial sums.
+    ref = xq.double() @ wq.double().t()
+    ref = ref * xs.double().reshape(-1)[:, None] * ws.double()[None, :]
+    if bias:
+        ref += bias_t.double()
 
     with ck.use_backend("hip"):
-        out = ck.int8_linear(x, wq, ws, bias, torch.bfloat16)
+        out = ck.int8_linear(x, wq, ws, bias_t, out_dtype)
 
     assert out.shape == (m, n)
-    # Integer accumulators on both sides; only the bf16 writeback rounds here,
-    # which is at most half a bf16 step of the largest output.
+    assert out.dtype == out_dtype
     scale = max(ref.abs().max().item(), 1e-6)
-    assert (out.float() - ref).abs().max().item() < 1e-2 * scale
+    err = (out.double() - ref).abs().max().item()
+    tol = _SIMT_OUT_TOL[out_dtype] * scale
+    assert err <= tol, f"max abs err {err:.3e}, allowed {tol:.3e}"
