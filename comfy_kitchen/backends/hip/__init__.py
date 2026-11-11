@@ -973,7 +973,11 @@ def int8_linear(
         q_rows = (m + 127) // 128 * 128 if tiled else m
         q = torch.empty((q_rows, k), dtype=torch.int8, device=x.device)
         x_scale = torch.empty((m,), dtype=torch.float32, device=x.device)
-        _C.quantize_int8_rowwise(_dl(x2d), _dl(q), _dl(x_scale), m, k, _stream(x), tiled)
+        # The extension resolves the INT8 schedule from the current HIP device, not
+        # from the stream, so hold the operand's device across the quantizer and the
+        # GEMM behind it.
+        with torch.cuda.device(x.device):
+            _C.quantize_int8_rowwise(_dl(x2d), _dl(q), _dl(x_scale), m, k, _stream(x), tiled)
 
     x_scale = x_scale.reshape(-1).contiguous()
     if bias is not None:
@@ -981,12 +985,13 @@ def int8_linear(
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
-    gemm(
-        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
-        0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias), m, n, k,
-        DTYPE_TO_CODE[out_dtype], _stream(x),
-    )
+    with torch.cuda.device(x.device):
+        gemm(
+            _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
+            0 if weight_scale.numel() == 1 else 1,
+            None if bias is None else _dl(bias), m, n, k,
+            DTYPE_TO_CODE[out_dtype], _stream(x),
+        )
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
     # pre-norm blocks apply it to.
@@ -1103,12 +1108,13 @@ def int8_linear_modulated(
     )
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
-    gemm(
-        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
-        0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
-    )
+    with torch.cuda.device(x.device):
+        gemm(
+            _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
+            0 if weight_scale.numel() == 1 else 1,
+            None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
@@ -1180,12 +1186,13 @@ def int8_linear_rms_modulated(
     )
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
-    gemm(
-        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
-        0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
-    )
+    with torch.cuda.device(x.device):
+        gemm(
+            _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
+            0 if weight_scale.numel() == 1 else 1,
+            None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
