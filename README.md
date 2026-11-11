@@ -50,6 +50,12 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `connected_components`      |       | ✓    |        | ✓   |     |
 | `edge_collapse_checks`      |       | ✓    |        | ✓   |     |
 | `min_cut`                   |       | ✓    |        | ✓   |     |
+| `shortest_paths`            |       | ✓    |        |     |     |
+| `shortest_paths_sparse`     |       | ✓    |        |     |     |
+| `bellman_ford`              |       | ✓    |        |     |     |
+| `trace_paths`               |       | ✓    |        |     |     |
+| `walk_successors`           |       | ✓    |        |     |     |
+| `conjugate_gradient`        |       | ✓    |        |     |     |
 
 Each of the eight rope entries also has an in-place form (`apply_rope_`,
 `rms_rope_split_half1_`, ...) with the same backend coverage as the row above.

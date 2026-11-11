@@ -38,7 +38,7 @@ constexpr int kWarps = kThreads / 32;
 constexpr int kMaxCols = 2;
 
 struct Solve {
-    int n, k, nnz;
+    int n, k;
     const int* indptr;
     const int* cols;
     const double* vals;
@@ -152,12 +152,12 @@ using namespace comfy::conjugate_gradient;
 extern "C" {
 
 // x: start in, solution out. work: (3 * n * k + 4 * kMaxCols * SMs) scratch.
-void launch_conjugate_gradient(int n, int k, int nnz, const void* indptr, const void* cols, const void* vals,
-                               const void* b, void* x, void* work, int max_iters, double tol, cudaStream_t stream) {
+void launch_conjugate_gradient(int n, int k, const void* indptr, const void* cols, const void* vals, const void* b,
+                               void* x, void* work, int max_iters, double tol, cudaStream_t stream) {
     if (n <= 0) return;
     const long long nk = static_cast<long long>(n) * k;
     double* r = static_cast<double*>(work);
-    Solve s{n, k, nnz, static_cast<const int*>(indptr), static_cast<const int*>(cols), static_cast<const double*>(vals),
+    Solve s{n, k, static_cast<const int*>(indptr), static_cast<const int*>(cols), static_cast<const double*>(vals),
             static_cast<const double*>(b), static_cast<double*>(x), r, r + nk, r + 2 * nk, r + 3 * nk, max_iters,
             tol * tol};
     comfy::launch_cooperative(cg_kernel, std::min(comfy::sm_count(), (n + kThreads - 1) / kThreads), kThreads, s, stream);

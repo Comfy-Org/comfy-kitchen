@@ -47,7 +47,7 @@ struct Sweep {
     double* dist;  // (2, n) Jacobi buffers
     int* parent;
     int* jump;     // (2, n) pointer-jumping buffers
-    int* flags;    // (6,) 3 dropped flags, cycle found, bad index, buffer holding the result
+    int* flags;    // (5,) 2 dropped flags, cycle found, bad index, buffer holding the result
     uint8_t* on_cycle;
     int max_iters, steps;
 };
@@ -59,16 +59,17 @@ __global__ void sweep_kernel(Sweep s) {
     const cg::thread_block_tile<kLanes> tile = cg::tiled_partition<kLanes>(cg::this_thread_block());
     const int lane = tile.thread_rank();
     for (int h = tid; h <= s.n; h += stride)
-        if (s.indptr[h] < 0 || s.indptr[h] > s.E) s.flags[4] = 1;
+        if (s.indptr[h] < 0 || s.indptr[h] > s.E) s.flags[3] = 1;
     for (int a = tid; a < s.E; a += stride)
-        if (s.tail[a] < 0 || s.tail[a] >= s.n) s.flags[4] = 1;
+        if (s.tail[a] < 0 || s.tail[a] >= s.n) s.flags[3] = 1;
     grid.sync();
-    if (__ldcg(s.flags + 4)) return;
-    int it = 0;
-    for (; it < s.max_iters; ++it) {
+    if (__ldcg(s.flags + 3)) return;
+    int it = 0;                                               // sweeps done
+    while (it < s.max_iters) {
         const double* cur = s.dist + (it & 1) * s.n;
-        double* next = s.dist + ((it + 1) & 1) * s.n;
-        if (tid == 0) s.flags[(it + 1) % 3] = 0;
+        double* next = s.dist + (~it & 1) * s.n;
+        int* dropped = s.flags + (it & 1);
+        if (tid == 0) s.flags[~it & 1] = 0;
         for (int h = tid / kLanes; h < s.n; h += stride / kLanes) {
             const double d = __ldcg(cur + h);
             const int a0 = s.indptr[h], a1 = s.indptr[h + 1];
@@ -82,14 +83,15 @@ __global__ void sweep_kernel(Sweep s) {
                 arc = cg::reduce(tile, arc, cg::greater<int>());
                 if (lane == 0) {
                     s.parent[h] = arc;
-                    s.flags[it % 3] = 1;
+                    *dropped = 1;
                 }
             }
             if (lane == 0) next[h] = best;
         }
         grid.sync();
-        if ((it + 1) % kCheck && it + 1 < s.max_iters) continue;
-        if (!__ldcg(s.flags + it % 3)) break;
+        ++it;
+        if (it % kCheck && it < s.max_iters) continue;
+        if (!__ldcg(dropped)) break;
         for (int v = tid; v < s.n; v += stride) {
             const int p = __ldcg(s.parent + v);
             s.jump[v] = p >= 0 ? s.tail[p] : v;
@@ -105,14 +107,14 @@ __global__ void sweep_kernel(Sweep s) {
         for (int v = tid; v < s.n; v += stride) {
             const int r = __ldcg(root + v);
             if (__ldcg(s.parent + r) >= 0) {
-                s.flags[3] = 1;
+                s.flags[2] = 1;
                 s.on_cycle[r] = 1;
             }
         }
         grid.sync();
-        if (__ldcg(s.flags + 3)) break;
+        if (__ldcg(s.flags + 2)) break;
     }
-    if (tid == 0) s.flags[5] = it < s.max_iters ? (it + 1) & 1 : it & 1;    // the buffer the last sweep wrote
+    if (tid == 0) s.flags[4] = it & 1;                        // the buffer the last sweep wrote
 }
 
 }  // namespace bellman_ford
@@ -122,8 +124,8 @@ using namespace comfy::bellman_ford;
 
 extern "C" {
 
-// dist (2, n): start distances in the first row; the result is in row flags[5]. parent -1, flags and on_cycle 0 on entry.
-// Sets flags[4] and does nothing on an out-of-range index.
+// dist (2, n): start distances in the first row; the result is in row flags[4]. parent -1, flags and on_cycle 0 on entry.
+// Sets flags[3] and does nothing on an out-of-range index.
 void launch_bellman_ford(int n, int E, const void* indptr, const void* tail, const void* w, void* dist, void* parent,
                          void* jump, void* flags, void* on_cycle, int max_iters, cudaStream_t stream) {
     if (n <= 0 || max_iters <= 0) return;

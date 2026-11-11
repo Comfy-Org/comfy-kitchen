@@ -405,8 +405,8 @@ extern "C" {
                             cudaStream_t stream);
     void launch_walk_successors(int R, int N, const void* succ, const void* stop, const void* active, const void* twin,
                                 const void* starts, void* seen, void* lengths, void* out, int L, cudaStream_t stream);
-    void launch_conjugate_gradient(int n, int k, int nnz, const void* indptr, const void* cols, const void* vals,
-                                   const void* b, void* x, void* work, int max_iters, double tol, cudaStream_t stream);
+    void launch_conjugate_gradient(int n, int k, const void* indptr, const void* cols, const void* vals, const void* b,
+                                   void* x, void* work, int max_iters, double tol, cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -2010,9 +2010,9 @@ void walk_successors(int R, int N, cuda_array succ, cuda_array stop, cuda_array 
                            lengths.data(), data_or_null(out), L, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
-void conjugate_gradient(int n, int k, int nnz, cuda_array indptr, cuda_array cols, cuda_array vals, cuda_array b,
+void conjugate_gradient(int n, int k, cuda_array indptr, cuda_array cols, cuda_array vals, cuda_array b,
                         cuda_array x, cuda_array work, int max_iters, double tol, uintptr_t stream_ptr) {
-    launch_conjugate_gradient(n, k, nnz, indptr.data(), cols.data(), vals.data(), b.data(), x.data(), work.data(),
+    launch_conjugate_gradient(n, k, indptr.data(), cols.data(), vals.data(), b.data(), x.data(), work.data(),
                               max_iters, tol, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
@@ -5539,7 +5539,7 @@ NB_MODULE(_C, m) {
           nb::arg("succ"), nb::arg("stop"), nb::arg("active"), nb::arg("twin"), nb::arg("starts"), nb::arg("seen"),
           nb::arg("lengths"), nb::arg("out").none(), nb::arg("L"), nb::arg("stream_ptr"));
     m.def("conjugate_gradient", &conjugate_gradient, "Conjugate gradients on a CSR matrix, in place", nb::arg("n"),
-          nb::arg("k"), nb::arg("nnz"), nb::arg("indptr"), nb::arg("cols"), nb::arg("vals"), nb::arg("b"), nb::arg("x"),
+          nb::arg("k"), nb::arg("indptr"), nb::arg("cols"), nb::arg("vals"), nb::arg("b"), nb::arg("x"),
           nb::arg("work"), nb::arg("max_iters"), nb::arg("tol"), nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)

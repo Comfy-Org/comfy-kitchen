@@ -3763,12 +3763,12 @@ def bellman_ford(indptr: torch.Tensor, tail: torch.Tensor, weight: torch.Tensor,
     on_cycle = torch.zeros(n, dtype=torch.bool, device=device)
     work = dist.repeat(2, 1)                                    # Jacobi buffers
     jump = torch.empty(2 * n, dtype=torch.int32, device=device)
-    flags = torch.zeros(6, dtype=torch.int32, device=device)
+    flags = torch.zeros(5, dtype=torch.int32, device=device)
     w = _wrap_for_dlpack
     _C.bellman_ford(n, tail.shape[0], w(indptr.to(torch.int32).contiguous()), w(tail.to(torch.int32).contiguous()),
                     w(weight.contiguous()), w(work), w(parent), w(jump), w(flags), w(on_cycle.view(torch.uint8)),
                     max_iters, torch.cuda.current_stream(device).cuda_stream)
-    bad, result = flags[4:].tolist()
+    bad, result = flags[3:].tolist()
     if bad:
         raise ValueError("bellman_ford: indptr or tail holds an index out of range")
     dist.copy_(work[result])
@@ -3845,7 +3845,7 @@ def conjugate_gradient(indptr: torch.Tensor, cols: torch.Tensor, vals: torch.Ten
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     work = torch.empty(3 * x.numel() + 8 * sms, dtype=torch.float64, device=device)     # r, p, A p, 2 x block partials
     w = _wrap_for_dlpack
-    _C.conjugate_gradient(n, k, cols.shape[0], w(indptr.to(torch.int32).contiguous()), w(cols.to(torch.int32).contiguous()),
+    _C.conjugate_gradient(n, k, w(indptr.to(torch.int32).contiguous()), w(cols.to(torch.int32).contiguous()),
                           w(vals.contiguous()), w(b.contiguous()), w(x), w(work), max_iters, float(tol),
                           torch.cuda.current_stream(device).cuda_stream)
 

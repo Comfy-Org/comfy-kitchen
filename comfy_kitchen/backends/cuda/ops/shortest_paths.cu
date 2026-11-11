@@ -128,7 +128,7 @@ __device__ void visit(const Search& s, int item, int lane, const Step& out) {
     const int r = static_cast<int>(key / s.N);
     const int v = static_cast<int>(key - static_cast<long long>(r) * s.N);
     const double d = __ldcg(s.dist + item);
-    if (d > __ldcg(s.bound + r) || (s.reach && d > s.reach[r])) return;
+    if (d > __ldcg(s.bound + r)) return;
     const long long e = s.end ? s.end[r] : -1;
     const long long cl = s.closer ? s.closer[r] : -1;
     const int a0 = s.indptr[v], a1 = s.indptr[v + 1];
