@@ -1119,12 +1119,14 @@ class TestBandedStreamK:
 @pytest.mark.parametrize("rows", [8, 9, 4352])
 @pytest.mark.parametrize("offset", [0, 1])
 def test_convrot_bf16_fast_path_matches_existing_kernel(rows, offset):
-    # The 64-lane implementation independently evaluates the same ordered FP32
-    # recipe. Offset exercises the unaligned fallback; rows 8/9 cross dispatch.
+    # Force the reference through the original 64-lane recipe using unaligned
+    # storage. Offset exercises the fallback; rows 8/9 cross fast dispatch.
     torch.manual_seed(8713)
     storage = torch.randn(rows * 4096 + offset, device="cuda", dtype=torch.bfloat16)
     x = storage[offset:].view(rows, 4096)
     q, scale = cuda.quantize_int8_rowwise_convrot(x, 256)
-    expected_q, expected_scale = cuda.quantize_int8_rowwise_convrot64(x, 256)
+    reference = torch.empty(x.numel() + 1, device=x.device, dtype=x.dtype)[1:].view_as(x)
+    reference.copy_(x)
+    expected_q, expected_scale = cuda.quantize_int8_rowwise_convrot64(reference, 256)
     assert torch.equal(q, expected_q)
     assert torch.equal(scale.view(torch.int32), expected_scale.view(torch.int32))
