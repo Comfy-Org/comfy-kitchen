@@ -3014,11 +3014,12 @@ def _topk_threshold(q, k, topk_ratio, scale, lengths, valid, sinks):
 _ROPE_FAB_CACHE = {}
 
 
-def _packed_rope_fab(freqs, t, rot):
+def _packed_rope_fab(freqs, t, rot, split_half=True):
     """[..., T, 1, rot/2, 2, 2] -> [T, rot, 2] per-channel (self, partner)
-    coefficients. Cached per freqs tensor (H3 reuses one across a step's
+    coefficients, pair i on channels (i, i + rot/2) or interleaved on
+    (2i, 2i + 1). Cached per freqs tensor (H3 reuses one across a step's
     layers); the weak ref validates an id() hit without retaining freqs."""
-    key = (id(freqs), t, rot)
+    key = (id(freqs), t, rot, split_half)
     hit = _ROPE_FAB_CACHE.get(key)
     if hit is not None and hit[0]() is freqs:
         return hit[1]
@@ -3027,10 +3028,12 @@ def _packed_rope_fab(freqs, t, rot):
         raise ValueError(f"sol_attn: rope_freqs covers {f.shape[0]} tokens, T={t}")
     with allocation_context():
         fab = torch.empty(t, rot, 2, device=freqs.device, dtype=torch.float32)
-    fab[:, :rot // 2, 0] = f[:, :, 0, 0]
-    fab[:, :rot // 2, 1] = f[:, :, 0, 1]
-    fab[:, rot // 2:, 0] = f[:, :, 1, 1]
-    fab[:, rot // 2:, 1] = f[:, :, 1, 0]
+    first, second = ((slice(0, rot // 2), slice(rot // 2, rot)) if split_half
+                     else (slice(0, rot, 2), slice(1, rot, 2)))
+    fab[:, first, 0] = f[:, :, 0, 0]
+    fab[:, first, 1] = f[:, :, 0, 1]
+    fab[:, second, 0] = f[:, :, 1, 1]
+    fab[:, second, 1] = f[:, :, 1, 0]
     _ROPE_FAB_CACHE.clear()   # one live entry
     _ROPE_FAB_CACHE[key] = (weakref.ref(freqs), fab)
     return fab
@@ -3165,21 +3168,25 @@ def sol_attn_chunked(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    rope_split_half: bool = True,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
-    bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
+    bf16 or fp16, 64-aligned starts, B=1); full Q/K/V are never materialised.
     ``tail`` / ``block_len`` / ``coarse_gate`` / ``token_aug`` as in ``sol_attn``.
 
     ``qkv_chunks``: an iterable of chunks or a zero-arg callable returning one.
     ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when None the
     producer runs twice (measure, then quantize), so pass a callable to stream
-    on the first call. Returns ``(out[1,T,H,128] bf16, kmean_next, vscale_next)``."""
+    on the first call. ``rope_split_half``: q and k rotate in the pairs
+    (i, i + rot/2) of ``rms_rope_split_half``, or when False in the interleaved
+    pairs (2i, 2i + 1) of ``rms_rope``. Returns ``(out[1,T,H,128] in the chunks'
+    dtype, kmean_next, vscale_next)``."""
     d = _SOL_HD
     rot = rope_freqs.shape[-3] * 2
     # the fused rope pairs channels across lanes of 4: rot/2 must be lane-aligned
     if rot % 8 or not 0 < rot <= d:
         raise ValueError(f"sol_attn_chunked: rot_dim must be a multiple of 8 in (0, {d}], got {rot}")
-    fab = _packed_rope_fab(rope_freqs, t, rot)
+    fab = _packed_rope_fab(rope_freqs, t, rot, bool(rope_split_half))
     dev = fab.device
     _check_sol_args(dev, sink_blocks, sink_q, topk_ratio)
     if scale is None:
@@ -3198,8 +3205,10 @@ def sol_attn_chunked(
     ws = torch.empty(p["total"], dtype=torch.uint8, device=dev)
     stream = torch.cuda.current_stream(dev).cuda_stream
     width = 3 * h * d
+    dtype = torch.bfloat16
 
     def produce(km, vsc):
+        nonlocal dtype
         _C.sol_producer_begin(_wrap_for_dlpack(ws), 1, t, h, stream, token_aug=int(token_aug))
         t0 = 0
         for chunk in (factory() if factory is not None else qkv_chunks):
@@ -3207,17 +3216,19 @@ def sol_attn_chunked(
             if t0 % 64 and m:
                 raise ValueError("sol_attn_chunked: chunk starts must be 64-aligned")
             # bare pointers below: a wrong width reads OOB, a host tensor poisons the context
-            if chunk.shape[-1] != width or chunk.dtype != torch.bfloat16 or chunk.device != dev:
+            if (chunk.shape[-1] != width or chunk.dtype not in (torch.bfloat16, torch.float16)
+                    or chunk.device != dev):
                 raise ValueError(
-                    f"sol_attn_chunked: chunks must be [M, {width}] bfloat16 on {dev}, "
+                    f"sol_attn_chunked: chunks must be [M, {width}] bfloat16 or float16 on {dev}, "
                     f"got {tuple(chunk.shape)} {chunk.dtype} on {chunk.device}")
+            dtype = chunk.dtype
             _C.sol_producer_chunk(
-                _wrap_for_dlpack(ws), _wrap_for_dlpack(chunk.contiguous()),
+                _wrap_for_dlpack(ws), _wrap_for_dlpack(chunk.to(torch.bfloat16).contiguous()),
                 _wrap_for_dlpack(fab), _wrap_for_dlpack(qw), _wrap_for_dlpack(kw),
                 _wrap_for_dlpack(km), _wrap_for_dlpack(vsc),
                 float(rope_eps), rot, t0, m, 1, t, h, stream,
                 block_len=None if block_len is None else _wrap_for_dlpack(block_len),
-                token_aug=int(token_aug))
+                token_aug=int(token_aug), split_half=bool(rope_split_half))
             t0 += m
         if t0 != t:
             raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")
@@ -3250,7 +3261,8 @@ def sol_attn_chunked(
         block_len=None if block_len is None else _wrap_for_dlpack(block_len), tail=bool(tail), token_aug=int(token_aug))
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale), coarse_gate)
-    return out, kmean_next, vscale_of(vamax)
+    ws = None   # released before a converted copy of out exists
+    return out.to(dtype), kmean_next, vscale_of(vamax)
 
 
 def _perm_d_index(device):

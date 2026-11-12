@@ -282,7 +282,7 @@ extern "C" {
     void sol_producer_chunk(
         void* workspace, const void* qkv, const void* fab,
         const void* qw, const void* kw, const void* kmean, const void* vscale,
-        const void* blen, float rope_eps, int rot_dim, int t0, int M,
+        const void* blen, float rope_eps, int rot_dim, bool split_half, int t0, int M,
         int batch, int seq_len, int num_heads, int n_tok, cudaStream_t stream);
     void launch_sol_attn_core(
         void* workspace, void* out, const void* vscale, void* kmean_next, void* vamax_out,
@@ -1741,7 +1741,8 @@ void sol_producer_chunk_py(
     float rope_eps, int64_t rot_dim, int64_t t0, int64_t m,
     int64_t batch, int64_t seq_len, int64_t num_heads,
     uintptr_t stream_ptr,
-    std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt, int64_t token_aug = 0) {
+    std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt, int64_t token_aug = 0,
+    bool split_half = true) {
     if (batch != 1)
         throw std::runtime_error("sol_producer_chunk: the producer path is B=1 only");
     if (rot_dim <= 0 || rot_dim > 128 || rot_dim % 8)
@@ -1759,7 +1760,7 @@ void sol_producer_chunk_py(
     sol_producer_chunk(workspace.data(), qkv.data(), fab.data(), qw.data(),
                        kw.data(), kmean.data(), vscale.data(),
                        block_len ? block_len->data() : nullptr,
-                       rope_eps, (int)rot_dim, (int)t0, (int)m,
+                       rope_eps, (int)rot_dim, split_half, (int)t0, (int)m,
                        (int)batch, (int)seq_len, (int)num_heads, (int)token_aug,
                        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
@@ -5327,7 +5328,8 @@ NB_MODULE(_C, m) {
           nb::arg("kw"), nb::arg("kmean"), nb::arg("vscale"),
           nb::arg("rope_eps"), nb::arg("rot_dim"), nb::arg("t0"), nb::arg("m"),
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(), nb::arg("token_aug") = 0);
+          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(), nb::arg("token_aug") = 0,
+          nb::arg("split_half") = true);
     m.def("sol_attn_core", &sol_attn_core_py,
           nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"),
           nb::arg("kmean_next"), nb::arg("vamax_out"),
