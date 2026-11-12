@@ -56,6 +56,32 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         return;
     }
+    if constexpr (std::is_same_v<OutT, __bf16>) {
+        // MiniMax H3 projection dimensions: hidden=5376, attention=7168,
+        // feed-forward=14336. Leave other shapes on their existing schedule.
+        const bool projection = (K == 5376 && (N == 21504 || N == 28672)) ||
+                                (N == 5376 && (K == 7168 || K == 14336));
+        // The row bounds limit this tuning policy, not GEMM correctness.
+        // Other sizes and architectures retain the generic dispatch.
+        if (M >= 2048 && M <= 8192 && projection && epi.scale_b_stride == 1 &&
+            epi.bias == nullptr && use_gfx1100_schedule()) {
+            EpiRowwiseNoBias no_bias{epi.scale_a, epi.scale_b};
+            // A 256-row tile reuses each weight panel across more output rows.
+            dim3 grid((N + 127) / 128, (M + 255) / 256);
+            // Group more row tiles for wide projections to improve weight-panel
+            // reuse in L2; narrower projections retain the default grouping.
+            if (N >= 16384) {
+                gemm_wmma_kernel<MmaInt8, EpiRowwiseNoBias, OutT, 256, 128, 128,
+                                 2, 4, 8, 2, const uint8_t*, false, false, 16>
+                    <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, ldc, no_bias);
+            } else {
+                gemm_wmma_kernel<MmaInt8, EpiRowwiseNoBias, OutT, 256, 128, 128,
+                                 2, 4, 8, 2, const uint8_t*, false, false, 4>
+                    <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, ldc, no_bias);
+            }
+            return;
+        }
+    }
     launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
 }
 

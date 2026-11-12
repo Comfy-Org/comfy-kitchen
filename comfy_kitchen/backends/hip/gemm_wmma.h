@@ -132,7 +132,7 @@ struct GemmOperandA<const uint8_t*> {
 template <typename Mma, typename Epi, typename OutT,
           int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN,
           typename ASrc = const uint8_t*,
-          bool COALESCED_STAGING = false, bool TILED_A = false>
+          bool COALESCED_STAGING = false, bool TILED_A = false, int GROUP_M = 4>
 __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     typename GemmOperandA<ASrc>::type A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
     int M, int N, int kbytes, int ldc, Epi epi) {
@@ -166,7 +166,8 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     // Grouped block ordering for L2 locality: consecutive blocks advance along M
     // within a group of kGroupM block-rows, so concurrently resident blocks share
     // the same B columns.
-    constexpr int kGroupM = 4;
+    constexpr int kGroupM = GROUP_M;
+    static_assert(GROUP_M > 0, "GROUP_M must be positive");
     const int blocks_n = gridDim.x;
     const int blocks_m = gridDim.y;
     const int bid = blockIdx.y * blocks_n + blockIdx.x;
