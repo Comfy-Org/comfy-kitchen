@@ -3,7 +3,7 @@ import torch
 
 import comfy_kitchen as ck
 
-from .conftest import requires_cuda_backend
+from .conftest import requires_gpu_backend, requires_hip_backend
 
 _FACES = torch.tensor([[1, 3, 2], [0, 2, 3], [0, 3, 1], [0, 1, 2]])
 
@@ -55,7 +55,7 @@ def _non_delaunay_fraction(verts, tets, nbr):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 @pytest.mark.parametrize("n", [1, 5, 2000, 50000])
 def test_uniform(n):
     gen = torch.Generator(device="cuda").manual_seed(n)
@@ -66,7 +66,7 @@ def test_uniform(n):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_matches_scipy():
     scipy_spatial = pytest.importorskip("scipy.spatial")
     gen = torch.Generator(device="cuda").manual_seed(0)
@@ -82,7 +82,7 @@ def test_matches_scipy():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_degenerate_input_stays_valid():
     # regular grid: cospherical cells and many coplanar points
     axis = torch.linspace(0, 1, 12, device="cuda")
@@ -92,7 +92,7 @@ def test_degenerate_input_stays_valid():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 @pytest.mark.parametrize("offset", [1e6, 1e7])
 def test_far_from_origin(offset):
     # the joggle must exceed rounding at the coordinates' magnitude, not just their spread
@@ -103,14 +103,14 @@ def test_far_from_origin(offset):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_empty_input():
     with pytest.raises(ValueError):
         ck.delaunay3d(torch.empty((0, 3), device="cuda"))
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_shell_points():
     # two close concentric spheres, like an offset surface sampled from both sides
     gen = torch.Generator(device="cuda").manual_seed(1)
@@ -122,7 +122,40 @@ def test_shell_points():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_rejects_bad_input():
     with pytest.raises(ValueError, match="points"):
         ck.delaunay3d(torch.rand(10, 2, device="cuda", dtype=torch.float64))
+
+
+@pytest.mark.cuda
+@requires_hip_backend
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_hip_rejects_nonfinite_points(bad):
+    from comfy_kitchen.backends import hip
+
+    points = torch.rand(8, 3, generator=torch.Generator().manual_seed(0)).cuda()
+    points[3, 1] = bad
+    with pytest.raises(ValueError, match="finite"):
+        hip.delaunay3d(points)
+
+
+@pytest.mark.cuda
+@requires_hip_backend
+def test_hip_bindings_reject_undersized_and_wrong_dtype_buffers():
+    from comfy_kitchen.backends import hip
+
+    w, c = hip._dl, hip._C
+    stream = torch.cuda.current_stream().cuda_stream
+    pt = torch.zeros(4, dtype=torch.int32).cuda()
+    with pytest.raises(RuntimeError, match="pt_prio has 3 elements"):
+        c.delaunay_vote(w(pt), w(pt[:3]), 4, w(pt), stream)
+    with pytest.raises(RuntimeError, match="vote has the wrong dtype"):
+        c.delaunay_vote(w(pt), w(pt), 4, w(pt.float()), stream)
+    alive = torch.zeros(1, dtype=torch.uint8).cuda()
+    with pytest.raises(RuntimeError, match="new_index has 0 elements"):
+        c.delaunay_compact(1, w(alive), w(pt[:0]), w(pt), w(pt), w(pt), w(pt), stream)
+    cand = torch.zeros(5, dtype=torch.int32).cuda()
+    # candidate 4 belongs to active tet 1, so five candidates need two active tets
+    with pytest.raises(RuntimeError, match="active_list has 1 elements"):
+        c.delaunay_flip_decide(5, w(cand[:1]), w(cand), w(cand), w(cand), w(cand), w(cand), w(alive), stream)

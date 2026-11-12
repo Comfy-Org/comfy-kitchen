@@ -22,6 +22,7 @@ import pathlib
 import sys
 import weakref
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import torch
 
@@ -59,6 +60,14 @@ logger = logging.getLogger("comfy_kitchen.hip")
 __all__ = [
     "adaln",
     "na3d",
+    "window_attention",
+    "delaunay3d",
+    "mesh_bvh",
+    "closest_point_on_mesh",
+    "closest_hit_on_mesh",
+    "connected_components",
+    "edge_collapse_checks",
+    "min_cut",
     "rms_adaln",
     "fp16_conv3d",
     "fp16_conv3d_out",
@@ -214,6 +223,7 @@ _WMMA_ONLY_OPS = frozenset({
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
     "na3d",
+    "window_attention",
     "sol_attn",
     "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
@@ -1980,6 +1990,52 @@ def na3d(
     return out
 
 
+_NA3D_HEAD_DIMS = (16, 32, 48, 64, 128)
+
+
+def window_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kh: list[int],
+    kw: list[int],
+    temporal_window: int,
+    clamp: bool,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Window attention over stacked key planes, ``(B, Tq, H, W, NH, HD)``
+    queries against ``(B, Tk, H, W, KVH, HD)`` keys. See ops/na3d.hip."""
+    batch, tq, h, w, num_heads, head_dim = q.shape
+    if scale is None:
+        scale = head_dim ** -0.5
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    out = torch.empty_like(q)
+    _C.window_attention(
+        _dl(q),
+        _dl(k),
+        _dl(v),
+        _dl(out),
+        batch,
+        tq,
+        k.shape[1],
+        h,
+        w,
+        num_heads,
+        k.shape[4],
+        head_dim,
+        [int(x) for x in kh],
+        [int(x) for x in kw],
+        int(temporal_window),
+        int(clamp),
+        float(scale),
+        DTYPE_TO_CODE[q.dtype],
+        _stream(q),
+    )
+    return out
+
+
 def _adaln_impl(kernel, x, scale, shift, eps) -> torch.Tensor:
     """``kernel`` is _C.adaln (LayerNorm) or _C.rms_adaln (RMSNorm)."""
     from comfy_kitchen.backends._modulation import adaln_prep_modulation
@@ -2016,6 +2072,370 @@ def rms_adaln(
     eps: float = 1e-6,
 ) -> torch.Tensor:
     return _adaln_impl(_C.rms_adaln, x, scale, shift, eps)
+
+
+_INT32_MAX = 2**31 - 1
+_DELAUNAY_MAX_FLIP_PASSES = 256  # per insertion round; faces still bad after that are left
+_DELAUNAY_MAX_TETS = 2**29  # adjacency is stored as (tet << 2 | face) in int32
+
+
+def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """See comfy_kitchen.delaunay3d. Rounds and flip passes loop here because each
+    launch is sized by the step before it."""
+    _check_shape("points", points, (None, 3))
+    if not torch.isfinite(points).all():
+        raise ValueError("points must be finite")
+    device = points.device
+    n = points.shape[0]
+    if n == 0:
+        raise ValueError("delaunay3d needs at least one point")
+    stream = torch.cuda.current_stream(device).cuda_stream
+    i32 = {"dtype": torch.int32, "device": device}
+    u8 = {"dtype": torch.uint8, "device": device}
+
+    verts = torch.empty((n + 4, 3), dtype=torch.float64, device=device)
+    verts[:n] = points
+    lo, hi = verts[:n].min(0).values, verts[:n].max(0).values
+    radius, magnitude = torch.stack([(hi - lo).norm() / 2, verts[:n].abs().max()]).tolist()
+    gen = torch.Generator(device=device).manual_seed(0)
+    # joggle (qhull's QJ) so no split point sits exactly on a face and leaves a flat child; to
+    # stay above double rounding it scales with the coordinates' magnitude, not just their spread
+    jog = 1e-10 * max(radius, magnitude, 1e-12)
+    verts[:n] += (torch.rand((n, 3), generator=gen, dtype=torch.float64, device=device) * 2 - 1) * jog
+    corners = torch.tensor([[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]], dtype=torch.float64, device=device)
+    # bounding tet with inradius 11.5x the points' radius, floored for points spread only by the joggle
+    verts[n:] = (lo + hi) / 2 + corners * (20 * max(radius, 10 * jog))
+
+    cap = min(8 * n + 64, _DELAUNAY_MAX_TETS)
+    tet_v = torch.full((cap, 4), -1, **i32)
+    tet_v[0] = torch.tensor([n, n + 1, n + 3, n + 2], **i32)  # positively oriented corner order
+    tet_opp = torch.full((cap, 4), -1, **i32)
+    alive = torch.zeros(cap, **u8)
+    alive[0] = 1
+    pend = torch.zeros(4 * cap, **u8)
+    pt_tet = torch.zeros(n, **i32)
+    prio = torch.randperm(n, generator=gen, device=device).int()  # insertion order
+    prio_to_pt = torch.argsort(prio).int()
+
+    def grow(need):
+        nonlocal cap, tet_v, tet_opp, alive, pend
+        if need <= cap:
+            return
+        if need > _DELAUNAY_MAX_TETS:
+            raise ValueError(f"delaunay3d: {n} points need more than {_DELAUNAY_MAX_TETS} tets")
+        extra = min(max(need, cap * 3 // 2), _DELAUNAY_MAX_TETS) - cap
+        tet_v = torch.cat([tet_v, torch.full((extra, 4), -1, **i32)])
+        tet_opp = torch.cat([tet_opp, torch.full((extra, 4), -1, **i32)])
+        alive = torch.cat([alive, torch.zeros(extra, **u8)])
+        pend = torch.cat([pend, torch.zeros(4 * extra, **u8)])
+        cap += extra
+
+    w = _dl
+    n_tets = 1
+
+    def flip(active):
+        # passes until nothing flips; faces that cannot flip yet are retried while others do
+        nonlocal n_tets
+        for _ in range(_DELAUNAY_MAX_FLIP_PASSES):
+            active_flag = active[:n_tets] * alive[:n_tets]
+            active_list = active_flag.nonzero().squeeze(1).int()
+            if active_list.numel() == 0:
+                return
+            n_cand = 4 * active_list.numel()
+            cand_info, cand_n, cand_m = (torch.empty(n_cand, **i32) for _ in range(3))
+            owner = torch.full((n_tets,), _INT32_MAX, **i32)
+            active = torch.zeros(cap, **u8)
+            _C.delaunay_flip_detect(active_list.numel(), w(active_list), w(active_flag), w(tet_v), w(tet_opp),
+                                    w(verts), w(cand_info), w(cand_n), w(cand_m), w(owner), w(active), stream)
+            run = torch.empty(n_cand, **i32)
+            _C.delaunay_flip_decide(n_cand, w(active_list), w(cand_info), w(cand_n), w(cand_m), w(owner), w(run),
+                                    w(active), stream)
+            ran = run != 0
+            is23 = (run & 3) == 1
+            n_run, n23 = torch.stack([ran.sum(), is23.sum()]).tolist()
+            if n_run == 0:
+                return
+            slot_rank = torch.cumsum(is23, 0, dtype=torch.int32) - is23.int()
+            run_rank = torch.cumsum(ran, 0, dtype=torch.int32) - ran.int()
+            grow(n_tets + n23)
+            active = torch.cat([active, torch.zeros(cap - active.numel(), **u8)])
+            flipped = torch.zeros(n_tets, **i32)
+            redirect = torch.empty(4 * n_tets, **i32)
+            new_tets = torch.empty(3 * n_run, **i32)
+            _C.delaunay_flip_execute(n_cand, w(active_list), w(run), w(cand_n), w(cand_m), w(slot_rank), w(run_rank),
+                                     n_tets, w(verts), w(tet_v), w(tet_opp), w(alive), w(flipped), w(redirect),
+                                     w(pend), w(new_tets), w(active), stream)
+            _C.delaunay_flip_fixup(n_run, w(new_tets), w(flipped), w(redirect), w(tet_opp), w(pend), stream)
+            _C.delaunay_relocate_flip(n, w(flipped), w(new_tets), w(tet_v), w(verts), w(pt_tet), stream)
+            n_tets += n23
+
+    def compacted(rows):
+        # alive tets in order, adjacency still encoded
+        new_index = torch.cumsum(alive[:n_tets], 0, dtype=torch.int32) - 1
+        out_v = torch.full((rows, 4), -1, **i32)
+        out_o = torch.full((rows, 4), -1, **i32)
+        _C.delaunay_compact(n_tets, w(alive), w(new_index), w(tet_v), w(tet_opp), w(out_v), w(out_o), stream)
+        return new_index, out_v, out_o
+
+    while True:
+        vote = torch.full((n_tets,), _INT32_MAX, **i32)
+        _C.delaunay_vote(w(pt_tet), w(prio), n, w(vote), stream)
+        split = vote != _INT32_MAX
+        n_split = int(split.sum())
+        if n_split == 0:
+            break
+        split_rank = torch.cumsum(split, 0, dtype=torch.int32) - split.int()
+        grow(n_tets + 3 * n_split)
+        active = torch.zeros(cap, **u8)
+        _C.delaunay_split(n_tets, w(vote), w(split_rank), w(prio_to_pt), w(tet_v), w(tet_opp), w(alive),
+                          w(pt_tet), w(active), stream)
+        _C.delaunay_relocate_split(n, w(vote), w(split_rank), n_tets, w(tet_v), w(verts), w(pt_tet), stream)
+        n_tets += 3 * n_split
+        flip(active)
+        n_alive = int(alive[:n_tets].sum())
+        if 4 * n_alive < 3 * n_tets:  # a quarter of the slots died in 3-2 flips: reclaim them
+            new_index, tet_v, tet_opp = compacted(cap)
+            pt_tet.copy_(torch.where(pt_tet >= 0, new_index[pt_tet.clamp(min=0)], pt_tet))
+            alive.zero_()
+            alive[:n_alive] = 1
+            n_tets = n_alive
+    flip(alive.clone())  # final pass over all tets: faces stuck mid-insertion may flip now
+
+    _, tets, neighbors = compacted(int(alive[:n_tets].sum()))
+    return verts, tets, torch.where(neighbors >= 0, neighbors >> 2, neighbors)
+
+
+class MeshBVH(NamedTuple):
+    triangles: torch.Tensor  # (F, 3, 3) float32 in Morton order
+    index: torch.Tensor  # (F,) int32: original id of each sorted triangle
+    child: torch.Tensor  # (F - 1, 2) int32 children of internal nodes 0..F-2; leaves are F-1..2F-2
+    box: torch.Tensor  # (2F - 1, 6) float32 node boxes (min xyz, max xyz)
+
+
+def _morton_spread21(x: torch.Tensor) -> torch.Tensor:
+    # 21 bits -> every third bit of 63
+    x = x & 0x1FFFFF
+    x = (x | x << 32) & 0x1F00000000FFFF
+    x = (x | x << 16) & 0x1F0000FF0000FF
+    x = (x | x << 8) & 0x100F00F00F00F00F
+    x = (x | x << 4) & 0x10C30C30C30C30C3
+    return (x | x << 2) & 0x1249249249249249
+
+
+def _check_float32(**tensors: torch.Tensor) -> None:
+    """Direct backend calls skip the registry's dtype constraints, and the mesh kernels read float32."""
+    for name, tensor in tensors.items():
+        if tensor.dtype != torch.float32:
+            raise ValueError(f"{name} must be float32, got {tensor.dtype}")
+
+
+def mesh_bvh(triangles: torch.Tensor) -> MeshBVH:
+    _check_shape("triangles", triangles, (None, 3, 3))
+    _check_float32(triangles=triangles)
+    device = triangles.device
+    n = triangles.shape[0]
+    if n == 0:
+        raise ValueError("mesh_bvh needs at least one triangle")
+    centre = (triangles.amin(1) + triangles.amax(1)) * 0.5
+    # finite centres only: one NaN triangle would give every triangle the same code
+    finite = centre.isfinite()
+    lo = torch.where(finite, centre, float("inf")).amin(0)
+    hi = torch.where(finite, centre, float("-inf")).amax(0)
+    cell = ((centre - lo) / (hi - lo).clamp_min(1e-30) * (2**21 - 1)).long().clamp(0, 2**21 - 1)
+    codes = _morton_spread21(cell[:, 0]) << 2 | _morton_spread21(cell[:, 1]) << 1 | _morton_spread21(cell[:, 2])
+    codes, order = torch.sort(codes)
+    tris = triangles[order]
+    child = torch.empty((max(n - 1, 1), 2), dtype=torch.int32, device=device)
+    parent = torch.empty(2 * n - 1, dtype=torch.int32, device=device)
+    visits = torch.zeros(max(n - 1, 1), dtype=torch.int32, device=device)
+    box = torch.empty((2 * n - 1, 6), dtype=torch.float32, device=device)
+    w = _dl
+    _C.mesh_bvh_build(w(codes), w(tris), n, w(child), w(parent), w(visits), w(box),
+                      torch.cuda.current_stream(device).cuda_stream)
+    return MeshBVH(tris, order.int(), child[: n - 1], box)
+
+
+def closest_point_on_mesh(
+    bvh: MeshBVH, points: torch.Tensor, max_dist: float = float("inf")
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    _check_shape("points", points, (None, 3))
+    _check_float32(points=points, triangles=bvh.triangles)
+    if bvh.triangles.device != points.device:
+        raise ValueError(f"bvh is on {bvh.triangles.device} but points are on {points.device}")
+    n = points.shape[0]
+    points = points.contiguous()
+    if max_dist < 0:  # nothing lies within a negative cutoff; the kernel compares squares, so answer here
+        return (torch.full((n,), float(max_dist), dtype=torch.float32, device=points.device), points.clone(),
+                torch.full((n,), -1, dtype=torch.int64, device=points.device))
+    dist = torch.empty(n, dtype=torch.float32, device=points.device)
+    closest = torch.empty((n, 3), dtype=torch.float32, device=points.device)
+    face = torch.empty(n, dtype=torch.int64, device=points.device)
+    w = _dl
+    _C.closest_point_on_mesh(w(points), n, w(bvh.triangles), w(bvh.index), bvh.triangles.shape[0], w(bvh.child),
+                             w(bvh.box), float(max_dist), w(dist), w(closest), w(face),
+                             torch.cuda.current_stream(points.device).cuda_stream)
+    return dist, closest, face
+
+
+def closest_hit_on_mesh(
+    bvh: MeshBVH, origins: torch.Tensor, directions: torch.Tensor, tmin: float = 0.0, tmax: float = float("inf"),
+    cull_backface: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _check_shape("origins", origins, (None, 3))
+    _check_shape("directions", directions, (origins.shape[0], 3))
+    _check_float32(origins=origins, directions=directions, triangles=bvh.triangles)
+    if bvh.triangles.device != origins.device or directions.device != origins.device:
+        raise ValueError(f"bvh is on {bvh.triangles.device}, origins on {origins.device} and directions on "
+                         f"{directions.device}")
+    n = origins.shape[0]
+    t = torch.empty(n, dtype=torch.float32, device=origins.device)
+    face = torch.empty(n, dtype=torch.int64, device=origins.device)
+    w = _dl
+    _C.closest_hit_on_mesh(w(origins.contiguous()), w(directions.contiguous()), n, w(bvh.triangles), w(bvh.index),
+                           bvh.triangles.shape[0], w(bvh.child), w(bvh.box), float(tmin), float(tmax),
+                           bool(cull_backface), w(t), w(face), torch.cuda.current_stream(origins.device).cuda_stream)
+    return t, face
+
+
+def _check_count(name: str, value) -> int:
+    """A size the kernels index with: a non-negative integer."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _check_shape(name: str, tensor: torch.Tensor, shape: tuple) -> None:
+    """`shape` entries of None accept any size."""
+    if tensor.dim() != len(shape) or any(s is not None and t != s for t, s in zip(tensor.shape, shape, strict=True)):
+        want = ", ".join("*" if s is None else str(s) for s in shape)
+        raise ValueError(f"{name} must have shape ({want}), got {tuple(tensor.shape)}")
+
+
+def _check_same_device(device: torch.device, **tensors: torch.Tensor) -> None:
+    """The kernels run on one stream, so an operand on another GPU would fault without peer access."""
+    for name, tensor in tensors.items():
+        if tensor.device != device:
+            raise ValueError(f"{name} must be on {device}, got {tensor.device}")
+
+
+def _check_indices(name: str, index: torch.Tensor, n: int, lowest: int = 0) -> None:
+    """The kernels index raw buffers with these values, so out-of-range ones would read or write past them.
+
+    Skipped while a CUDA graph is being captured: reading the bounds back would break the capture, and a replay
+    cannot check them anyway, so the caller who captures owns the indices."""
+    if index.numel() == 0:
+        return
+    with torch.cuda.device(index.device):
+        if torch.cuda.is_current_stream_capturing():
+            return
+    lo, hi = torch.stack(torch.aminmax(index)).tolist()
+    if lo < lowest or hi >= n:
+        raise ValueError(f"{name} must lie in [{lowest}, {n}), got values in [{lo}, {hi}]")
+
+
+def connected_components(edges: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    num_nodes = _check_count("num_nodes", num_nodes)
+    _check_shape("edges", edges, (None, 2))
+    _check_indices("edges", edges, num_nodes)
+    edges = edges.contiguous()
+    parent = torch.arange(num_nodes, dtype=torch.int32, device=edges.device)
+    labels = torch.empty(num_nodes, dtype=torch.int64, device=edges.device)
+    _C.connected_components(_dl(edges), edges.shape[0], edges.dtype == torch.int64, num_nodes,
+                            _dl(parent), _dl(labels),
+                            torch.cuda.current_stream(edges.device).cuda_stream)
+    return labels
+
+
+def edge_collapse_checks(
+    vertices: torch.Tensor, faces: torch.Tensor, edges: torch.Tensor, positions: torch.Tensor,
+    cos_threshold: float = 0.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = vertices.device
+    _check_same_device(device, faces=faces, edges=edges, positions=positions)
+    n_verts, n_edges = vertices.shape[0], edges.shape[0]
+    _check_shape("vertices", vertices, (None, 3))
+    _check_shape("faces", faces, (None, 3))
+    _check_shape("edges", edges, (None, 2))
+    _check_shape("positions", positions, (n_edges, 3))
+    _check_indices("faces", faces, n_verts)
+    _check_indices("edges", edges, n_verts)
+    faces = faces.to(torch.int32).contiguous()
+    corners = faces.reshape(-1)
+    # vertex-to-face CSR, filled by the kernel: sorting the corners would take several times their size
+    offsets = torch.zeros(n_verts + 1, dtype=torch.int32, device=device)
+    torch.cumsum(torch.bincount(corners, minlength=n_verts), dim=0, out=offsets[1:])
+    cursor = torch.zeros(n_verts, dtype=torch.int32, device=device)
+    fan = torch.empty(corners.numel(), dtype=torch.int32, device=device)
+    flips = torch.empty(n_edges, dtype=torch.int32, device=device)
+    skinny = torch.empty(n_edges, dtype=torch.float32, device=device)
+    link_ok = torch.empty(n_edges, dtype=torch.bool, device=device)
+    _C.edge_collapse_checks(_dl(vertices.contiguous()), _dl(faces), _dl(offsets),
+                            _dl(cursor), _dl(fan),
+                            _dl(edges.to(torch.int32).contiguous()), _dl(positions.contiguous()),
+                            corners.numel(), n_edges, cos_threshold,
+                            _dl(flips), _dl(skinny), _dl(link_ok),
+                            torch.cuda.current_stream(device).cuda_stream)
+    return flips, skinny, link_ok
+
+
+def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: torch.Tensor,
+            relabel_every: int = 64) -> torch.Tensor:
+    if relabel_every <= 0:
+        raise ValueError(f"relabel_every must be positive, got {relabel_every}")
+    device = nbr.device
+    _check_same_device(device, cap=cap, s_cap=s_cap, t_cap=t_cap)
+    n, k = nbr.shape
+    if k > 128:
+        raise ValueError(f"nbr can have at most 128 slots per node (reverse slots are int8), got {k}")
+    _check_shape("cap", cap, (n, k))
+    _check_shape("s_cap", s_cap, (n,))
+    _check_shape("t_cap", t_cap, (n,))
+    _check_indices("nbr", nbr, n, lowest=-1)
+    if n == 0:
+        return torch.empty(0, dtype=torch.bool, device=device)
+    # a negative capacity makes tol negative or strands excess, and the push-relabel loop then never ends
+    for name, tensor in (("cap", cap), ("s_cap", s_cap), ("t_cap", t_cap)):
+        if not (tensor.isfinite().all() and (tensor >= 0).all()):
+            raise ValueError(f"{name} must be finite and non-negative")
+    # the kernels keep one reverse slot per neighbour, so parallel edges would lose flow
+    ordered = nbr.sort(dim=1).values
+    if ((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)).any():
+        raise ValueError("nbr must not list a neighbour twice for one node; sum parallel capacities into one slot")
+    nbr = nbr.to(torch.int32).contiguous()
+    cap = cap.contiguous()
+    r = torch.empty_like(cap)
+    rev = torch.empty((n, k), dtype=torch.int8, device=device)
+    e = s_cap.clone()
+    rt = t_cap.clone()
+    h = torch.empty(n, dtype=torch.int32, device=device)
+    lists = [torch.empty(n, dtype=torch.int32, device=device) for _ in range(2)]
+    counts = [torch.zeros(1, dtype=torch.int32, device=device) for _ in range(2)]
+    active = torch.zeros(1, dtype=torch.int32, device=device)
+    queued = torch.zeros(n, dtype=torch.int32, device=device)
+    inc = torch.zeros((n, k), dtype=torch.float32, device=device)   # amounts pushed into each slot this iteration
+    hn = torch.empty(n, dtype=torch.int32, device=device)
+    bfs_lists = torch.empty((2, n), dtype=torch.int32, device=device)
+    bfs_counts = torch.zeros(2, dtype=torch.int32, device=device)
+    tol = 1e-12 * float(cap.max()) if cap.numel() else 0.0  # a graph may have terminal edges only
+    big = n + 2
+    stream = torch.cuda.current_stream(device).cuda_stream
+    w = _dl
+    _C.min_cut_init(n, k, w(nbr), w(cap), w(r), w(rev), stream)
+    cur, it = 0, 0
+    while True:
+        if it % relabel_every == 0:
+            _C.min_cut_global_relabel(n, k, w(nbr), w(rev), w(r), w(rt), tol, big, w(h), w(bfs_lists), w(bfs_counts), stream)
+            _C.min_cut_rebuild_active(n, w(e), w(h), tol, big, w(lists[cur]), w(counts[cur]), w(queued), stream)
+            if int(counts[cur].item()) == 0:
+                break
+        _C.min_cut_iterate(n, k, w(nbr), w(rev), w(r), w(e), w(rt), w(h), w(inc), w(hn), tol, big, w(lists[cur]),
+                           w(counts[cur]), w(lists[1 - cur]), w(counts[1 - cur]), w(queued), w(active), stream)
+        cur = 1 - cur
+        it += 1
+        if int(active.item()) == 0:
+            break
+    _C.min_cut_global_relabel(n, k, w(nbr), w(rev), w(r), w(rt), tol, big, w(h), w(bfs_lists), w(bfs_counts), stream)
+    return h >= big
 
 
 def _ndhwc_strides(t: torch.Tensor):
@@ -2909,6 +3329,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ValidationResult,
         na3d_common_call_rule,
         sol_attn_common_call_rule,
+        window_attention_common_call_rule,
         with_out_param,
     )
 
@@ -2919,19 +3340,31 @@ def _build_constraints(has_wmma: bool = True) -> dict:
     fp8s = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
     out_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
+    def _na3d_launch_rule(q):
+        # Head dims the kernel is built for, and grid y = T * H, grid z = B * heads.
+        if q is not None:
+            if q.shape[-1] not in _NA3D_HEAD_DIMS:
+                return ValidationResult.fail("q", f"head_dim must be one of {_NA3D_HEAD_DIMS}")
+            if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
+                return ValidationResult.fail("q", "grid dims exceed HIP limits")
+        return ValidationResult.ok()
+
     def _na3d_call_rule(kwargs):
         common = na3d_common_call_rule(kwargs)
         if not common.success:
             return common
-        q = kwargs.get("q")
-        if q is not None:
-            head_dim = q.shape[-1]
-            # The WMMA K-step is 16 wide and the output accumulators are held in
-            # registers, one 16-column tile each.
-            if head_dim % 16 != 0 or head_dim > 64:
-                return ValidationResult.fail("q", "head_dim must be a multiple of 16 and <= 64")
-            if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
-                return ValidationResult.fail("q", "grid dims exceed HIP limits")
+        return _na3d_launch_rule(kwargs.get("q"))
+
+    def _window_attention_call_rule(kwargs):
+        common = window_attention_common_call_rule(kwargs)
+        if not common.success:
+            return common
+        launch = _na3d_launch_rule(kwargs.get("q"))
+        if not launch.success:
+            return launch
+        kh = kwargs.get("kh")
+        if kh is not None and len(kh) > 8:
+            return ValidationResult.fail("kh", "at most 8 distinct per-plane windows")
         return ValidationResult.ok()
 
     bf16_param = ParamConstraint(dtypes=frozenset({torch.bfloat16}))
@@ -2974,6 +3407,15 @@ def _build_constraints(has_wmma: bool = True) -> dict:
             },
             default_devices=dev,
             call_rules=(_na3d_call_rule,),
+        ),
+        "window_attention": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+                "k": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+                "v": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+            },
+            default_devices=dev,
+            call_rules=(_window_attention_call_rule,),
         ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={
@@ -3163,6 +3605,49 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 ),
                 "wscales": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
                 "lora_up": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(2),)),
+            },
+            default_devices=dev,
+        ),
+        "delaunay3d": FunctionConstraints(
+            params={
+                "points": ParamConstraint(dtypes=frozenset({torch.float32, torch.float64}), shape_rules=(ExactDims(2),)),
+            },
+            default_devices=dev,
+        ),
+        "mesh_bvh": FunctionConstraints(
+            params={"triangles": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(3),))},
+            default_devices=dev,
+        ),
+        "closest_point_on_mesh": FunctionConstraints(
+            params={"points": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),))},
+            default_devices=dev,
+        ),
+        "closest_hit_on_mesh": FunctionConstraints(
+            params={
+                "origins": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),)),
+                "directions": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),)),
+            },
+            default_devices=dev,
+        ),
+        "connected_components": FunctionConstraints(
+            params={"edges": ParamConstraint(dtypes=frozenset({torch.int32, torch.int64}), shape_rules=(ExactDims(2),))},
+            default_devices=dev,
+        ),
+        "edge_collapse_checks": FunctionConstraints(
+            params={
+                "vertices": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),)),
+                "faces": ParamConstraint(dtypes=frozenset({torch.int32, torch.int64}), shape_rules=(ExactDims(2),)),
+                "edges": ParamConstraint(dtypes=frozenset({torch.int32, torch.int64}), shape_rules=(ExactDims(2),)),
+                "positions": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),)),
+            },
+            default_devices=dev,
+        ),
+        "min_cut": FunctionConstraints(
+            params={
+                "nbr": ParamConstraint(dtypes=frozenset({torch.int32, torch.int64}), shape_rules=(ExactDims(2),)),
+                "cap": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),)),
+                "s_cap": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
+                "t_cap": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)),
             },
             default_devices=dev,
         ),

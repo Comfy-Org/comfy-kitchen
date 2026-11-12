@@ -185,6 +185,23 @@ set(HIP_SOURCES
     ops/w4a8_requant.hip
     ops/gated_delta.hip
     ops/memmove.hip
+    ops/delaunay3d.hip
+    ops/mesh_bvh.hip
+    ops/connected_components.hip
+    ops/edge_collapse.hip
+    ops/min_cut.hip
+)
+
+# The geometry predicates rely on IEEE semantics: the double-double sums need exact
+# rounding that reassociation cancels away, and an infinite cutoff must stay infinite.
+# Source options follow the target's, so this overrides -ffast-math for these files.
+set_source_files_properties(
+    ops/delaunay3d.hip
+    ops/mesh_bvh.hip
+    ops/connected_components.hip
+    ops/edge_collapse.hip
+    ops/min_cut.hip
+    PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
 )
 
 set(CPP_SOURCES
