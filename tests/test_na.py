@@ -59,6 +59,7 @@ CASES = [
     ((1, 2, 3, 96, 1, 64), (1, 3, 33), (False, False, False)),  # kw > CUDA BK=32
     ((1, 3, 4, 34, 2, 16), (3, 3, 5), (False, False, False)),   # hd 16
     ((1, 3, 4, 34, 2, 48), (3, 3, 5), (False, False, False)),   # hd 48 (not a power of 2)
+    ((1, 3, 4, 34, 2, 128), (3, 3, 5), (False, False, False)),  # hd 128
     ((1, 4, 6, 20, 2, 64), (3, 5, 7), (False, False, True)),    # causal W
     ((1, 4, 6, 20, 2, 64), (3, 5, 7), (False, True, False)),    # causal H
     ((1, 4, 6, 20, 2, 64), (3, 5, 7), (True, True, True)),      # causal on every axis

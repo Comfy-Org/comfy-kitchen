@@ -17,6 +17,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/vector.h>
 #include <cuda_runtime.h>
 #include <climits>
 #include <cstring>
@@ -264,6 +265,13 @@ extern "C" {
         int batch, int t_size, int h_size, int w_size, int num_heads, int head_dim,
         int kt, int kh, int kw,
         int causal_t, int causal_h, int causal_w,
+        float scale, int dtype_code, cudaStream_t stream);
+
+    // Window attention over stacked key planes — see ops/na3d.cu.
+    void launch_window_attention_kernel(
+        const void* q, const void* k, const void* v, void* out,
+        int batch, int tq, int tk, int h_size, int w_size, int num_heads, int kv_heads, int head_dim,
+        const int* kh, const int* kw, int n_windows, int temporal_window, int clamp,
         float scale, int dtype_code, cudaStream_t stream);
 
     // Sol-Attn sparse attention — see sage_attention/sol_attn.cu.
@@ -1573,6 +1581,30 @@ void na3d(
         q.data(), k.data(), v.data(), out.data(),
         (int)batch, (int)t_size, (int)h_size, (int)w_size, (int)num_heads, (int)head_dim,
         (int)kt, (int)kh, (int)kw, causal_t, causal_h, causal_w,
+        scale, dtype_code, stream);
+}
+
+// Nanobind wrapper for window attention over stacked key planes
+void window_attention(
+    nb::ndarray<nb::device::cuda> q,
+    nb::ndarray<nb::device::cuda> k,
+    nb::ndarray<nb::device::cuda> v,
+    nb::ndarray<nb::device::cuda> out,
+    int64_t batch, int64_t tq, int64_t tk, int64_t h_size, int64_t w_size,
+    int64_t num_heads, int64_t kv_heads, int64_t head_dim,
+    const std::vector<int>& kh, const std::vector<int>& kw,
+    int64_t temporal_window, int clamp,
+    float scale,
+    int dtype_code,
+    uintptr_t stream_ptr)
+{
+    if (kh.size() != kw.size() || kh.empty() || kh.size() > 8)
+        throw std::invalid_argument("window_attention: kh and kw need the same length, 1 to 8 windows");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_window_attention_kernel(
+        q.data(), k.data(), v.data(), out.data(),
+        (int)batch, (int)tq, (int)tk, (int)h_size, (int)w_size, (int)num_heads, (int)kv_heads, (int)head_dim,
+        kh.data(), kw.data(), (int)kh.size(), (int)temporal_window, clamp,
         scale, dtype_code, stream);
 }
 
@@ -5233,6 +5265,14 @@ NB_MODULE(_C, m) {
           nb::arg("num_heads"), nb::arg("head_dim"),
           nb::arg("kt"), nb::arg("kh"), nb::arg("kw"),
           nb::arg("causal_t"), nb::arg("causal_h"), nb::arg("causal_w"),
+          nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
+
+    m.def("window_attention", &window_attention,
+          "Window attention over stacked key planes (per-plane windows, GQA)",
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"),
+          nb::arg("batch"), nb::arg("tq"), nb::arg("tk"), nb::arg("h_size"), nb::arg("w_size"),
+          nb::arg("num_heads"), nb::arg("kv_heads"), nb::arg("head_dim"),
+          nb::arg("kh"), nb::arg("kw"), nb::arg("temporal_window"), nb::arg("clamp"),
           nb::arg("scale"), nb::arg("dtype_code"), nb::arg("stream_ptr"));
 
     m.def("gated_delta_decode_fused", &gated_delta_decode_fused,

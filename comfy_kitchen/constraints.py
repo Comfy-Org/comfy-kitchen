@@ -354,6 +354,47 @@ def na3d_common_call_rule(kwargs):
     return ValidationResult.ok()
 
 
+def window_attention_common_call_rule(kwargs):
+    """Shared ``window_attention`` validation (used by every backend's entry).
+
+    The fused backend sizes q from ``q`` and k/v from ``k`` and passes them as
+    bare pointers, so a mismatch becomes an out-of-bounds read.
+    """
+    q, k, v = kwargs.get("q"), kwargs.get("k"), kwargs.get("v")
+    if k is not None and v is not None and tuple(v.shape) != tuple(k.shape):
+        return ValidationResult.fail("v", f"must have the same shape as k {tuple(k.shape)}, got {tuple(v.shape)}")
+    if q is not None:
+        for name, other in (("k", k), ("v", v)):
+            if other is None:
+                continue
+            if other.dtype != q.dtype:
+                return ValidationResult.fail(name, f"must have the same dtype as q ({q.dtype}), got {other.dtype}")
+            if other.device != q.device:
+                return ValidationResult.fail(name, f"must be on the same device as q ({q.device}), got {other.device}")
+        if k is not None:
+            b, tq, h, w, nh, hd = q.shape
+            if (k.shape[0], k.shape[2], k.shape[3], k.shape[5]) != (b, h, w, hd):
+                return ValidationResult.fail(
+                    "k", f"must match q in batch, height, width and head_dim, got {tuple(k.shape)} for q {tuple(q.shape)}"
+                )
+            if tq > k.shape[1]:
+                return ValidationResult.fail("q", f"has {tq} planes, more than the {k.shape[1]} key planes")
+            if k.shape[4] < 1 or nh % k.shape[4] != 0:
+                return ValidationResult.fail("k", f"{k.shape[4]} heads do not divide the {nh} query heads")
+    kh, kw = kwargs.get("kh"), kwargs.get("kw")
+    if kh is not None and kw is not None:
+        if len(kh) != len(kw) or len(kh) == 0:
+            return ValidationResult.fail("kh", f"kh and kw must be non-empty and the same length, got {len(kh)} and {len(kw)}")
+        if k is not None and len(kh) not in (1, k.shape[1]):
+            return ValidationResult.fail("kh", f"needs one window for every key plane or one for all, got {len(kh)} for {k.shape[1]} planes")
+        if any(x < 1 for x in (*kh, *kw)):
+            return ValidationResult.fail("kh", f"windows must be positive, got {list(kh)} x {list(kw)}")
+    temporal_window = kwargs.get("temporal_window")
+    if temporal_window is not None and temporal_window < 1:
+        return ValidationResult.fail("temporal_window", f"must be positive, got {temporal_window}")
+    return ValidationResult.ok()
+
+
 def with_out_param(base: FunctionConstraints) -> FunctionConstraints:
     """The ``_out`` form of an op: base constraints plus a 5-D ``out`` in x's dtypes."""
     out = ParamConstraint(dtypes=base.params["x"].dtypes, shape_rules=(ExactDims(5),))

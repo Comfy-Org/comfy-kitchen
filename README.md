@@ -233,7 +233,6 @@ Both extensions are built against the Python limited API on 3.12+, so a wheel
 carrying CUDA and HIP side by side keeps its `abi3` tag. At runtime only the
 extension matching PyTorch's CUDA or ROCm runtime is loaded.
 
-
 ## RDNA1 backend (AMD gfx1010)
 
 The `rdna1` backend serves RDNA1 (`gfx1010`: RX 5700 / 5600 / 5600M class), which the
@@ -280,15 +279,15 @@ residual; `fp16_linear` fuses bias and a scaled residual into the epilogue.
 and `int8_block_sparse_attention` restricts each block of queries to a caller-chosen
 set of 64-key tiles.
 
-| What runs                      | How                                                         |
-|--------------------------------|-------------------------------------------------------------|
+| What runs | How |
+| -------------------------------- | ------------------------------------------------------------- |
 | fp8, INT8, INT4/INT6, W4A8, ConvRot, SVDQuant and AWQ linears, `fp16_linear` | Thread-level GEMM |
 | ConvRot INT8 (group 256), `fp16_packed_linear`, `fp16_packed_conv3d`, `fp16_packed_conv_transpose3d`, `fp16_conv3d`, `q8_0_linear`, `q4_k_linear` | Packed fp16 GEMM |
 | `direct_conv3d`, `depthwise_conv3d`, `depthwise_conv_transpose3d` | Direct and gather conv kernels |
 | `fp32_winograd_conv2d`, `fp32_winograd_conv_transpose2d` | MIOpen's fp32 Winograd kernels |
 | `int8_attention`, `sol_attn`, `na3d` | Software tile policy; fp16-FMA kernel for `int8_attention` |
-| Quantizers, RoPE, RMS-RoPE, AdaLN, GroupNorm+SiLU+pad | Elementwise kernels              |
-| NVFP4, MXFP8, `na2d`, flash decode, GatedDeltaNet decode | Not provided; eager            |
+| Quantizers, RoPE, RMS-RoPE, AdaLN, GroupNorm+SiLU+pad | Elementwise kernels |
+| NVFP4, MXFP8, `na2d`, flash decode, GatedDeltaNet decode | Not provided; eager |
 
 The backend registers when a `gfx1010` is visible and declines tensors on any other
 device, so it runs in one process beside `hip`, each serving its own GPUs. Where it
@@ -345,7 +344,6 @@ output = torch.nn.functional.linear(qt, weight_qt)
 dq = qt.dequantize()
 ```
 
-
 ## Installation
 
 ### From PyPI
@@ -382,15 +380,15 @@ pip install -e . --no-build-isolation -v
 
 These options require using `setup.py` directly (not `pip install`):
 
-| Option | Command | Description | Default                                                                     |
-|--------|---------|-------------|-----------------------------------------------------------------------------|
-| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Disable CUDA; without `--hip`, build a CPU-only wheel | Enabled (build with CUDA)                                                   |
-| `--hip` | `python setup.py bdist_wheel --hip` | Add HIP explicitly (including to a CUDA build) | Auto only when CUDA is unavailable                                          |
-| `--no-hip` | `python setup.py bdist_wheel --no-hip` | Disable HIP | Disabled                                                                    |
-| `--hip-archs=...` | `python setup.py build_ext --hip-archs="gfx1200;gfx1201"` | HIP architectures to build for | Visible supported AMD GPUs, otherwise all supported targets                 |
+| Option | Command | Description | Default |
+| -------- | --------- | ------------- | ----------------------------------------------------------------------------- |
+| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Disable CUDA; without `--hip`, build a CPU-only wheel | Enabled (build with CUDA) |
+| `--hip` | `python setup.py bdist_wheel --hip` | Add HIP explicitly (including to a CUDA build) | Auto only when CUDA is unavailable |
+| `--no-hip` | `python setup.py bdist_wheel --no-hip` | Disable HIP | Disabled |
+| `--hip-archs=...` | `python setup.py build_ext --hip-archs="gfx1200;gfx1201"` | HIP architectures to build for | Visible supported AMD GPUs, otherwise all supported targets |
 | `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | `75-virtual;80;89;90a;100f;120f` (Linux), `75-virtual;80;89;120f` (Windows) |
-| `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release)                                                          |
-| `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled                                                                    |
+| `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release) |
+| `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled |
 
 ```bash
 # Build CPU-only wheel (pure Python, no CUDA required)
@@ -402,8 +400,6 @@ python setup.py build_ext --cuda-archs="80;89" bdist_wheel
 # Debug build with line info for profiling
 python setup.py build_ext --debug-build --lineinfo bdist_wheel
 ```
-
-
 
 ### Requirements
 
@@ -440,6 +436,7 @@ with ck.use_backend("triton"):
 ## Backend System
 
 The library supports multiple backends:
+
 - **eager**: Pure PyTorch implementation
 - **cuda**: Custom CUDA C kernels (CUDA only)
 - **hip**: Custom HIP kernels (WMMA GEMMs on RDNA3/3.5/4; non-WMMA kernels also on RDNA2)
@@ -463,7 +460,7 @@ result = ck.quantize_per_tensor_fp8(x, scale)
 Each backend declares constraints for its functions:
 
 | Constraint | Description |
-|------------|-------------|
+| ------------ | ------------- |
 | **Device** | Which device types are supported |
 | **Dtype** | Allowed input/output dtypes per parameter |
 | **Shape** | Shape requirements (e.g., 2D tensors, dimensions divisible by 16) |
@@ -476,7 +473,6 @@ The registry validates inputs against these constraints **before** calling the b
 import logging
 logging.getLogger("comfy_kitchen.dispatch").setLevel(logging.DEBUG)
 ```
-
 
 ## Testing
 

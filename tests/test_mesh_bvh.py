@@ -3,7 +3,7 @@ import torch
 
 import comfy_kitchen as ck
 
-from .conftest import requires_cuda_backend
+from .conftest import requires_gpu_backend, requires_hip_backend
 
 
 def _closest_on_triangles(p, tris):
@@ -46,7 +46,7 @@ def _random_mesh(n_tris, seed):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 @pytest.mark.parametrize("n_tris", [1, 2, 7, 1000, 20000])
 def test_matches_brute_force(n_tris):
     tris = _random_mesh(n_tris, n_tris)
@@ -62,7 +62,7 @@ def test_matches_brute_force(n_tris):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_large_triangles():
     # a huge triangle among many small ones: nearest-centroid shortcuts get it wrong
     tris = torch.cat(
@@ -78,7 +78,7 @@ def test_large_triangles():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_degenerate_triangles():
     # collinear triangles and slivers down to 1e-6 wide, where float32 region tests cancel out
     gen = torch.Generator(device="cuda").manual_seed(4)
@@ -94,7 +94,7 @@ def test_degenerate_triangles():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 @pytest.mark.parametrize("max_dist", [0.05, 0.0517, 0.0731, 0.1234])
 def test_max_dist(max_dist):
     tris = _random_mesh(500, 5)
@@ -112,7 +112,7 @@ def test_max_dist(max_dist):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_negative_max_dist():
     tris = _random_mesh(200, 7)
     points = tris.mean(1)  # on the mesh, so any non-negative cutoff would find them
@@ -121,7 +121,7 @@ def test_negative_max_dist():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_rejects_bad_input():
     tris = _random_mesh(20, 8)
     for bad in (tris[:2, :2], torch.cat([tris, tris[:, :1]], 1)):
@@ -187,7 +187,7 @@ def _check_rays(origins, directions, tris, t, face, tmin=0.0, tmax=float("inf"),
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 @pytest.mark.parametrize("n_tris", [1, 2, 7, 1000, 20000])
 def test_ray_matches_brute_force(n_tris):
     tris = _random_mesh(n_tris, n_tris)
@@ -197,7 +197,7 @@ def test_ray_matches_brute_force(n_tris):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 @pytest.mark.parametrize(("tmin", "tmax"), [(0.05, float("inf")), (0.0, 0.1), (-0.3, 0.07)])
 def test_ray_interval(tmin, tmax):
     tris = _random_mesh(2000, 12)
@@ -207,7 +207,7 @@ def test_ray_interval(tmin, tmax):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 @pytest.mark.parametrize("flip", [False, True])
 def test_ray_cull_backface(flip):
     tris = _random_mesh(2000, 14)
@@ -218,7 +218,7 @@ def test_ray_cull_backface(flip):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_ray_closed_mesh_has_no_leaks():
     # a cube surface of 6 x 2 x 32^2 triangles: random rays from inside, and rays from the centre through every
     # grid vertex and edge midpoint (axis-parallel ones start on box planes), must all hit
@@ -245,7 +245,7 @@ def test_ray_closed_mesh_has_no_leaks():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_ray_rejects_bad_input():
     tris = _random_mesh(20, 17)
     bvh = ck.mesh_bvh(tris)
@@ -282,7 +282,7 @@ def _bumpy_sphere(subdivisions, seed):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_ray_watertight_at_vertices_and_edges():
     # from inside a closed curved mesh, rays aimed exactly at every vertex and shared-edge midpoint must all hit
     verts, faces = _bumpy_sphere(5, 18)
@@ -295,3 +295,54 @@ def test_ray_watertight_at_vertices_and_edges():
         origins = origin.expand(targets.shape[0], 3).contiguous()
         _, face = ck.closest_hit_on_mesh(bvh, origins, targets - origins)
         assert int((face < 0).sum()) == 0
+
+
+@pytest.mark.cuda
+@requires_hip_backend
+def test_hip_rejects_non_float32_inputs():
+    from comfy_kitchen.backends import hip
+
+    tris = torch.tensor([[[0, 0, 0], [1, 0, 0], [0, 1, 0.0]]]).cuda()
+    bvh = hip.mesh_bvh(tris)
+    query = torch.tensor([[0.25, 0.25, 1.0]]).cuda()
+    down = torch.tensor([[0, 0, -1.0]]).cuda()
+    with pytest.raises(ValueError, match="triangles must be float32"):
+        hip.mesh_bvh(tris.double())
+    for max_dist in (float("inf"), -1.0):  # a negative cutoff answers without reaching the kernel
+        with pytest.raises(ValueError, match="points must be float32"):
+            hip.closest_point_on_mesh(bvh, query.double(), max_dist)
+    with pytest.raises(ValueError, match="origins must be float32"):
+        hip.closest_hit_on_mesh(bvh, query.double(), down)
+    with pytest.raises(ValueError, match="directions must be float32"):
+        hip.closest_hit_on_mesh(bvh, query, down.half())
+
+
+@pytest.mark.cuda
+@requires_hip_backend
+def test_hip_bindings_reject_undersized_and_wrong_dtype_buffers():
+    from comfy_kitchen.backends import hip
+
+    w, c = hip._dl, hip._C
+    stream = torch.cuda.current_stream().cuda_stream
+    tris = torch.tensor([[[0, 0, 0], [1, 0, 0], [0, 1, 0.0]]]).cuda()
+    bvh = hip.mesh_bvh(tris)
+    codes = torch.zeros(1, dtype=torch.int64).cuda()
+    child = torch.empty((1, 2), dtype=torch.int32).cuda()
+    parent = torch.empty(1, dtype=torch.int32).cuda()
+    visits = torch.zeros(1, dtype=torch.int32).cuda()
+    with pytest.raises(RuntimeError, match="box has 5 elements"):
+        c.mesh_bvh_build(w(codes), w(tris), 1, w(child), w(parent), w(visits), w(torch.empty(5).cuda()), stream)
+    q = torch.tensor([[0.25, 0.25, 1.0]]).cuda()
+    dist, face = torch.empty(1).cuda(), torch.empty(1, dtype=torch.int64).cuda()
+    closest = torch.empty(1, 3).cuda()
+
+    def bvh_args():  # a DLPack capsule can only be consumed once
+        return w(bvh.triangles), w(bvh.index), 1, w(bvh.child), w(bvh.box), float("inf")
+
+    with pytest.raises(RuntimeError, match="closest has 1 elements"):
+        c.closest_point_on_mesh(w(q), 1, *bvh_args(), w(dist), w(dist), w(face), stream)
+    with pytest.raises(RuntimeError, match="points has the wrong dtype"):
+        c.closest_point_on_mesh(w(q.double()), 1, *bvh_args(), w(dist), w(closest), w(face), stream)
+    with pytest.raises(RuntimeError, match="t has 1 elements"):
+        c.closest_hit_on_mesh(w(q.repeat(2, 1)), w(q.repeat(2, 1)), 2, w(bvh.triangles), w(bvh.index), 1, w(bvh.child),
+                              w(bvh.box), 0.0, 1.0, False, w(dist), w(torch.empty(2, dtype=torch.int64).cuda()), stream)
