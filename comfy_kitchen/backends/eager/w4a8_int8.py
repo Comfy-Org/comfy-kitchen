@@ -13,6 +13,7 @@ from __future__ import annotations
 import torch
 
 from comfy_kitchen.backends._activations import apply_input_act, apply_residual
+from comfy_kitchen.float_utils import fp8_to_float
 from comfy_kitchen.tensor.w4a8_packed import _FIXED_LUT, _pack_codes, _unpack_codes, unpack_w4a8_mma_weight
 
 from .quantization import int8_linear, rotate_int8_convrot_weight
@@ -148,7 +149,7 @@ def _assign_grid(
 
 def _grid_levels(level_table: torch.Tensor, s_rel: torch.Tensor) -> torch.Tensor:
     """The int8 values each level of every group decodes to: round(clamp(level * s_rel))."""
-    return (level_table.view(1, 1, -1) * s_rel.float().unsqueeze(-1)).round_().clamp_(-127, 127)
+    return (level_table.view(1, 1, -1) * fp8_to_float(s_rel).unsqueeze(-1)).round_().clamp_(-127, 127)
 
 
 def _fit_codebook(
@@ -348,9 +349,9 @@ def _search_group_scale(
         # exact representable neighbours: +-1 on the e4m3 bit pattern (s_rel > 0)
         raw = s_rel.view(torch.uint8)
         candidates = [
-            s_rel.float(),
-            (raw - 1).clamp_(min=1).view(torch.float8_e4m3fn).float(),
-            (raw + 1).clamp_(max=_E4M3_MAX_FINITE_BITS).view(torch.float8_e4m3fn).float(),
+            fp8_to_float(s_rel),
+            fp8_to_float((raw - 1).clamp_(min=1).view(torch.float8_e4m3fn)),
+            fp8_to_float((raw + 1).clamp_(max=_E4M3_MAX_FINITE_BITS).view(torch.float8_e4m3fn)),
         ]
     else:
         base = s_rel.float()
@@ -533,7 +534,7 @@ def _dequant_int4_grouped_to_int8(
         values = codebook.to(device=qdata.device, dtype=torch.float32)[quantized]
     else:
         values = quantized.float() - float(1 << (bits - 1))  # uniform, zero point mid-range
-    values = values.view(n, groups, group_size) * s_rel.float().unsqueeze(-1)
+    values = values.view(n, groups, group_size) * fp8_to_float(s_rel).unsqueeze(-1)
     return values.view(n, k).round().clamp_(-127, 127).to(torch.int8)
 
 
