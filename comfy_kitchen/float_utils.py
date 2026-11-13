@@ -70,7 +70,7 @@ def fp8_to_float(x: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.T
     key = (x.dtype, dtype, x.device)
     lut = _FP8_DECODE_LUTS.get(key)
     if lut is None:
-        lut = torch.arange(256, dtype=torch.uint8).view(x.dtype).to(dtype).to(x.device)
+        lut = torch.arange(256, dtype=torch.uint8, device="cpu").view(x.dtype).to(dtype).to(x.device)
         _FP8_DECODE_LUTS[key] = lut
     return lut[x.view(torch.uint8).long()]
 
