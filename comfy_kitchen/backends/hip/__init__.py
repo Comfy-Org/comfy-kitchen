@@ -226,7 +226,6 @@ _WMMA_ONLY_OPS = frozenset({
     "sol_attn",
     "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
-    "w4a8_int8_linear",
 })
 
 
@@ -1653,10 +1652,15 @@ def w4a8_int8_linear(
         )
         return torch.nn.functional.linear(x, weight, bias).to(out_dtype)
 
-    if not convrot_ok:
+    if not convrot_ok or not has_wmma():
+        # No matrix cores (RDNA2) or an unsupported ConvRot group: unpack to INT8 and
+        # run the regular int8_linear, which takes the SIMT v_dot4 GEMM on RDNA2.
+        # The chunked decode+GEMM below is WMMA-only.
         int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
-        return _eager.int8_linear(
-            x, int8_weight, s_channel, bias, out_dtype, True, convrot_groupsize
+        return int8_linear(
+            x, int8_weight, s_channel, bias, out_dtype, True, convrot_groupsize,
+            input_act=input_act, input_act_weight=act_weight,
+            input_act_eps=input_act_eps,
         )
 
     return _w4a8_int8_linear_chunked(
