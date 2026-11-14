@@ -11,6 +11,7 @@ import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.backends import eager
+from comfy_kitchen.exceptions import NoCapableBackendError
 from comfy_kitchen.registry import registry
 
 pytestmark = pytest.mark.skipif(
@@ -219,13 +220,41 @@ def test_missing_scale_is_left_to_eager():
     assert registry.get_capable_backend("rms_rope_split_half", pair) == "mps"
 
 
+@pytest.mark.parametrize(
+    "shape", [(1, 64), (64, 1), (1, 1, 64)], ids=lambda s: "x".join(map(str, s)))
+def test_non_1d_scale_is_rejected_like_eager(shape):
+    # rope() flattens the scale, but eager needs exactly [head_dim], where it is
+    # rejected by the backend constraint. A broadcast view must not start working
+    # only because the call landed on MPS.
+    x = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    fr = freqs_for((1, 8, 1), 32)
+    w = torch.ones(64, device=DEV, dtype=torch.bfloat16).view(shape)
+    with pytest.raises(NoCapableBackendError):
+        registry.get_capable_backend(
+            "rms_rope1", {"x": x, "freqs_cis": fr, "scale": w, "epsilon": 1e-6})
+    with pytest.raises(NoCapableBackendError):
+        ck.rms_rope1(x, fr, w, 1e-6)
+
+
 def test_shader_compile_failure_falls_back_to_eager(monkeypatch):
+    """A failed compile is cached: two calls land on eager after one attempt."""
     from comfy_kitchen.backends.mps import kernels
+
+    real_compile = torch.mps.compile_shader
+    attempts = []
+
+    def counting_compile(source):
+        attempts.append(source)
+        return real_compile(source)
 
     monkeypatch.setattr(kernels, "_lib", None)
     monkeypatch.setattr(kernels, "_compile_error", None)
     monkeypatch.setattr(kernels, "_SRC", "this is not Metal")
+    monkeypatch.setattr(torch.mps, "compile_shader", counting_compile)
     x = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
     fr = freqs_for((1, 8, 1), 32)
-    assert registry.get_capable_backend("apply_rope1", {"x": x, "freqs_cis": fr}) == "eager"
-    assert torch.equal(ck.apply_rope1(x, fr), eager.apply_rope1(x, fr))
+    expected = eager.apply_rope1(x, fr)
+    for _ in range(2):
+        assert registry.get_capable_backend("apply_rope1", {"x": x, "freqs_cis": fr}) == "eager"
+        assert torch.equal(ck.apply_rope1(x, fr), expected)
+    assert len(attempts) == 1
