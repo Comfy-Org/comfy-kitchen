@@ -17,7 +17,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `scaled_mm_mxfp8`           | ✓     |      |        |     |     |     |
 | `adaln`                     | ✓     | ✓    | ✓      | ✓   |     | ✓   |
 | `rms_adaln`                 | ✓     | ✓    | ✓      | ✓   |     | ✓   |
-| `input_act`                 | ✓     |      |        |     |     |     |
+| `input_act`                 | ✓     |      |        |     |     | ✓   |
 | `na3d`                      | ✓     | ✓    | ✓      | ✓   |     |     |
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |     |
 | `sol_attn`                  | ✓     | ✓    |        | ✓   |     |     |
@@ -67,16 +67,21 @@ corresponding operator is available.
 ## Apple GPU (mps) backend
 
 The `mps` backend runs each single-tensor rope entry (including its in-place form
-and `rot_dim`) and `adaln` / `rms_adaln` as one Metal kernel; the paired rope
-entries launch one kernel per tensor, two per paired call. The kernels are
-compiled with `torch.mps.compile_shader` and take float32, float16 and bfloat16,
-and strided views with a contiguous last dim, so packed-qkv slices and
-`(B, H, N, D)` layouts need no copies. Everything else is declined by the call
-rules and runs on eager: other dtypes or layouts, more than four leading dims
-that cannot be merged, a `freqs_cis` that is not float32, a scale that is not
-`[head_dim]`, and for RoPE an odd head dim or `rot_dim` or a head dim above 1024.
-A Metal compile failure is cached and declined the same way, so later calls do
-not retry it.
+and `rot_dim`), `adaln` / `rms_adaln` and the gated `input_act` pairs (`swiglu`,
+`situ`) as Metal kernels; the paired rope entries launch one kernel per tensor,
+two per paired call. The kernels are compiled with `torch.mps.compile_shader` and
+take float32, float16 and bfloat16, and strided views with a contiguous last dim,
+so packed-qkv slices and `(B, H, N, D)` layouts need no copies. Everything else is
+declined by the call rules and runs on eager: other dtypes or layouts, more than
+four leading dims that cannot be merged, a `freqs_cis` that is not float32, an
+RMS-RoPE scale that is not `[head_dim]`, and for RoPE an odd head dim or `rot_dim`
+or a head dim above 1024. A Metal compile failure is cached and declined the same
+way, so later calls do not retry it.
+
+`input_act` is the standalone form of the activations the quantized linears
+take as `input_act` (`gelu_tanh`, `swiglu`, `situ`, `rms_norm`), for callers
+whose linear is not quantized. It runs on eager everywhere; `mps` takes the
+gated pairs.
 
 ## Huawei Ascend backend
 
