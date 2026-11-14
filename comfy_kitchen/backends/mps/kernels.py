@@ -231,9 +231,11 @@ def rope_unsupported(x, freqs, weight=None, rot_dim=0):
         return f"unsupported head dim {dim} / rot_dim {rot_dim}"
     if freqs.dtype != torch.float32 or freqs.dim() < 3 or tuple(freqs.shape[-3:]) != (rot // 2, 2, 2):
         return "freqs_cis must be float32 [..., rot_dim // 2, 2, 2]"
-    if weight is not None and (not isinstance(weight, torch.Tensor) or weight.numel() != dim
-                               or weight.device != x.device):
-        return "scale must have head_dim elements on the same device"
+    # The kernel flattens the scale, so accept only the [head_dim] shape eager's
+    # F.rms_norm takes; a (1, head_dim) view would otherwise work here and raise there.
+    if weight is not None and (not isinstance(weight, torch.Tensor)
+                               or tuple(weight.shape) != (dim,) or weight.device != x.device):
+        return "scale must be a [head_dim] tensor on the same device"
     f = _trimmed_freqs(x, freqs)
     try:
         f = f.expand(*x.shape[:-1], rot // 2, 2, 2)
