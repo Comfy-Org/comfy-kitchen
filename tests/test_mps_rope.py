@@ -88,6 +88,19 @@ def test_rope_matches_eager(dtype, shape, layout, split_half):
                               rms(x.float().cpu(), fr.cpu(), w.float().cpu(), 1e-6))
 
 
+@pytest.mark.parametrize("split_half", [False, True], ids=["interleaved", "split_half"])
+def test_identity_frequencies_preserve_each_component_exactly(split_half):
+    """cos=1, sin=0 must return the input bit-for-bit, not just within the floor."""
+    torch.manual_seed(0)
+    b, n, h, d = 2, 5, 3, 16
+    x = (torch.rand(b, n, h, d, device=DEV, dtype=torch.float32) - 0.5) * 0.02
+    fr = torch.zeros(1, n, 1, d // 2, 2, 2, device=DEV, dtype=torch.float32)
+    fr[..., 0, 0] = 1.0
+    fr[..., 1, 1] = 1.0
+    op = ck.apply_rope_split_half1 if split_half else ck.apply_rope1
+    assert torch.equal(op(x, fr), x)
+
+
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda d: str(d)[6:])
 def test_packed_qkv_in_place_leaves_v_alone(dtype):
     torch.manual_seed(0)
