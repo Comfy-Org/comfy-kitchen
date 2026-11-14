@@ -1113,3 +1113,20 @@ class TestBandedStreamK:
         m = 9216                                          # 75.5 MB
         assert pick(m, n, k) == (13 if m * k > threshold else 0)
         assert pick(4096, 24576, 32768) in (0, 1)         # fewer M tiles than N: no reroute
+
+
+@requires_cuda_backend
+@pytest.mark.parametrize("rows", [8, 9, 4352])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_convrot_bf16_fast_path_matches_existing_kernel(rows, offset):
+    # Force the reference through the original 64-lane recipe using unaligned
+    # storage. Offset exercises the fallback; rows 8/9 cross fast dispatch.
+    torch.manual_seed(8713)
+    storage = torch.randn(rows * 4096 + offset, device="cuda", dtype=torch.bfloat16)
+    x = storage[offset:].view(rows, 4096)
+    q, scale = cuda.quantize_int8_rowwise_convrot(x, 256)
+    reference = torch.empty(x.numel() + 1, device=x.device, dtype=x.dtype)[1:].view_as(x)
+    reference.copy_(x)
+    expected_q, expected_scale = cuda.quantize_int8_rowwise_convrot64(reference, 256)
+    assert torch.equal(q, expected_q)
+    assert torch.equal(scale.view(torch.int32), expected_scale.view(torch.int32))
