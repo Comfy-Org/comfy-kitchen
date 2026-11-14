@@ -81,3 +81,10 @@ def test_compiles_rms_norm_with_a_weight():
     fn = torch.compile(lambda t: ck.input_act(t, "rms_norm", weight, 1e-6), fullgraph=True)
     out = fn(x)
     assert torch.equal(out, apply_input_act(x, "rms_norm", weight, 1e-6))
+
+
+@pytest.mark.parametrize("act", ["swiglu", "situ"])
+@pytest.mark.parametrize("width", [3, 5])
+def test_op_rejects_an_odd_last_dim(act, width):
+    with pytest.raises(ValueError, match="needs an even last dim"):
+        torch.ops.comfy_kitchen.input_act(torch.randn(2, width), act, None, 0.0)
