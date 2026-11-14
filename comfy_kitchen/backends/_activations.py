@@ -32,6 +32,11 @@ INPUT_ACT_TO_CODE: dict[str | None, int] = {
 }
 
 
+def _has_forward_tangent(t: torch.Tensor | None) -> bool:
+    """Whether ``t`` carries a forward-mode AD tangent (a dual tensor)."""
+    return t is not None and torch.autograd.forward_ad.unpack_dual(t).tangent is not None
+
+
 def input_act_code(input_act: str | None) -> int:
     """Kernel code for `input_act`, rejecting anything unsupported."""
     try:
@@ -77,8 +82,12 @@ def apply_input_act(
     if input_act == "rms_norm":
         if act_weight is None:
             raise ValueError("input_act 'rms_norm' requires act_weight")
-        return torch.nn.functional.rms_norm(
-            x, (x.shape[-1],), weight=act_weight.to(x.dtype), eps=act_eps)
+        weight = act_weight.to(x.dtype)
+        if _has_forward_tangent(x) or _has_forward_tangent(act_weight):
+            # F.rms_norm's weighted forward-AD path errors on MPS, so spell
+            # out the same formula; it keeps the tangent.
+            return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + act_eps) * weight
+        return torch.nn.functional.rms_norm(x, (x.shape[-1],), weight=weight, eps=act_eps)
     raise ValueError(_unsupported(input_act))
 
 

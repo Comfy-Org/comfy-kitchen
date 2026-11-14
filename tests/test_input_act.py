@@ -42,6 +42,36 @@ def test_gradients_flow_through_the_eager_path():
         assert torch.autograd.gradcheck(lambda y, act=act: ck.input_act(y, act), (y,))
 
 
+def _forward_reference(t, act, weight=None):
+    """Out-of-place activation used as the forward-mode tangent reference."""
+    if act == "gelu_tanh":
+        return torch.nn.functional.gelu(t, approximate="tanh")
+    if act == "swiglu":
+        gate, up = t.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * up
+    if act == "situ":
+        hidden, gate = t.chunk(2, dim=-1)
+        gated = gate.div(4.0).tanh().mul(4.0) * torch.sigmoid(gate)
+        return hidden.div(25.0).tanh().mul(25.0) * gated
+    return t * torch.rsqrt(t.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * weight
+
+
+@pytest.mark.parametrize("act", ["gelu_tanh", "swiglu", "situ", "rms_norm"])
+def test_forward_mode_tangent_survives_no_grad(act):
+    """A dual input keeps its tangent even when reverse-mode recording is off."""
+    torch.manual_seed(0)
+    x = torch.randn(2, 16, dtype=torch.double)
+    tangent_in = torch.randn_like(x)
+    weight = torch.rand(16, dtype=torch.double) * 0.5 + 0.5
+    kwargs = {"act_weight": weight, "act_eps": 1e-6} if act == "rms_norm" else {}
+    with torch.no_grad():
+        _, tangent = torch.func.jvp(lambda t: ck.input_act(t, act, **kwargs), (x,), (tangent_in,))
+        _, expected = torch.func.jvp(
+            lambda t: _forward_reference(t, act, weight), (x,), (tangent_in,))
+    assert tangent.abs().max() > 0
+    torch.testing.assert_close(tangent, expected)
+
+
 def test_weight_gradient_flows_without_input_grad():
     x = torch.randn(2, 8, dtype=torch.double)
     w = torch.rand(8, dtype=torch.double, requires_grad=True)

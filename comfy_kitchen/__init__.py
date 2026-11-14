@@ -9,7 +9,7 @@ from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
 from .backends.cuda import memmove_ as _memmove_
-from .backends._activations import apply_input_act
+from .backends._activations import _has_forward_tangent, apply_input_act
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -518,9 +518,12 @@ def input_act(
         return x
     if input_act in ("swiglu", "situ") and x.shape[-1] % 2:
         raise ValueError(f"input_act {input_act!r} needs an even last dim, got {x.shape[-1]}")
-    # The custom op has no autograd formula; keep gradient-tracked calls on the
-    # differentiable eager implementation instead of detaching them.
-    if torch.is_grad_enabled() and (x.requires_grad or (act_weight is not None and act_weight.requires_grad)):
+    # The custom op has no autograd or forward-AD formula; keep tracked calls on
+    # the differentiable eager implementation instead of detaching them. Forward
+    # mode is live even under torch.no_grad(), so test it separately.
+    needs_reverse = torch.is_grad_enabled() and (
+        x.requires_grad or (act_weight is not None and act_weight.requires_grad))
+    if needs_reverse or _has_forward_tangent(x) or _has_forward_tangent(act_weight):
         return apply_input_act(x, input_act, act_weight, act_eps)
     return torch.ops.comfy_kitchen.input_act(x, input_act, act_weight, float(act_eps))
 
