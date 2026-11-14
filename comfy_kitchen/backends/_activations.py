@@ -32,6 +32,11 @@ INPUT_ACT_TO_CODE: dict[str | None, int] = {
 }
 
 
+def _has_forward_tangent(t: torch.Tensor | None) -> bool:
+    """Whether ``t`` carries a forward-mode AD tangent (a dual tensor)."""
+    return t is not None and torch.autograd.forward_ad.unpack_dual(t).tangent is not None
+
+
 def input_act_code(input_act: str | None) -> int:
     """Kernel code for `input_act`, rejecting anything unsupported."""
     try:
@@ -65,16 +70,24 @@ def apply_input_act(
         return torch.nn.functional.silu(gate).mul_(up)
     if input_act == "situ":
         # 4*tanh(gate/4)*sigmoid(gate) * 25*tanh(hidden/25), evaluated in the
-        # same order and dtype as MOSS-Image's module; in place to avoid a
-        # fresh M x K temporary per op.
+        # same order and dtype as MOSS-Image's module. Keep the in-place path
+        # for inference; tanh's backward needs the pre-multiply output, so a
+        # gradient-tracked call uses the out-of-place form.
         hidden, gate = x.chunk(2, dim=-1)
+        if x.requires_grad and torch.is_grad_enabled():
+            gated = gate.div(4.0).tanh().mul(4.0).mul(torch.sigmoid(gate))
+            return hidden.div(25.0).tanh().mul(25.0).mul(gated)
         gated = gate.div(4.0).tanh_().mul_(4.0).mul_(torch.sigmoid(gate))
         return hidden.div(25.0).tanh_().mul_(25.0).mul_(gated)
     if input_act == "rms_norm":
         if act_weight is None:
             raise ValueError("input_act 'rms_norm' requires act_weight")
-        return torch.nn.functional.rms_norm(
-            x, (x.shape[-1],), weight=act_weight.to(x.dtype), eps=act_eps)
+        weight = act_weight.to(x.dtype)
+        if _has_forward_tangent(x) or _has_forward_tangent(act_weight):
+            # F.rms_norm's weighted forward-AD path errors on MPS, so spell
+            # out the same formula; it keeps the tangent.
+            return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + act_eps) * weight
+        return torch.nn.functional.rms_norm(x, (x.shape[-1],), weight=weight, eps=act_eps)
     raise ValueError(_unsupported(input_act))
 
 
