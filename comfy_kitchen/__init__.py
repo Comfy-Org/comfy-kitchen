@@ -9,6 +9,7 @@ from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
 from .backends.cuda import memmove_ as _memmove_
+from .backends._activations import apply_input_act
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -71,6 +72,8 @@ __all__ = [
     "group_norm_silu_pad3d",
     "group_norm_stats3d",
     "rms_adaln",
+    # Activations
+    "input_act",
     # Attention
     "PrequantizedInt8Attention",
     "int8_attention",
@@ -478,6 +481,39 @@ def rms_adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.rms_adaln(x, scale, shift, eps)
+
+
+def input_act(
+    x: torch.Tensor,
+    input_act: str | None,
+    act_weight: torch.Tensor | None = None,
+    act_eps: float = 0.0,
+) -> torch.Tensor:
+    """Apply one of the linear input activations on its own (unquantized paths).
+
+    The same activations the quantized linears accept as ``input_act``, for a
+    caller whose linear is not quantized: "gelu_tanh", "swiglu" and "situ" (the
+    gated pairs halve the last dim and need an even one), or "rms_norm" with
+    ``act_weight`` and ``act_eps``. ``None`` / "none" returns ``x`` unchanged.
+
+    Args:
+        x: Input tensor (..., K).
+        input_act: Activation name.
+        act_weight: K-element weight, required for "rms_norm".
+        act_eps: Epsilon for "rms_norm".
+
+    Returns:
+        The activated tensor; (..., K // 2) for "swiglu" and "situ".
+    """
+    if input_act in (None, "none"):
+        return x
+    if input_act in ("swiglu", "situ") and x.shape[-1] % 2:
+        raise ValueError(f"input_act {input_act!r} needs an even last dim, got {x.shape[-1]}")
+    # The custom op has no autograd formula; keep gradient-tracked calls on the
+    # differentiable eager implementation instead of detaching them.
+    if torch.is_grad_enabled() and (x.requires_grad or (act_weight is not None and act_weight.requires_grad)):
+        return apply_input_act(x, input_act, act_weight, act_eps)
+    return torch.ops.comfy_kitchen.input_act(x, input_act, act_weight, float(act_eps))
 
 
 def quantize_per_tensor_fp8(
