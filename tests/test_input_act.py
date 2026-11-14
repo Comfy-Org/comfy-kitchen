@@ -37,7 +37,7 @@ def test_gradients_flow_through_the_eager_path():
     w = torch.rand(8, dtype=torch.double, requires_grad=True)
     assert torch.autograd.gradcheck(lambda x, w: ck.input_act(x, "rms_norm", w, 1e-6), (x, w))
 
-    for act in ("swiglu", "situ"):
+    for act in ("gelu_tanh", "swiglu", "situ"):
         y = torch.randn(2, 16, dtype=torch.double, requires_grad=True)
         assert torch.autograd.gradcheck(lambda y, act=act: ck.input_act(y, act), (y,))
 
@@ -60,3 +60,24 @@ def test_transposed_input_keeps_the_eager_layout():
         # A compiled downstream reshape must see the same layout as eager.
         compiled = torch.compile(lambda t, act=act: ck.input_act(t, act).reshape(-1), fullgraph=True)
         assert torch.equal(compiled(x), apply_input_act(x, act).reshape(-1))
+
+
+@pytest.mark.parametrize("act", ["swiglu", "situ"])
+def test_gated_activations_reject_an_odd_last_dim(act):
+    with pytest.raises(ValueError, match="needs an even last dim"):
+        ck.input_act(torch.randn(2, 3), act)
+
+
+def test_op_disabled_returns_fresh_values():
+    x = torch.randn(4, 8)
+    out = torch.ops.comfy_kitchen.input_act(x, "none", None, 0.0)
+    torch.testing.assert_close(out, x)
+    assert out.data_ptr() != x.data_ptr()
+
+
+def test_compiles_rms_norm_with_a_weight():
+    x = torch.randn(2, 16)
+    weight = torch.rand(16)
+    fn = torch.compile(lambda t: ck.input_act(t, "rms_norm", weight, 1e-6), fullgraph=True)
+    out = fn(x)
+    assert torch.equal(out, apply_input_act(x, "rms_norm", weight, 1e-6))
