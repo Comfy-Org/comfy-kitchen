@@ -66,10 +66,17 @@ corresponding operator is available.
 
 ## Apple GPU (mps) backend
 
-The `mps` backend runs the rope entries (including in-place forms and `rot_dim`)
-and `adaln` / `rms_adaln` as Metal kernels compiled with `torch.mps.compile_shader`,
-for float32/float16/bfloat16 and strided views with a contiguous last dim. Other
-calls are declined and run on eager.
+The `mps` backend runs each single-tensor rope entry (including its in-place form
+and `rot_dim`) and `adaln` / `rms_adaln` as one Metal kernel; the paired rope
+entries launch one kernel per tensor, two per paired call. The kernels are
+compiled with `torch.mps.compile_shader` and take float32, float16 and bfloat16,
+and strided views with a contiguous last dim, so packed-qkv slices and
+`(B, H, N, D)` layouts need no copies. Everything else is declined by the call
+rules and runs on eager: other dtypes or layouts, more than four leading dims
+that cannot be merged, a `freqs_cis` that is not float32, a scale that is not
+`[head_dim]`, and for RoPE an odd head dim or `rot_dim` or a head dim above 1024.
+A Metal compile failure is cached and declined the same way, so later calls do
+not retry it.
 
 ## Huawei Ascend backend
 
