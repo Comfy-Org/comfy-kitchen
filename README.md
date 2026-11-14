@@ -346,6 +346,7 @@ The library supports multiple backends:
 - **eager**: Pure PyTorch implementation
 - **cuda**: Custom CUDA C kernels (CUDA only)
 - **hip**: Custom HIP kernels (WMMA GEMMs on RDNA3/3.5/4; non-WMMA kernels also on RDNA2)
+- **ascend**: Huawei Ascend NPU kernels (requires `torch-npu`)
 - **triton**: Triton JIT-compiled kernels
 - **mps**: Metal kernels for Apple GPUs (compiled with `torch.mps.compile_shader`)
 
