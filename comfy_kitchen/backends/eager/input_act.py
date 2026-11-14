@@ -34,5 +34,7 @@ def _op_input_act(
 
 @_op_input_act.register_fake
 def _op_input_act_fake(x, input_act, act_weight, act_eps):
-    width = x.shape[-1] - x.shape[-1] // 2 if input_act in ("swiglu", "situ") else x.shape[-1]
-    return x.new_empty(*x.shape[:-1], width)
+    # Run the eager chain on the fake tensor so the metadata (shape and strides)
+    # matches what the real kernel returns; `new_empty` would claim contiguous
+    # strides for an activation that preserves a transposed input's layout.
+    return apply_input_act(x, input_act, act_weight, act_eps)

@@ -39,4 +39,24 @@ def test_gradients_flow_through_the_eager_path():
 
     for act in ("swiglu", "situ"):
         y = torch.randn(2, 16, dtype=torch.double, requires_grad=True)
-        assert torch.autograd.gradcheck(lambda y: ck.input_act(y, act), (y,))
+        assert torch.autograd.gradcheck(lambda y, act=act: ck.input_act(y, act), (y,))
+
+
+def test_transposed_input_keeps_the_eager_layout():
+    """The fake kernel must not claim contiguous strides for a transposed input."""
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    x = torch.randn(3, 2, 16).transpose(0, 1)
+    for act in ("gelu_tanh", "swiglu", "situ"):
+        with ck.use_backend("eager"):
+            real = ck.input_act(x, act)
+        with FakeTensorMode():
+            fake = torch.ops.comfy_kitchen.input_act(
+                torch.empty_strided(x.shape, x.stride(), dtype=x.dtype), act, None, 0.0
+            )
+        assert fake.shape == real.shape
+        assert fake.stride() == real.stride()
+
+        # A compiled downstream reshape must see the same layout as eager.
+        compiled = torch.compile(lambda t, act=act: ck.input_act(t, act).reshape(-1), fullgraph=True)
+        assert torch.equal(compiled(x), apply_input_act(x, act).reshape(-1))
