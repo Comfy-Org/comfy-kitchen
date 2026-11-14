@@ -56,13 +56,20 @@ def _forward_reference(t, act, weight=None):
     return t * torch.rsqrt(t.pow(2).mean(dim=-1, keepdim=True) + 1e-6) * weight
 
 
+@pytest.mark.parametrize("device", ["cpu", "mps"])
 @pytest.mark.parametrize("act", ["gelu_tanh", "swiglu", "situ", "rms_norm"])
-def test_forward_mode_tangent_survives_no_grad(act):
+def test_forward_mode_tangent_survives_no_grad(act, device):
     """A dual input keeps its tangent even when reverse-mode recording is off."""
+    if device == "mps" and not torch.backends.mps.is_available():
+        pytest.skip("needs an Apple GPU")
     torch.manual_seed(0)
-    x = torch.randn(2, 16, dtype=torch.double)
+    # MPS has no float64; the CPU run keeps the tighter double tolerance. The MPS
+    # case is what catches a fallback to F.rms_norm, whose weighted forward-AD
+    # path raises there.
+    dtype = torch.float32 if device == "mps" else torch.double
+    x = torch.randn(2, 16, dtype=dtype, device=device)
     tangent_in = torch.randn_like(x)
-    weight = torch.rand(16, dtype=torch.double) * 0.5 + 0.5
+    weight = torch.rand(16, dtype=dtype, device=device) * 0.5 + 0.5
     kwargs = {"act_weight": weight, "act_eps": 1e-6} if act == "rms_norm" else {}
     with torch.no_grad():
         _, tangent = torch.func.jvp(lambda t: ck.input_act(t, act, **kwargs), (x,), (tangent_in,))
