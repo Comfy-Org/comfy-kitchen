@@ -6,12 +6,14 @@ On MPS the eager RoPE and AdaLN implementations run as chains of small ops
 full pass over memory. This backend runs them as one Metal kernel per tensor
 (two launches for the paired ``(xq, xk)`` RoPE entries), compiled with
 ``torch.mps.compile_shader``: every RoPE variant (interleaved and
-split-half, with or without the RMSNorm, partial ``rot_dim``, in place) and
-``adaln`` / ``rms_adaln``, in float32, float16 and bfloat16. Calls the kernels
+split-half, with or without the RMSNorm, partial ``rot_dim``, in place),
+``adaln`` / ``rms_adaln`` and the gated ``input_act`` pairs (swiglu, situ), in
+float32, float16 and bfloat16. Calls the kernels
 do not take (other devices, dtypes or layouts) are declined by the call rules
 and run on eager.
 """
 __all__ = [
+    "input_act",
     "adaln",
     "rms_adaln",
     "apply_rope",
@@ -37,6 +39,7 @@ import torch
 from comfy_kitchen.constraints import FunctionConstraints, ParamConstraint
 from comfy_kitchen.registry import registry
 
+from .activations import input_act, validate_input_act
 from .norm import adaln, rms_adaln, validate_adaln
 from .rope import (
     apply_rope,
@@ -80,6 +83,11 @@ def _build_constraints() -> dict:
         call_rules=(validate_adaln,),
     )
     out = {
+        "input_act": FunctionConstraints(
+            params={"x": ParamConstraint(dtypes=floats)},
+            default_devices=mps,
+            call_rules=(validate_input_act,),
+        ),
         "adaln": norm,
         "rms_adaln": norm,
         "apply_rope1": rope(("x",), validate_apply_rope1),
