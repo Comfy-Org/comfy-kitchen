@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(
 DEV = "mps"
 DTYPES = [torch.float32, torch.float16, torch.bfloat16]
 FLOOR = {torch.float32: 2e-5, torch.float16: 2e-3, torch.bfloat16: 1.6e-2}
-SHAPES = [(1, 45, 24, 128), (1, 17, 4, 96)]
+SHAPES = [(2, 45, 24, 128), (1, 17, 4, 96)]
 
 
 def freqs_for(lead, pairs):
@@ -109,6 +109,26 @@ def test_packed_qkv_in_place_leaves_v_alone(dtype):
         inplace(q, k, fr, *extra)
         assert torch.equal(q, expect[0]) and torch.equal(k, expect[1])
         assert torch.equal(v, v_before)
+
+
+@pytest.mark.parametrize("split_half", [False, True], ids=["interleaved", "split_half"])
+@pytest.mark.parametrize("dtype", DTYPES, ids=lambda d: str(d)[6:])
+def test_paired_rms_rope_uses_each_scale(dtype, split_half):
+    torch.manual_seed(0)
+    b, n, h, d = 2, 9, 4, 64
+    q = torch.randn(b, n, h, d, device=DEV, dtype=dtype)
+    k = torch.randn_like(q)
+    fr = freqs_for((1, n, 1), d // 2)
+    q_scale = (torch.rand(d, device=DEV) + 0.5).to(dtype)
+    k_scale = (torch.rand(d, device=DEV) + 0.5).to(dtype)
+    op = ck.rms_rope_split_half if split_half else ck.rms_rope
+    eager_op = eager.rms_rope_split_half if split_half else eager.rms_rope
+    got = op(q, k, fr, q_scale, k_scale, 1e-6)
+    stock = eager_op(q, k, fr, q_scale, k_scale, 1e-6)
+    ref = eager_op(q.float().cpu(), k.float().cpu(), fr.cpu(), q_scale.float().cpu(),
+                   k_scale.float().cpu(), 1e-6)
+    for g, s, r in zip(got, stock, ref, strict=True):
+        assert_close_to_reference(g, s, r)
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda d: str(d)[6:])

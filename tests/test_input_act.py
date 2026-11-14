@@ -42,6 +42,12 @@ def test_gradients_flow_through_the_eager_path():
         assert torch.autograd.gradcheck(lambda y, act=act: ck.input_act(y, act), (y,))
 
 
+def test_weight_gradient_flows_without_input_grad():
+    x = torch.randn(2, 8, dtype=torch.double)
+    w = torch.rand(8, dtype=torch.double, requires_grad=True)
+    assert torch.autograd.gradcheck(lambda w: ck.input_act(x, "rms_norm", w, 1e-6), (w,))
+
+
 def test_transposed_input_keeps_the_eager_layout():
     """The fake kernel must not claim contiguous strides for a transposed input."""
     from torch._subclasses.fake_tensor import FakeTensorMode
