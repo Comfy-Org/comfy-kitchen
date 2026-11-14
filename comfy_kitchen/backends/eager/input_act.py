@@ -7,7 +7,7 @@ than the eager chain of ops, so it is dispatched like any other op.
 """
 import torch
 
-from comfy_kitchen.backends._activations import apply_input_act, input_act_width
+from comfy_kitchen.backends._activations import apply_input_act
 from comfy_kitchen.registry import registry
 
 
@@ -34,4 +34,5 @@ def _op_input_act(
 
 @_op_input_act.register_fake
 def _op_input_act_fake(x, input_act, act_weight, act_eps):
-    return x.new_empty(*x.shape[:-1], x.shape[-1] // input_act_width(input_act))
+    width = x.shape[-1] - x.shape[-1] // 2 if input_act in ("swiglu", "situ") else x.shape[-1]
+    return x.new_empty(*x.shape[:-1], width)
