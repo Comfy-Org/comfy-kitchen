@@ -51,7 +51,7 @@ __global__ void sol_producer_kernel(
     float* __restrict__ qmean,               // [H, NPAD, HD] f32 block means (post-rope)
     float* __restrict__ vamax_next,          // [H, HD] atomicMax accumulator
     const int32_t* __restrict__ blen,        // [NTB] valid tokens per block, or null
-    float rope_eps, int rot,
+    float rope_eps, int rot, bool split_half,
     int t0, int M, int T, int Tp, int H, int NPAD, int NQ)
 {
     __shared__ __align__(16) __nv_bfloat16 sT[BLK * LD_TILE];
@@ -70,7 +70,7 @@ __global__ void sol_producer_kernel(
     // ---------------- Q phase ----------------
     stage_tile64(sT, rows + (int64_t)h * HD, row_stride, len);
     __syncthreads();
-    norm_rope_rows(sT, LD_TILE, len, fab_t0, qw, rope_eps, rot);
+    norm_rope_rows(sT, LD_TILE, len, fab_t0, qw, rope_eps, rot, split_half);
     __syncthreads();
     quant_q_rows(sT, len, nrows, qiP + ((size_t)tb0 * H + h) * HD, qs + (size_t)tb0 * H + h, H);
     __syncthreads();
@@ -82,7 +82,7 @@ __global__ void sol_producer_kernel(
     // ---------------- K phase ----------------
     stage_tile64(sT, rows + (int64_t)(H + h) * HD, row_stride, len);
     __syncthreads();
-    norm_rope_rows(sT, LD_TILE, len, fab_t0, kw, rope_eps, rot);
+    norm_rope_rows(sT, LD_TILE, len, fab_t0, kw, rope_eps, rot, split_half);
     __syncthreads();
     {
         // block K sums (post-rope, uncentered) for the pooled tensors
@@ -126,7 +126,7 @@ void launch_sol_producer(
     const void* kmean, const void* vscale,
     void* qiP, void* qs, void* kiP, void* ksb, void* vTi, void* vRow, void* vcT,
     void* ksumP, void* cen8, void* cens, void* qmean, void* vamax_next,
-    const void* blen, float rope_eps, int rot,
+    const void* blen, float rope_eps, int rot, bool split_half,
     int t0, int M, int T, int Tp, int H, int NPAD, int NQ,
     cudaStream_t stream)
 {
@@ -138,5 +138,5 @@ void launch_sol_producer(
         (int8_t*)qiP, (float*)qs, (int8_t*)kiP, (float2*)ksb,
         (int8_t*)vTi, (int8_t*)vRow, (__nv_bfloat16*)vcT, (float*)ksumP,
         (int8_t*)cen8, (float*)cens, (float*)qmean, (float*)vamax_next,
-        (const int32_t*)blen, rope_eps, rot, t0, M, T, Tp, H, NPAD, NQ);
+        (const int32_t*)blen, rope_eps, rot, split_half, t0, M, T, Tp, H, NPAD, NQ);
 }
