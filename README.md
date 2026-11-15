@@ -66,9 +66,10 @@ corresponding operator is available.
 
 ## Apple GPU (mps) backend
 
-The `mps` backend runs each single-tensor rope entry (including its in-place form
-and `rot_dim`) and `adaln` / `rms_adaln` as one Metal kernel; the paired rope
-entries launch one kernel per tensor, two per paired call. The kernels are
+The `mps` backend runs each single-tensor rope entry, including its in-place
+form, and `adaln` / `rms_adaln` as one Metal kernel; the paired rope entries
+(with the `rot_dim` prefix on the split-half RMS form) launch one kernel per
+tensor, two per paired call. The kernels are
 compiled with `torch.mps.compile_shader` and take float32, float16 and bfloat16,
 and strided views with a contiguous last dim, so packed-qkv slices and
 `(B, H, N, D)` layouts need no copies. Everything else is declined by the call
