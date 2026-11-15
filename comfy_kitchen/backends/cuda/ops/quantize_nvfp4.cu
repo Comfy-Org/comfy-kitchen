@@ -23,6 +23,7 @@
 namespace comfy {
 namespace {
 // Identical group ownership and arithmetic on every GPU.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000
 template <typename Input, int V, bool Masked, bool HiFirst>
 __global__ void
 quantize_nvfp4_kernel(const Input *input, const float *global_scale,
@@ -72,6 +73,7 @@ quantize_nvfp4_kernel(const Input *input, const float *global_scale,
       reinterpret_cast<uint16_t *>(output)[chunk] = packed.short_word;
   }
 }
+#endif
 
 // Keep the existing four-value decode kernel on every GPU.
 constexpr unsigned int kValsPerThread = 4;
@@ -186,6 +188,7 @@ __global__ void dequantize_nvfp4_kernel(
     }
 }
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000
 template <typename Input, int V>
 void launch_nvfp4_quantization(const void *input, const void *global_scale,
                                void *output, void *scales, int64_t rows,
@@ -239,6 +242,7 @@ void dispatch_nvfp4_quantization(const void *input, const void *global_scale,
   }
 #undef RUN
 }
+#endif
 
 template <typename Output>
 void dispatch_nvfp4_dequantization(const void *input, const void *global_scale,
@@ -275,6 +279,7 @@ void dispatch_nvfp4_dequantization(const void *input, const void *global_scale,
 } // namespace comfy
 
 extern "C" {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000
 void launch_quantize_nvfp4_kernel(const void *input, const void *global_scale,
                                   void *output, void *scales, int64_t rows,
                                   int64_t columns, int64_t original_rows,
@@ -295,6 +300,7 @@ void launch_quantize_nvfp4_kernel(const void *input, const void *global_scale,
   });
   CUDA_CHECK(cudaGetLastError());
 }
+#endif
 
 void launch_dequantize_nvfp4_kernel(const void *input, const void *global_scale,
                                     const void *scales, void *output,

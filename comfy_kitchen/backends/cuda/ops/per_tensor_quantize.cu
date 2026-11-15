@@ -35,6 +35,7 @@ __forceinline__ __device__ float clamp(float val, float min, float max) {
     return fminf(max, fmaxf(min, val));
 }
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 890
 template<typename InputType, typename OutputType>
 __global__ void quantize_fp8_tensor_kernel(
     const InputType *src, 
@@ -69,6 +70,8 @@ __global__ void quantize_fp8_tensor_kernel(
     }
     *reinterpret_cast<float4*>(dst + idx) = f4_e4m3.f4;
 }
+
+#endif
 
 template<typename InputType, typename OutputType>
 __global__ void dequantize_fp8_tensor_kernel(
@@ -118,6 +121,7 @@ __global__ void dequantize_fp8_tensor_kernel(
     }
 }
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 890
 template<typename InputType, typename OutputType>
 __global__ void stochastic_round_fp8_kernel(
     uint8_t *rng_and_dst,
@@ -160,6 +164,8 @@ __global__ void stochastic_round_fp8_kernel(
     rng_and_dst[idx] = out.u8;
 }
 
+#endif
+
 } // anonymous namespace
 
 } // namespace comfy
@@ -167,6 +173,7 @@ __global__ void stochastic_round_fp8_kernel(
 // C interface for DLPack bindings
 extern "C" {
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 890
 void launch_quantize_fp8_kernel(
     const void* input, 
     void* output, 
@@ -208,6 +215,8 @@ void launch_quantize_fp8_kernel(
     }
 }
 
+#endif
+
 void launch_dequantize_fp8_kernel(
     const void* input,
     void* output,
@@ -248,6 +257,7 @@ void launch_dequantize_fp8_kernel(
     }
 }
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 890
 void launch_stochastic_round_fp8_kernel(
     void* rng_and_output,
     const void* input,
@@ -284,5 +294,7 @@ void launch_stochastic_round_fp8_kernel(
         throw std::runtime_error(std::string("CUDA kernel launch failed: ") + cudaGetErrorString(err));
     }
 }
+
+#endif
 
 } // extern "C"

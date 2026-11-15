@@ -19,6 +19,7 @@
 #include "utils.cuh"
 #include <stdexcept>
 
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1000
 namespace comfy {
 namespace {
 template <typename Input, int V, bool Masked>
@@ -118,3 +119,4 @@ extern "C" void launch_quantize_mxfp8_kernel(const void *input, void *output,
   });
   CUDA_CHECK(cudaGetLastError());
 }
+#endif
