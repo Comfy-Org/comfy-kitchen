@@ -395,7 +395,6 @@ def test_chunked_producer_matches_separate_rope(rot):
     assert _cos(out3, ref) > 0.995
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_chunked_producer_interleaved_rope():
     """rope_split_half=False rotates the pairs (2i, 2i + 1): checked against
     rms_rope_ + sol_attn, and against the split-half producer given the same q
@@ -418,7 +417,6 @@ def test_chunked_producer_interleaved_rope():
     assert _rel(out1, halves) < 2e-3
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_chunked_producer_fp16_chunks():
     """fp16 chunks go through the bf16 kernel and the output comes back fp16."""
     c = _chunked_case(seed=11, rot=64, v_scale=0.02)

@@ -3790,6 +3790,14 @@ def fp16_conv3d_out(
     out.copy_(res if residual is None else res + residual)
 
 
+def _group_norm_chunks(b: int, c: int, t: int, h: int, w: int) -> int:
+    # Match group_norm_chunk_rows in group_norm_config.h.
+    chunk_rows = 64
+    while chunk_rows < 1024 and b * t * h * w * ((c + 63) // 64) > 512 * chunk_rows:
+        chunk_rows *= 2
+    return -(-(h * w) // chunk_rows)
+
+
 def group_norm_silu_pad3d(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -3819,8 +3827,11 @@ def group_norm_silu_pad3d(
                   or b * (t + front) > 65535)
     row_stride = _ndhwc_row_stride(x) if served else None
     if served and row_stride is None:
-        row_stride = w * c
-        x = x.contiguous(memory_format=torch.channels_last_3d)
+        if c >= 32 and h * w >= 64 and x.is_contiguous() and _aligned16(x) and x.numel() >= 1 << 20:
+            row_stride = -t  # Use direct NCDHW reads when the transpose tile has enough work.
+        else:
+            row_stride = w * c
+            x = x.contiguous(memory_format=torch.channels_last_3d)
     served = served and _aligned16(x)  # the kernels issue 16-byte vector loads
     if not served:
         res = _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, stats)
@@ -3839,7 +3850,7 @@ def group_norm_silu_pad3d(
     if weight is None:
         weight = bias = placeholder
     elif stats is None:
-        chunks = -(-(h * w) // 1024)
+        chunks = _group_norm_chunks(b, c, t, h, w)
         workspace = torch.empty(2 * b * t * (chunks * c + num_groups), dtype=torch.float32, device=x.device)
     _C.group_norm_silu_pad3d(
         _wrap_for_dlpack(x), _wrap_for_dlpack(weight), _wrap_for_dlpack(bias),
@@ -3871,12 +3882,15 @@ def group_norm_stats3d(x: torch.Tensor, num_groups: int, eps: float) -> torch.Te
     served = not (c % 8 or c > 2048 or c % num_groups or num_groups > 1024 or b * t > 65535)
     row_stride = _ndhwc_row_stride(x) if served else None
     if served and row_stride is None:
-        row_stride = w * c
-        x = x.contiguous(memory_format=torch.channels_last_3d)
+        if x.is_contiguous() and _aligned16(x):
+            row_stride = -t  # Native contiguous NCDHW input; avoid a layout copy.
+        else:
+            row_stride = w * c
+            x = x.contiguous(memory_format=torch.channels_last_3d)
     served = served and _aligned16(x)
     if not served:
         return _eager_group_norm_stats3d(x, num_groups, eps)
-    chunks = -(-(h * w) // 1024)
+    chunks = _group_norm_chunks(b, c, t, h, w)
     workspace = torch.empty(2 * b * t * chunks * c, dtype=torch.float32, device=x.device)
     stats = torch.empty((b * t, num_groups, 2), dtype=torch.float32, device=x.device)
     _C.group_norm_stats3d(
@@ -3924,7 +3938,13 @@ def _apply_rope_cuda(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, *,
     split_half: bool, inplace: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if xq.shape != xk.shape:
+    if xq.shape != xk.shape and (
+        not hasattr(_C, "apply_rope_gqa") or xq.ndim != 4 or xk.ndim != 4
+        or freqs_cis.ndim != 6 or xq.shape[0] != xk.shape[0]
+        or xq.shape[3] != xk.shape[3]
+        or xq.shape[2 if freqs_cis.shape[1] == 1 else 1]
+        != xk.shape[2 if freqs_cis.shape[1] == 1 else 1]
+    ):
         return (
             _apply_rope1_cuda(xq, freqs_cis, split_half=split_half, inplace=inplace),
             _apply_rope1_cuda(xk, freqs_cis, split_half=split_half, inplace=inplace),
@@ -4069,23 +4089,25 @@ def _rms_rope_cuda(
             fallback = (_eager_rope.rms_rope_split_half_ if inplace
                         else _eager_rope.rms_rope_split_half)
             return fallback(q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
-        return (
-            _rms_rope1_cuda(
-                q, freqs_cis, q_scale, epsilon,
-                split_half=split_half, inplace=inplace,
-            ),
-            _rms_rope1_cuda(
-                k, freqs_cis, k_scale, epsilon,
-                split_half=split_half, inplace=inplace,
-            ),
-        )
+        if not hasattr(_C, "rms_rope_gqa"):
+            return (
+                _rms_rope1_cuda(
+                    q, freqs_cis, q_scale, epsilon,
+                    split_half=split_half, inplace=inplace,
+                ),
+                _rms_rope1_cuda(
+                    k, freqs_cis, k_scale, epsilon,
+                    split_half=split_half, inplace=inplace,
+                ),
+            )
 
     assert _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope", rot_dim=rot_dim) is not None
 
     q_out = q if inplace else torch.empty_like(q)
     k_out = k if inplace else torch.empty_like(k)
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
-    _C.rms_rope(
+    native_op = _C.rms_rope if q.shape == k.shape else _C.rms_rope_gqa
+    native_op(
         _wrap_for_dlpack(q),
         _wrap_for_dlpack(k),
         _wrap_for_dlpack(freqs_cis),
