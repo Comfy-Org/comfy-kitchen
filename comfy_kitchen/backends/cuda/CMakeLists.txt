@@ -218,6 +218,53 @@ endif()
 
 target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_cuda_kernels>)
 
+# The packed converter requires architecture-specific images. Derive these
+# from the requested architectures; NVCC supplies the members of 'f' families.
+if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1")
+    execute_process(COMMAND "${CMAKE_CUDA_COMPILER}" --list-gpu-code
+        OUTPUT_VARIABLE convrot_gpu_codes RESULT_VARIABLE convrot_list_status)
+    if(NOT convrot_list_status EQUAL 0)
+        message(FATAL_ERROR "Cannot query NVCC architecture support for ConvRot")
+    endif()
+    string(REGEX MATCHALL "sm_[0-9]+" convrot_family_archs "${convrot_gpu_codes}")
+    list(TRANSFORM convrot_family_archs REPLACE "^sm_" "")
+    list(TRANSFORM convrot_family_archs APPEND "a-real")
+    set(COMFY_CONVROT_ARCHS "")
+    foreach(arch IN LISTS COMFY_CUDA_ARCHS)
+        if(NOT arch MATCHES "^([0-9]+)")
+            continue()
+        endif()
+        set(cc "${CMAKE_MATCH_1}")
+        if(arch MATCHES "f(-real)?$")
+            string(REGEX REPLACE "[0-9]$" "" family "${cc}")
+            set(targets ${convrot_family_archs})
+            list(FILTER targets INCLUDE REGEX "^${family}[0-9]a-real$")
+            list(APPEND COMFY_CONVROT_ARCHS ${targets})
+        elseif(cc GREATER_EQUAL 90)
+            list(APPEND COMFY_CONVROT_ARCHS "${cc}a-real")
+        elseif(cc GREATER_EQUAL 80)
+            list(APPEND COMFY_CONVROT_ARCHS "${cc}-real")
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES COMFY_CONVROT_ARCHS)
+    message(STATUS "ConvRot fast architectures: ${COMFY_CONVROT_ARCHS}")
+    if(COMFY_CONVROT_ARCHS)
+        set(COMFY_CONVROT_CCS ${COMFY_CONVROT_ARCHS})
+        list(TRANSFORM COMFY_CONVROT_CCS REPLACE "[^0-9]" "")
+        list(JOIN COMFY_CONVROT_CCS "\\," COMFY_CONVROT_CCS)
+        add_library(comfy_convrot_fast OBJECT ops/int8_linear.cu)
+        set_target_properties(comfy_convrot_fast PROPERTIES
+            CUDA_ARCHITECTURES "${COMFY_CONVROT_ARCHS}"
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        target_compile_definitions(comfy_convrot_fast PRIVATE
+            COMFY_BUILD_CONVROT_FAST "COMFY_CONVROT_CCS=${COMFY_CONVROT_CCS}")
+        target_compile_options(comfy_convrot_fast PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
+        target_include_directories(comfy_convrot_fast PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIRS})
+        target_compile_definitions(comfy_kitchen_cuda_kernels PRIVATE COMFY_HAVE_CONVROT_BF16)
+        target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_convrot_fast>)
+    endif()
+endif()
+
 target_compile_definitions(_C PRIVATE NB_STATIC)
 
 # Include directories
