@@ -3924,7 +3924,13 @@ def _apply_rope_cuda(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, *,
     split_half: bool, inplace: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if xq.shape != xk.shape:
+    if xq.shape != xk.shape and (
+        not hasattr(_C, "apply_rope_gqa") or xq.ndim != 4 or xk.ndim != 4
+        or freqs_cis.ndim != 6 or xq.shape[0] != xk.shape[0]
+        or xq.shape[3] != xk.shape[3]
+        or xq.shape[2 if freqs_cis.shape[1] == 1 else 1]
+        != xk.shape[2 if freqs_cis.shape[1] == 1 else 1]
+    ):
         return (
             _apply_rope1_cuda(xq, freqs_cis, split_half=split_half, inplace=inplace),
             _apply_rope1_cuda(xk, freqs_cis, split_half=split_half, inplace=inplace),
@@ -4069,23 +4075,25 @@ def _rms_rope_cuda(
             fallback = (_eager_rope.rms_rope_split_half_ if inplace
                         else _eager_rope.rms_rope_split_half)
             return fallback(q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
-        return (
-            _rms_rope1_cuda(
-                q, freqs_cis, q_scale, epsilon,
-                split_half=split_half, inplace=inplace,
-            ),
-            _rms_rope1_cuda(
-                k, freqs_cis, k_scale, epsilon,
-                split_half=split_half, inplace=inplace,
-            ),
-        )
+        if not hasattr(_C, "rms_rope_gqa"):
+            return (
+                _rms_rope1_cuda(
+                    q, freqs_cis, q_scale, epsilon,
+                    split_half=split_half, inplace=inplace,
+                ),
+                _rms_rope1_cuda(
+                    k, freqs_cis, k_scale, epsilon,
+                    split_half=split_half, inplace=inplace,
+                ),
+            )
 
     assert _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope", rot_dim=rot_dim) is not None
 
     q_out = q if inplace else torch.empty_like(q)
     k_out = k if inplace else torch.empty_like(k)
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
-    _C.rms_rope(
+    native_op = _C.rms_rope if q.shape == k.shape else _C.rms_rope_gqa
+    native_op(
         _wrap_for_dlpack(q),
         _wrap_for_dlpack(k),
         _wrap_for_dlpack(freqs_cis),
