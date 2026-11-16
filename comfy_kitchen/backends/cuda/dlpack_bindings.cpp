@@ -2114,7 +2114,7 @@ void group_norm_silu_pad3d(
 {
     const bool norm = weight.size() > 0;
     const bool given = stats.size() > 0;
-    if (row_stride < W * C) {
+    if ((row_stride != -T && row_stride < W * C)) {
         throw std::invalid_argument("group_norm_silu_pad3d: row stride is shorter than a row");
     }
     if (norm && (static_cast<int64_t>(weight.size()) != C || static_cast<int64_t>(bias.size()) != C)) {
@@ -2154,7 +2154,7 @@ void group_norm_stats3d(
     int dtype_code,
     uintptr_t stream_ptr)
 {
-    if (static_cast<int64_t>(x.size()) != B * C * T * H * W || row_stride < W * C) {
+    if (static_cast<int64_t>(x.size()) != B * C * T * H * W || (row_stride != -T && row_stride < W * C)) {
         throw std::invalid_argument("group_norm_stats3d: x size or row stride does not match the given shape");
     }
     const int64_t chunks = (H * W + 1023) / 1024;
