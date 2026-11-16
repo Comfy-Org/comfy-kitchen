@@ -2265,6 +2265,10 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
+    bool launch_cutlass_int8_dequant_scalar(
+        const void*, const void*, const float*, const float*, const void*, void*,
+        int64_t, int64_t, int64_t, cudaStream_t);
+
     int cutlass_int8_selected_config(int64_t M, int64_t N, int64_t K);
 
     bool launch_cutlass_int8_dequant_config(
@@ -3117,6 +3121,32 @@ bool cutlass_int8_dequant(
     const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
     return launch_cutlass_int8_dequant(a.data(), b.data(), xs.data(), ws.data(),
                                        bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
+}
+
+// Scalar-weight BF16 fast path. Keep the vector-scale binding and its
+// residual/strided consumers unchanged; false preserves their existing fallback.
+bool cutlass_int8_dequant_scalar(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::c_contig, nb::device::cuda> a,
+    nb::ndarray<int8_t, nb::ndim<2>, nb::c_contig, nb::device::cuda> b,
+    nb::ndarray<float, nb::c_contig, nb::device::cuda> xs,
+    nb::ndarray<float, nb::c_contig, nb::device::cuda> ws,
+    nb::ndarray<nb::c_contig, nb::device::cuda> bias,
+    nb::ndarray<nb::ndim<2>, nb::c_contig, nb::device::cuda> d,
+    uintptr_t stream_ptr) {
+    const int64_t m = a.shape(0), n = b.shape(0), k = a.shape(1);
+    if (b.shape(1) != k || d.shape(0) != m || d.shape(1) != n ||
+        xs.size() != size_t(m) || ws.size() != 1 || map_dtype_to_code(d.dtype()) != 2 ||
+        (bias.size() && (bias.size() != size_t(n) || map_dtype_to_code(bias.dtype()) != 2)))
+        throw std::runtime_error("cutlass_int8_dequant_scalar: invalid shape, scale or BF16 output/bias");
+    int device;
+    if (cudaGetDevice(&device) != cudaSuccess || device != a.device_id() ||
+        b.device_id() != device || xs.device_id() != device || ws.device_id() != device ||
+        d.device_id() != device ||
+        (bias.size() && bias.device_id() != device))
+        throw std::runtime_error("cutlass_int8_dequant_scalar: operands must be on the current CUDA device");
+    return launch_cutlass_int8_dequant_scalar(a.data(), b.data(), xs.data(), ws.data(),
+        bias.size() ? bias.data() : nullptr, d.data(), m, n, k,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Shared operand checks for the fp16 GEMM bindings: A [M,K], B [N,K], D [M,N],
@@ -4811,6 +4841,11 @@ NB_MODULE(_C, m) {
           nb::arg("d"),
           nb::arg("out_dtype_code"),
           nb::arg("stream_ptr"));
+
+    m.def("cutlass_int8_dequant_scalar", &cutlass_int8_dequant_scalar,
+          "Scalar-weight BF16 INT8 GEMM + DQ on SM90/SM100; false uses the existing backend",
+          nb::arg("a"), nb::arg("b"), nb::arg("xs"), nb::arg("ws"), nb::arg("bias"),
+          nb::arg("d"), nb::arg("stream_ptr"));
 
     m.def("cutlass_fp16_linear", &cutlass_fp16_linear,
           "FP16 GEMM with FP16 accumulators via CUTLASS (D = A @ B^T + bias); "
