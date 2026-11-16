@@ -2333,6 +2333,25 @@ def int8_linear(
             return _finish(turing_out)
 
     used_cutlass = False
+    if (
+        not _DISABLE_CUTLASS_INT8
+        and out_dtype == torch.bfloat16
+        and weight_scale.numel() == 1
+        and m >= 1024
+        and k <= 131071  # Keep every signed INT8 dot within INT32.
+        and residual is None
+        and _cuda_device_capability(x_qdata.get_device()) in ((9, 0), (10, 0))
+        and hasattr(_C, "cutlass_int8_dequant_scalar")
+    ):
+        used_cutlass = _C.cutlass_int8_dequant_scalar(
+            _wrap_for_dlpack(x_qdata),
+            _wrap_for_dlpack(weight),
+            _wrap_for_dlpack(x_scale),
+            _wrap_for_dlpack(weight_scale),
+            _wrap_for_dlpack(bias_arg),
+            _wrap_for_dlpack(out),
+            stream_ptr,
+        )
     prefer_cublas_fallback = _prefer_cublas_int8_fallback(
         m,
         n,
@@ -2340,7 +2359,8 @@ def int8_linear(
         x_qdata.get_device(),
     )
     if (
-        not prefer_cublas_fallback
+        not used_cutlass
+        and not prefer_cublas_fallback
         and not _DISABLE_CUTLASS_INT8
         and _cuda_device_supports_cutlass_int8_dequant(x_qdata)
     ):

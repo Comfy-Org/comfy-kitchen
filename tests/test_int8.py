@@ -1112,4 +1112,51 @@ class TestBandedStreamK:
         assert pick(2048, n, k) in (0, 1)                 # 16.8 MB: below any threshold
         m = 9216                                          # 75.5 MB
         assert pick(m, n, k) == (13 if m * k > threshold else 0)
-        assert pick(4096, 24576, 32768) in (0, 1)         # fewer M tiles than N: no reroute
+        selected = pick(4096, 24576, 32768)
+        expected = {13} if l2 >= 16 << 20 else {0, 1}
+        assert selected in expected
+
+
+@requires_cuda_backend
+@pytest.mark.parametrize("shape", [(1025, 128, 256), (4096, 512, 4096), (4096, 256, 8192)])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_scalar_int8_gemm_replays_updated_inputs(shape, with_bias, seed):
+    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0)):
+        pytest.skip("Native scalar INT8 GEMM targets SM90/SM100")
+    m, n, k = shape
+    wrap, c = cuda._wrap_for_dlpack, cuda._C
+    a = torch.randint(-128, 128, (m, k), dtype=torch.int8, device="cuda")
+    b = torch.randint(-128, 128, (n, k), dtype=torch.int8, device="cuda")
+    xs = torch.rand(m, device="cuda") * 0.01
+    ws = torch.full((), 0.027, device="cuda")
+    bias = (torch.randn(n, dtype=torch.bfloat16, device="cuda") if with_bias
+            else cuda._empty_cuda_tensor(a.device, torch.bfloat16))
+    out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
+    ref = torch.empty_like(out)
+    stream = torch.cuda.current_stream().cuda_stream
+
+    def run():
+        assert c.cutlass_int8_dequant_scalar(
+            *(wrap(t) for t in (a, b, xs, ws, bias, out)), stream)
+
+    def reference():
+        vector_scale = ws.expand(n).contiguous()
+        assert c.cutlass_int8_dequant(
+            *(wrap(t) for t in (a, b, xs, vector_scale, bias, ref)), 2, stream)
+
+    reference()
+    run()
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    a.random_(-128, 128)
+    b.random_(-128, 128)
+    xs.uniform_(0.001, 0.01)
+    ws.fill_(0.013)
+    if with_bias:
+        bias.normal_()
+    reference()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))

@@ -159,10 +159,10 @@ struct ThreadblockSwizzleLeanStreamKT {
     }
 
     CUTLASS_DEVICE
-    cutlass::gemm::GemmCoord get_tile_offset(int tile_index) const {
+    cutlass::gemm::GemmCoord get_tile_offset(int tile_index, bool prefer_bands = false) const {
         int tile_m;
         int tile_n;
-        if (tiled_shape_.m() < tiled_shape_.n()) {
+        if (!prefer_bands && tiled_shape_.m() < tiled_shape_.n()) {
             tile_n = tile_index / tiled_shape_.m();
             tile_m = tile_index - tile_n * tiled_shape_.m();
         } else if (band_tiles > 0) {

@@ -218,6 +218,31 @@ endif()
 
 target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_cuda_kernels>)
 
+# TMA/WGMMA/UMMA require architecture-specific images. Compile the same unit
+# once per requested, validated architecture; generic/SM120 kernels stay in the
+# existing target. Family requests (e.g. 100f) also contain the native 100 image.
+if(EXISTS "${COMFY_CUTLASS_DIR}/cutlass/version.h")
+    set(int8_tma_archs "")
+    foreach(arch IN LISTS COMFY_CUDA_ARCHS)
+        if(arch MATCHES "^(90|100)(a|f)?(-real)?$")
+            list(APPEND int8_tma_archs "${CMAKE_MATCH_1}")
+        endif()
+    endforeach()
+    list(REMOVE_DUPLICATES int8_tma_archs)
+    foreach(cc IN LISTS int8_tma_archs)
+        add_library(comfy_int8_sm${cc} OBJECT ops/int8_gemm/tma.cu)
+        set_target_properties(comfy_int8_sm${cc} PROPERTIES
+            CUDA_ARCHITECTURES "${cc}a-real"
+            CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+        target_compile_definitions(comfy_int8_sm${cc} PRIVATE COMFY_INT8_GEMM_ARCH=${cc})
+        target_compile_options(comfy_int8_sm${cc} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
+        target_include_directories(comfy_int8_sm${cc} PRIVATE
+            "${COMFY_CUTLASS_DIR}" "${COMFY_CUTLASS_DIR}/../tools/util/include")
+        target_compile_definitions(comfy_kitchen_cuda_kernels PRIVATE COMFY_HAVE_INT8_SM${cc})
+        target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_int8_sm${cc}>)
+    endforeach()
+endif()
+
 target_compile_definitions(_C PRIVATE NB_STATIC)
 
 # Include directories

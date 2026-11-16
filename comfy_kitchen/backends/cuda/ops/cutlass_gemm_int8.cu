@@ -18,6 +18,42 @@
 #include <cstdint>
 #include <cmath>
 #include <algorithm>
+#include <climits>
+
+#include "int8_gemm/int8_gemm.cuh"
+
+// The scalar fast path is separate from the legacy vector-scale API, so its
+// existing callers, residual epilogue and SM120 instantiations stay unchanged.
+extern "C" bool launch_cutlass_int8_dequant_scalar(
+    const void* a, const void* b, const float* xs, const float* ws, const void* bias,
+    void* out, int64_t m, int64_t n, int64_t k, cudaStream_t stream) {
+    if (m < 1024 || n <= 0 || k <= 0 || k > 131071 || m > INT_MAX / 32 || n > INT_MAX / 32 || k > INT_MAX / 32)
+        return false;
+    if ((reinterpret_cast<uintptr_t>(a) | reinterpret_cast<uintptr_t>(b)) & 15)
+        return false;
+    if ((reinterpret_cast<uintptr_t>(xs) | reinterpret_cast<uintptr_t>(ws)) & 3)
+        return false;
+    if ((reinterpret_cast<uintptr_t>(bias) | reinterpret_cast<uintptr_t>(out)) & 15)
+        return false;
+    int device, major, minor;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
+        return false;
+    const comfy::int8_gemm::Problem p{
+        static_cast<const int8_t*>(a), static_cast<const int8_t*>(b), xs, ws,
+        static_cast<const __nv_bfloat16*>(bias), static_cast<__nv_bfloat16*>(out),
+        int(m), int(n), int(k)};
+#ifdef COMFY_HAVE_INT8_SM90
+    if (major == 9 && minor == 0)
+        return comfy::int8_gemm::launch_sm90(p, stream);
+#endif
+#ifdef COMFY_HAVE_INT8_SM100
+    if (major == 10 && minor == 0)
+        return comfy::int8_gemm::launch_sm100(p, stream);
+#endif
+    return false;
+}
 
 #ifdef COMFY_HAVE_CUTLASS
 
@@ -32,9 +68,34 @@ namespace {
 using namespace cute;
 using comfy_cutlass::device_sm_count;
 using comfy_cutlass::device_l2_bytes;
-// Bands of 32 N tiles: a 154 MB weight at 32k rows reads 0.9 GB from DRAM instead of 26 GB.
-// An L2 too small to hold a band narrows them, see stream_k_band_tiles.
-using ThreadblockSwizzleBandedStreamK = comfy_cutlass::ThreadblockSwizzleLeanStreamKT<32>;
+int64_t band_reroute_bytes(int64_t l2) {
+    return std::max<int64_t>(l2 * 3 / 4, int64_t(48) << 20);
+}
+// Leave room for activations when a streaming INT8 weight band would fill L2.
+// Keep bands across grid aspect ratios when activations outgrow the cache.
+struct ThreadblockSwizzleBandedStreamK : comfy_cutlass::ThreadblockSwizzleLeanStreamKT<32> {
+    using Base = comfy_cutlass::ThreadblockSwizzleLeanStreamKT<32>;
+    ThreadblockSwizzleBandedStreamK() = default;
+    bool prefer_bands = false;
+
+    template<typename... Args>
+    ThreadblockSwizzleBandedStreamK(cutlass::gemm::GemmUniversalMode mode,
+        cutlass::gemm::GemmCoord problem, cutlass::gemm::GemmCoord tile, Args... args)
+        : Base(mode, problem, tile, args...) {
+        const int64_t l2 = device_l2_bytes();
+        prefer_bands = l2 >= comfy_cutlass::kBandRetainL2Bytes &&
+                       int64_t(problem.m()) * problem.k() > band_reroute_bytes(l2);
+        if (l2 >= comfy_cutlass::kBandRetainL2Bytes && int64_t(problem.m()) * problem.k() > l2) {
+            const int cache_band = std::max(1, int(l2 / (2 * int64_t(tile.n()) * problem.k())));
+            band_tiles = std::min(band_tiles, cache_band);
+        }
+    }
+
+    CUTLASS_DEVICE
+    cutlass::gemm::GemmCoord get_tile_offset(int tile_index) const {
+        return Base::get_tile_offset(tile_index, prefer_bands);
+    }
+};
 
 template <typename ThreadMap, bool Scalar>
 struct WeightScaleBroadcast;
@@ -221,12 +282,12 @@ int wave_guard(int m, int n, int selected) {
 int choose_fused_int8_config(int m, int n, int k) {
     const int selected = wave_guard(m, n, select_fused_int8_config(m, n, k));
     if (selected != 0 && selected != 1) return selected;
-    // The identity order re-reads the activation per weight column once it outgrows L2;
-    // banded stream-K does not, but only bands when M has at least as many tiles as N.
+    // Use cache bands once activations outgrow L2, including N-wide grids.
+    // Small caches retain their existing grid-aspect policy.
     // Measured crossovers: 66-88 MB at 96 MB L2, 42-63 MB at 36 MB.
-    const int64_t reroute_bytes = std::max<int64_t>(int64_t(device_l2_bytes()) * 3 / 4, int64_t(48) << 20);
-    const bool bands = (m + 127) / 128 >= (n + 255) / 256;
-    return (bands && int64_t(m) * k > reroute_bytes) ? 13 : selected;
+    const int64_t l2 = device_l2_bytes();
+    const bool bands = l2 >= comfy_cutlass::kBandRetainL2Bytes || (m + 127) / 128 >= (n + 255) / 256;
+    return (bands && int64_t(m) * k > band_reroute_bytes(l2)) ? 13 : selected;
 }
 
 template <typename Launch>
