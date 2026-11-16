@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 // group_norm_silu_pad3d: per-frame GroupNorm + SiLU + causal-conv padding (reflect
-// in space, zero frames in front) in one pass, NDHWC in and out.
+// in space, zero frames in front) in one pass, NCDHW or NDHWC in and NDHWC out.
 //   stats_partial:  per (frame, pixel chunk, channel tile) sum / sum of squares
 //   stats_finalize: reduce to per-group mean, rstd
 //   apply:          normalize, silu, store into the padded output (reflected indices)
@@ -104,17 +104,82 @@ stats_partial_kernel(const T* __restrict__ x, float2* __restrict__ partial,
     }
 }
 
+// Center on one shared group value, retaining small differences for nearly constant inputs.
+template <typename T>
+__global__ void stats_group_partial_kernel(const T* __restrict__ x, float2* __restrict__ partial,
+    float2* __restrict__ stats, int64_t rows, int C, int G, int chunks, int time, int chunk_rows) {
+    const int group = blockIdx.x % G, chunk = blockIdx.x / G, frame = blockIdx.y;
+    const int cpg = C / G;
+    const int64_t begin = int64_t(chunk) * chunk_rows, end = min(begin + chunk_rows, rows);
+    const int64_t base = ((int64_t(frame / time) * C + group * cpg) * time + frame % time) * rows;
+    const T anchor_value = x[base];
+    const float anchor = to_f(anchor_value);
+    if (!chunk && !threadIdx.x) stats[int64_t(frame) * G + group] = make_float2(anchor, 0.f);
+    const int pixels8 = chunk_rows / 8, shift = __ffs(pixels8) - 1;
+    const int vectors = pixels8 * cpg;
+    float s = 0.f, ss = 0.f;
+    for (int i = threadIdx.x; i < vectors; i += blockDim.x) {
+        const int c = group * cpg + (i >> shift);
+        const int64_t pixel = begin + (i & (pixels8 - 1)) * 8;
+        if (pixel >= end) continue;
+        const int64_t off = ((int64_t(frame / time) * C + c) * time + frame % time) * rows + pixel;
+        uint4 raw;
+        T* vals = reinterpret_cast<T*>(&raw);
+        const T* src = x + off;
+        if ((pixel + 8 <= end) && !(reinterpret_cast<uintptr_t>(src) & 15))
+            raw = *reinterpret_cast<const uint4*>(src);
+        else {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) vals[j] = pixel + j < end ? src[j] : anchor_value;
+        }
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float d = to_f(vals[j]) - anchor;
+            s += d;
+            ss += d * d;
+        }
+    }
+    for (int off = 16; off; off >>= 1) {
+        s += __shfl_down_sync(0xffffffffu, s, off);
+        ss += __shfl_down_sync(0xffffffffu, ss, off);
+    }
+    __shared__ float2 sums[8];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (!lane) sums[warp] = make_float2(s, ss);
+    __syncthreads();
+    if (!warp) {
+        s = lane < blockDim.x / 32 ? sums[lane].x : 0.f;
+        ss = lane < blockDim.x / 32 ? sums[lane].y : 0.f;
+        for (int off = 16; off; off >>= 1) {
+            s += __shfl_down_sync(0xffffffffu, s, off);
+            ss += __shfl_down_sync(0xffffffffu, ss, off);
+        }
+        if (!lane) {
+            partial[(int64_t(frame) * chunks + chunk) * G + group] =
+                make_float2(s, ss);
+        }
+    }
+}
+
 // One block per group; keep FP64 accumulation while reducing in parallel.
+template <bool GROUPED>
 __global__ void stats_finalize_kernel(const float2* __restrict__ partial, float2* __restrict__ stats,
                                       int C, int G, int chunks, double n_per_group, float eps) {
     const int frame = blockIdx.x;
     const int g = blockIdx.y;
     const int cpg = C / G;
+    const double anchor = GROUPED ? stats[int64_t(frame) * G + g].x : 0.0;
     double s = 0.0, ss = 0.0;
-    for (int i = threadIdx.x; i < chunks * cpg; i += blockDim.x) {
-        const float2 p = partial[(static_cast<int64_t>(frame) * chunks + i / cpg) * C + g * cpg + i % cpg];
-        s += p.x;
-        ss += p.y;
+    for (int i = threadIdx.x; i < chunks * (GROUPED ? 1 : cpg); i += blockDim.x) {
+        if constexpr (GROUPED) {
+            const float2 p = partial[(int64_t(frame) * chunks + i) * G + g];
+            s += p.x;
+            ss += p.y;
+        } else {
+            const float2 p = partial[(static_cast<int64_t>(frame) * chunks + i / cpg) * C + g * cpg + i % cpg];
+            s += p.x;
+            ss += p.y;
+        }
     }
     for (int offset = 16; offset; offset /= 2) {
         s += __shfl_down_sync(0xffffffff, s, offset);
@@ -133,8 +198,9 @@ __global__ void stats_finalize_kernel(const float2* __restrict__ partial, float2
             ss += __shfl_down_sync(0xffffffff, ss, offset);
         }
         if (lane == 0) {
-            const double mean = s / n_per_group;
-            const double var = fmax(ss / n_per_group - mean * mean, 0.0);
+            const double d = s / n_per_group;
+            const double mean = anchor + d;
+            const double var = fmax(ss / n_per_group - d * d, 0.0);
             stats[frame * G + g] = make_float2(static_cast<float>(mean), rsqrtf(static_cast<float>(var) + eps));
         }
     }
@@ -208,16 +274,87 @@ apply_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
     }
 }
 
+// Coalesced NCDHW loads and NDHWC stores meet in a padded transpose tile.
+template <typename T>
+__global__ void apply_channels_first_kernel(const T* __restrict__ x, const float2* __restrict__ stats,
+    const T* __restrict__ gamma, const T* __restrict__ beta, T* __restrict__ out,
+    int C, int T_in, int H, int W, int G, int T_out, int H_out, int W_out,
+    int left, int top, int front, bool silu, bool zero_pad, int cpg, uint32_t reciprocal) {
+    __shared__ uint16_t tile[64][65];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int oframe = blockIdx.y, t = oframe % T_out - front;
+    const int iframe = oframe / T_out * T_in + t;
+    if (t < 0) {
+        for (int i = threadIdx.x; i < 512; i += blockDim.x) {
+            const int c = blockIdx.z * 64 + (i & 7) * 8;
+            const int64_t p = int64_t(blockIdx.x) * 64 + i / 8;
+            if (c < C && p < int64_t(H_out) * W_out)
+                *reinterpret_cast<uint4*>(out + (int64_t(oframe) * H_out * W_out + p) * C + c) = make_uint4(0, 0, 0, 0);
+        }
+        return;
+    }
+    const int64_t pixel = int64_t(blockIdx.x) * 64 + lane * 2;
+    const int out_y = pixel / W_out, out_x = pixel % W_out;
+    const bool wrap = out_x + 1 == W_out;
+    const int ys[2] = {out_y - top, out_y + int(wrap) - top};
+    const int xs[2] = {out_x - left, (wrap ? 0 : out_x + 1) - left};
+    const bool valid[2] = {pixel < int64_t(H_out) * W_out && (!zero_pad || (ys[0] >= 0 && ys[0] < H && xs[0] >= 0 && xs[0] < W)),
+        pixel + 1 < int64_t(H_out) * W_out && (!zero_pad || (ys[1] >= 0 && ys[1] < H && xs[1] >= 0 && xs[1] < W))};
+    const int64_t spatial[2] = {int64_t(zero_pad ? ys[0] : reflect_index(ys[0], H)) * W + (zero_pad ? xs[0] : reflect_index(xs[0], W)),
+        int64_t(zero_pad ? ys[1] : reflect_index(ys[1], H)) * W + (zero_pad ? xs[1] : reflect_index(xs[1], W))};
+    #pragma unroll
+    for (int j = 0; j < 64; j += 8) {
+        const int c = blockIdx.z * 64 + warp + j;
+        float2 f = make_float2(0.f, 0.f);
+        if (c < C) {
+            const int64_t base = ((int64_t(oframe / T_out) * C + c) * T_in + t) * H * W;
+            if (valid[0]) f.x = to_f(x[base + spatial[0]]);
+            if (valid[1]) f.y = to_f(x[base + spatial[1]]);
+            if (gamma) {
+                uint32_t group = cpg == 1 ? c : __umulhi(static_cast<uint32_t>(c), reciprocal);
+                group += static_cast<uint32_t>(c) - group * cpg >= static_cast<uint32_t>(cpg);
+                const float2 st = stats[int64_t(iframe) * G + group];
+                const float a = st.y * to_f(gamma[c]), b = to_f(beta[c]) - st.x * a;
+                f = to_pair<T>(from_pair<T>(make_float2(a * f.x + b, a * f.y + b)));
+            }
+            if (silu) { f.x = f.x / (1.f + expf(-f.x)); f.y = f.y / (1.f + expf(-f.y)); }
+        }
+        const uint32_t raw = from_pair<T>(f);
+        tile[lane * 2][warp + j] = valid[0] ? uint16_t(raw) : 0;
+        tile[lane * 2 + 1][warp + j] = valid[1] ? uint16_t(raw >> 16) : 0;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int j = 0; j < 64; j += 8) {
+        const int c = blockIdx.z * 64 + lane * 2;
+        const int64_t p = int64_t(blockIdx.x) * 64 + warp + j;
+        if (c < C && p < int64_t(H_out) * W_out) {
+            const uint32_t raw = tile[warp + j][lane * 2] | (uint32_t(tile[warp + j][lane * 2 + 1]) << 16);
+            *reinterpret_cast<uint32_t*>(out + (int64_t(oframe) * H_out * W_out + p) * C + c) = raw;
+        }
+    }
+}
+
 template <typename T>
 void stats_typed(const T* x, float2* partial, float2* stats, int frames, int C, int H, int W, int G, float eps,
                  int64_t row_stride, cudaStream_t stream) {
     const int64_t rows = static_cast<int64_t>(H) * W;
     const int chunk_rows = stats_chunk_rows(frames, C, rows);
     const int chunks = static_cast<int>((rows + chunk_rows - 1) / chunk_rows);
+    const int cpg = C / G;
+    if (row_stride < 0) {
+        const int64_t vectors = int64_t((chunk_rows + 7) / 8) * cpg;
+        const int threads = int(std::min<int64_t>(256, ((vectors + 31) / 32) * 32));
+        stats_group_partial_kernel<T><<<dim3(chunks * G, frames), threads, 0, stream>>>(
+            x, partial, stats, rows, C, G, chunks, int(-row_stride), chunk_rows);
+        stats_finalize_kernel<true><<<dim3(frames, G), 128, 0, stream>>>(
+            partial, stats, C, G, chunks, double(rows) * cpg, eps);
+        return;
+    }
     const int cv = std::min(C / kVec, 8);
     stats_partial_kernel<T><<<dim3(chunks, frames, (C / kVec + cv - 1) / cv), (kThreads / cv) * cv, 0, stream>>>(
         x, partial, rows, C, chunks, W, row_stride, chunk_rows);
-    stats_finalize_kernel<<<dim3(frames, G), 128, 0, stream>>>(
+    stats_finalize_kernel<false><<<dim3(frames, G), 128, 0, stream>>>(
         partial, stats, C, G, chunks, static_cast<double>(rows) * (C / G), eps);
 }
 
@@ -243,6 +380,13 @@ void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* wor
     const int T_out = T_in + front;
     const int H_out = H + top + bottom;
     const int W_out = W + left + right;
+    const int cpg = norm ? C / G : 1;
+    const uint32_t cpg_reciprocal = norm ? static_cast<uint32_t>((uint64_t{1} << 32) / cpg) : 0;
+    if (row_stride < 0) {
+        apply_channels_first_kernel<T><<<dim3((int64_t(H_out) * W_out + 63) / 64, B * T_out, (C + 63) / 64), 256, 0, stream>>>(
+            x, stats, gamma, beta, out, C, T_in, H, W, G, T_out, H_out, W_out, left, top, front, silu, zero_pad, cpg, cpg_reciprocal);
+        return;
+    }
     const int cv = C / kVec;
     const int threads = (kThreads / cv) * cv;
     int pixels_per_thread = 1;
@@ -261,7 +405,6 @@ void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* wor
     const dim3 grid(static_cast<unsigned>((plane_pixels + pixels_per_block - 1) / pixels_per_block),
                     B * T_out, row_grid ? std::min(H_out, 65535) : 1);
     const size_t smem = norm ? 2 * (C + C / kVec) * sizeof(float) : 0;
-    const uint32_t cpg_reciprocal = norm ? static_cast<uint32_t>((uint64_t{1} << 32) / (C / G)) : 0;
 #define LAUNCH_APPLY(N, S, Z)                                                         \
     apply_kernel<T, N, S, Z><<<grid, threads, smem, stream>>>(                       \
         x, stats, gamma, beta, out, T_in, H, W, C, G, T_out, H_out, W_out, left, top, front, row_stride, pixels_per_thread, cpg_reciprocal)
@@ -283,7 +426,7 @@ void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* wor
 
 // Per-frame GroupNorm statistics only: stats [B*T*G] float2 (mean, rstd), workspace
 // B*T*ceil(H*W/chunk_rows)*C float2. Feeds launch_group_norm_silu_pad3d's stats_in for strips.
-// row_stride: elements between image rows (W * C when packed; larger for a row-interleaved view).
+// row_stride: -T for contiguous NCDHW, otherwise the NDHWC image-row pitch.
 extern "C" void launch_group_norm_stats3d(
     const void* x, void* workspace, void* stats,
     int B, int C, int T, int H, int W, int G, float eps, int64_t row_stride,
@@ -300,7 +443,7 @@ extern "C" void launch_group_norm_stats3d(
     });
 }
 
-// x/out NDHWC; gamma/beta [C] or both nullptr for pad-only;
+// out NDHWC; x may be contiguous NCDHW (row_stride=-T); gamma/beta [C] or nullptr for pad-only;
 // workspace (B*T*ceil(H*W/chunk_rows)*C + B*T*G) float2, unused without gamma or with stats_in;
 // stats_in [B*T*G] float2 from launch_group_norm_stats3d, or nullptr to compute them here.
 extern "C" void launch_group_norm_silu_pad3d(
