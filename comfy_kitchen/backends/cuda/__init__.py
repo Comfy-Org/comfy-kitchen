@@ -3791,7 +3791,7 @@ def fp16_conv3d_out(
 
 
 def _group_norm_chunks(b: int, c: int, t: int, h: int, w: int) -> int:
-    # Match stats_chunk_rows in ops/group_norm_pad3d.cu.
+    # Match group_norm_chunk_rows in group_norm_config.h.
     chunk_rows = 64
     while chunk_rows < 1024 and b * t * h * w * ((c + 63) // 64) > 512 * chunk_rows:
         chunk_rows *= 2

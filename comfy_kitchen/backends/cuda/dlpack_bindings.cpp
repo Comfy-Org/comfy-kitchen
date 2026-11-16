@@ -25,6 +25,7 @@
 #include <tuple>
 
 #include "cublaslt_runtime.h"
+#include "group_norm_config.h"
 #include "input_act_codes.h"
 
 namespace nb = nanobind;
@@ -2127,7 +2128,7 @@ void group_norm_silu_pad3d(
         static_cast<int64_t>(out.size()) != B * C * (T + front) * (H + top + bottom) * (W + left + right)) {
         throw std::invalid_argument("group_norm_silu_pad3d: x/out sizes do not match the given shape");
     }
-    const int64_t chunks = (H * W + 1023) / 1024;
+    const int64_t chunks = comfy::group_norm_chunks(B * T, C, H * W);
     if (norm && !given && static_cast<int64_t>(workspace.size()) < 2 * B * T * (chunks * C + num_groups)) {
         throw std::invalid_argument("group_norm_silu_pad3d: workspace too small");
     }
@@ -2157,7 +2158,7 @@ void group_norm_stats3d(
     if (static_cast<int64_t>(x.size()) != B * C * T * H * W || (row_stride != -T && row_stride < W * C)) {
         throw std::invalid_argument("group_norm_stats3d: x size or row stride does not match the given shape");
     }
-    const int64_t chunks = (H * W + 1023) / 1024;
+    const int64_t chunks = comfy::group_norm_chunks(B * T, C, H * W);
     if (static_cast<int64_t>(workspace.size()) < 2 * B * T * chunks * C) {
         throw std::invalid_argument("group_norm_stats3d: workspace too small");
     }

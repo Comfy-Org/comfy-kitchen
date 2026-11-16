@@ -17,17 +17,12 @@
 #include <algorithm>
 
 #include "dtype_dispatch.cuh"
+#include "group_norm_config.h"
 
 namespace {
 
 constexpr int kThreads = 256;
 constexpr int kVec = 8;            // 16-byte vectors of half / bf16
-inline int stats_chunk_rows(int frames, int C, int64_t rows) {
-    // Keep enough blocks for small frames without excessive partials on large ones.
-    int chunk_rows = 64;
-    while (chunk_rows < 1024 && rows * frames * ((C + 63) / 64) > 512 * chunk_rows) chunk_rows *= 2;
-    return chunk_rows;
-}
 
 template <typename T> __device__ __forceinline__ float to_f(T v);
 template <> __device__ __forceinline__ float to_f<half>(half v) { return __half2float(v); }
@@ -339,7 +334,7 @@ template <typename T>
 void stats_typed(const T* x, float2* partial, float2* stats, int frames, int C, int H, int W, int G, float eps,
                  int64_t row_stride, cudaStream_t stream) {
     const int64_t rows = static_cast<int64_t>(H) * W;
-    const int chunk_rows = stats_chunk_rows(frames, C, rows);
+    const int chunk_rows = comfy::group_norm_chunk_rows(frames, C, rows);
     const int chunks = static_cast<int>((rows + chunk_rows - 1) / chunk_rows);
     const int cpg = C / G;
     if (row_stride < 0) {
@@ -366,7 +361,7 @@ void launch_typed(const T* x, const T* gamma, const T* beta, T* out, float2* wor
     const bool norm = gamma != nullptr;
     const int frames = B * T_in;
     const int64_t rows = static_cast<int64_t>(H) * W;
-    const int chunk_rows = stats_chunk_rows(frames, C, rows);
+    const int chunk_rows = comfy::group_norm_chunk_rows(frames, C, rows);
     const int chunks = static_cast<int>((rows + chunk_rows - 1) / chunk_rows);
     const float2* stats = stats_in;
 
