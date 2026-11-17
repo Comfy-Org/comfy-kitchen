@@ -167,7 +167,7 @@ __device__ inline void load_q(const T* __restrict__ q, int64_t row0, int64_t row
 // One staged key tile for one warp: S = Q.K^T over the active n8 tiles, masked
 // online softmax, O += P.V. visible(row, key) says whether this thread's row
 // (0: g, 1: g+8) sees key `key` of the tile.
-template <typename T, int HD, int BK, bool BASE2 = false, bool MATRIX_K = false, typename Visible>
+template <typename T, int HD, int BK, bool MATRIX_K = false, typename Visible>
 __device__ inline void attend_tile(const T* tK, const T* tV, const uint32_t (&qa)[HD / 16][4], const bool (&active)[BK / 8],
                                    const Visible& visible, float scale, float (&m_r)[2], float (&l_r)[2],
                                    float (&o_acc)[HD / 8][4], int lane) {
@@ -215,7 +215,8 @@ __device__ inline void attend_tile(const T* tK, const T* tV, const uint32_t (&qa
         for (int e = 0; e < 4; ++e) {
             const int row = e >> 1;          // c0,c1 -> row g; c2,c3 -> row g+8
             const bool vis = active[nt] && visible(row, nt * 8 + qd * 2 + (e & 1));
-            const float s = vis ? s_acc[nt][e] * (BASE2 ? scale * 1.4426950408889634f : scale) : NEG_INF;
+            // Keep finite logits in their original units until the row max is subtracted.
+            const float s = vis ? s_acc[nt][e] * scale : NEG_INF;
             s_acc[nt][e] = s;
             m_new[row] = fmaxf(m_new[row], s);
         }
@@ -226,8 +227,8 @@ __device__ inline void attend_tile(const T* tK, const T* tV, const uint32_t (&qa
         m_new[0] = fmaxf(m_new[0], __shfl_xor_sync(0xffffffffu, m_new[0], off));
         m_new[1] = fmaxf(m_new[1], __shfl_xor_sync(0xffffffffu, m_new[1], off));
     }
-    const float alpha0 = (BASE2 ? exp2f(m_r[0] - m_new[0]) : __expf(m_r[0] - m_new[0]));
-    const float alpha1 = (BASE2 ? exp2f(m_r[1] - m_new[1]) : __expf(m_r[1] - m_new[1]));
+    const float alpha0 = __expf(m_r[0] - m_new[0]);
+    const float alpha1 = __expf(m_r[1] - m_new[1]);
     m_r[0] = m_new[0];
     m_r[1] = m_new[1];
     float l_add[2] = {0.f, 0.f};
@@ -236,7 +237,7 @@ __device__ inline void attend_tile(const T* tK, const T* tV, const uint32_t (&qa
         #pragma unroll
         for (int e = 0; e < 4; ++e) {
             const int row = e >> 1;
-            const float pv = (s_acc[nt][e] <= NEG_INF) ? 0.f : (BASE2 ? exp2f(s_acc[nt][e] - m_new[row]) : __expf(s_acc[nt][e] - m_new[row]));
+            const float pv = (s_acc[nt][e] <= NEG_INF) ? 0.f : __expf(s_acc[nt][e] - m_new[row]);
             s_acc[nt][e] = pv;
             l_add[row] += pv;
         }
@@ -649,7 +650,7 @@ __global__ void __launch_bounds__(WQ * 32, WQ == 1 ? 16 : 1) window_patch_kernel
             const int ky = tY[c], kx = tX[c];
             return ky >= ylo[row] && ky < yhi[row] && kx >= xlo && kx < xhi;
         };
-        attend_tile<T, HD, BK, WQ == 1>(sK[buf], sV[buf], qa, active, visible, p.scale, m_r, l_r, o_acc, lane);
+        attend_tile<T, HD, BK>(sK[buf], sV[buf], qa, active, visible, p.scale, m_r, l_r, o_acc, lane);
         __syncthreads();
         if (!advance_patch<BK>(p, t_hi, y_first, y_last, x_first, x_last, cp))
             break;
@@ -846,7 +847,7 @@ __global__ void __launch_bounds__(32 * (TEMPORAL ? 2 : NA3D_PATCH_WARPS(K)), TEM
                     if constexpr (TEMPORAL) return (score_bits >> ((c / 8) * 4 + row * 2 + (c & 1))) & 1u;
                     else return ((row ? word1 : word0) >> c) & 1u;
                 };
-                attend_tile<T, HD, BK, true, TEMPORAL>(sK[buf], sV[buf], qa, active, visible, p.scale, m, l, acc, lane);
+                attend_tile<T, HD, BK, TEMPORAL>(sK[buf], sV[buf], qa, active, visible, p.scale, m, l, acc, lane);
             }
             // Spatial tiles retire prior readers at the next load barrier.
             if constexpr (WQ == 1) __syncwarp(); else buf ^= 1;
