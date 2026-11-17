@@ -34,6 +34,47 @@ def roundup(x: int, multiple: int) -> int:
     return ((x + multiple - 1) // multiple) * multiple
 
 
+_FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+_FP8_CAST_SUPPORT: dict[str, bool] = {}
+_FP8_DECODE_LUTS: dict[tuple, torch.Tensor] = {}
+
+
+def supports_fp8_cast(device: torch.device | str) -> bool:
+    """Whether ``device`` can cast float8 tensors to another float dtype.
+
+    Some backends (MPS) can allocate, copy and bit-view float8 tensors but have no float8
+    kernels, so any cast raises ``RuntimeError: Undefined type Float8_e4m3fn``. Probed once
+    per device type.
+    """
+    dev_type = torch.device(device).type
+    supported = _FP8_CAST_SUPPORT.get(dev_type)
+    if supported is None:
+        try:
+            torch.zeros((1,), dtype=torch.float8_e4m3fn, device=device).to(torch.float32)
+            supported = True
+        except (RuntimeError, TypeError, NotImplementedError):
+            supported = False
+        _FP8_CAST_SUPPORT[dev_type] = supported
+    return supported
+
+
+def fp8_to_float(x: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """``x.to(dtype)`` that also works where the device has no float8 cast (e.g. MPS).
+
+    Non-float8 inputs and devices with a native cast take the plain ``.to(dtype)``.
+    Otherwise the values are decoded bit-exactly through a 256-entry table built on CPU and
+    indexed on the device with the uint8 bit pattern, which needs no float8 kernel.
+    """
+    if x.dtype not in _FP8_DTYPES or supports_fp8_cast(x.device):
+        return x.to(dtype)
+    key = (x.dtype, dtype, x.device)
+    lut = _FP8_DECODE_LUTS.get(key)
+    if lut is None:
+        lut = torch.arange(256, dtype=torch.uint8, device="cpu").view(x.dtype).to(dtype).to(x.device)
+        _FP8_DECODE_LUTS[key] = lut
+    return lut[x.view(torch.uint8).long()]
+
+
 def _float8_round(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.float8_e4m3fn).to(torch.float32)
 
