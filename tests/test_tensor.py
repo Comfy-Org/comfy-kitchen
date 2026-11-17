@@ -1076,6 +1076,26 @@ class TestNVFP4LinearOperations:
         assert result.shape == expected.shape
         assert torch.equal(result, expected)
 
+    def test_nvfp4_compiled_linear_with_bias_avoids_dequantization(self, monkeypatch):
+        if not TensorCoreNVFP4Layout.supports_fast_matmul():
+            pytest.skip("NVFP4 matmul requires Blackwell")
+        x = QuantizedTensor.from_float(torch.randn(32, 64, device="cuda", dtype=torch.bfloat16),
+                                       "TensorCoreNVFP4Layout")
+        w = QuantizedTensor.from_float(torch.randn(128, 64, device="cuda", dtype=torch.bfloat16),
+                                       "TensorCoreNVFP4Layout")
+        bias = torch.randn(128, device="cuda", dtype=torch.bfloat16)
+        expected = comfy_kitchen.scaled_mm_nvfp4(
+            x._qdata, w._qdata, x._params.scale, w._params.scale,
+            x._params.block_scale, w._params.block_scale, bias=bias,
+        )
+
+        def fail_dequantize(self):
+            pytest.fail("Compiled NVFP4 linear fell back to dequantization")
+
+        monkeypatch.setattr(QuantizedTensor, "dequantize", fail_dequantize)
+        compiled = torch.compile(torch.nn.functional.linear, fullgraph=True)
+        torch.testing.assert_close(compiled(x, w, bias), expected, rtol=0, atol=0)
+
     def test_nvfp4_linear_output_dtype(self):
         """Test that NVFP4 linear output has correct dtype."""
         if not TensorCoreNVFP4Layout.supports_fast_matmul():
