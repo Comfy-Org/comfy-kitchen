@@ -246,7 +246,6 @@ from comfy_kitchen.tensor.int8_utils import (  # noqa: E402
 )
 
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
-_cublas_workspaces: dict[int, torch.Tensor] = {}
 _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
 _nvidia_16_series_device_cache: dict[int, bool] = {}
@@ -532,17 +531,12 @@ def get_cublas_workspace_size_bytes() -> int:
 
 
 def get_cublas_workspace() -> torch.Tensor:
-    """Returns workspace for cublas."""
-    device_index = torch.cuda.current_device()
-    workspace = _cublas_workspaces.get(device_index)
-    if workspace is None:
-        workspace = torch.empty(
-            get_cublas_workspace_size_bytes(),
-            dtype=torch.uint8,
-            device=device_index,
-        )
-        _cublas_workspaces[device_index] = workspace
-    return workspace
+    """Return call-local scratch; caching retains tensors in CUDA graph pools."""
+    return torch.empty(
+        get_cublas_workspace_size_bytes(),
+        dtype=torch.uint8,
+        device=torch.cuda.current_device(),
+    )
 
 
 def _empty_cuda_tensor(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
