@@ -25,6 +25,7 @@
 #include <tuple>
 
 #include "cublaslt_runtime.h"
+#include "group_norm_config.h"
 #include "input_act_codes.h"
 
 namespace nb = nanobind;
@@ -124,6 +125,13 @@ extern "C" {
         int input_dtype_code,
         bool hi_first,
         cudaStream_t stream);
+
+    bool try_launch_rope_gqa(
+        const void* q, const void* k, const void* freqs,
+        const void* q_scale, const void* k_scale, void* q_out, void* k_out,
+        int64_t batch, int64_t heads, int64_t k_heads, int64_t tokens, int64_t head_dim,
+        bool bnhd, bool split_half, bool fp32_weights, float epsilon,
+        int input_dtype, bool rms, cudaStream_t stream);
 
     void launch_rms_rope_kernel(
         const void* q,
@@ -282,7 +290,7 @@ extern "C" {
     void sol_producer_chunk(
         void* workspace, const void* qkv, const void* fab,
         const void* qw, const void* kw, const void* kmean, const void* vscale,
-        const void* blen, float rope_eps, int rot_dim, int t0, int M,
+        const void* blen, float rope_eps, int rot_dim, bool split_half, int t0, int M,
         int batch, int seq_len, int num_heads, int n_tok, cudaStream_t stream);
     void launch_sol_attn_core(
         void* workspace, void* out, const void* vscale, void* kmean_next, void* vamax_out,
@@ -699,6 +707,22 @@ void apply_rope(
         throw std::runtime_error("Output shape must match input shape");
     }
 
+    // Get input dtype code
+    int input_dtype_code = map_dtype_to_code(xq.dtype());
+    int output_dtype_code = map_dtype_to_code(xq_out.dtype());
+    if ((input_dtype_code != 1 && input_dtype_code != 2) ||
+        output_dtype_code != input_dtype_code) {
+        throw std::runtime_error(
+            "apply_rope inputs and outputs must share an FP16/BF16 dtype");
+    }
+
+    // Get freqs dtype code
+    int freqs_dtype_code = map_dtype_to_code(freqs.dtype());
+    if (freqs_dtype_code < 0 || freqs_dtype_code > 2) {
+        throw std::runtime_error(
+            "apply_rope frequencies must be FP32, FP16, or BF16");
+    }
+
     // Handle optional xk and xk_out
     bool has_xk = !xk_obj.is_none();
     bool has_xk_out = !xk_out_obj.is_none();
@@ -716,18 +740,46 @@ void apply_rope(
         auto xk = nb::cast<nb::ndarray<nb::device::cuda>>(xk_obj);
         auto xk_out = nb::cast<nb::ndarray<nb::device::cuda>>(xk_out_obj);
         
-        if (xk.ndim() != 4 ||
-            xk.shape(0) != batch || xk.shape(1) != dim1 ||
-            xk.shape(2) != dim2 || xk.shape(3) != head_dim) {
-            throw std::runtime_error("xk shape must match xq shape");
+        if (xk.ndim() != 4 || xk_out.ndim() != 4) {
+            throw std::runtime_error("apply_rope requires 4D key inputs and outputs");
         }
-        
-        if (xk_out.ndim() != 4 ||
-            xk_out.shape(0) != batch || xk_out.shape(1) != dim1 ||
-            xk_out.shape(2) != dim2 || xk_out.shape(3) != head_dim) {
-            throw std::runtime_error("xk_out shape must match xq shape");
+        bool same_shape = true;
+        for (int axis = 0; axis < 4; ++axis) {
+            same_shape &= xk.shape(axis) == xq.shape(axis);
+            if (xk_out.shape(axis) != xk.shape(axis))
+                throw std::runtime_error("xk_out shape must match xk shape");
         }
-        
+        if (!same_shape) {
+            const bool bnhd = freqs_dim2 == 1 && freqs_dim1 == dim1;
+            const int ha = bnhd ? 2 : 1, ta = bnhd ? 1 : 2;
+            bool eligible = xk.shape(0) == batch && xk.shape(ta) == xq.shape(ta) &&
+                xk.shape(3) == head_dim && freqs_batch == 1 &&
+                freqs.shape(ha) == 1 && freqs.shape(ta) == xq.shape(ta) &&
+                freqs_dtype_code == 0 &&
+                map_dtype_to_code(xk.dtype()) == input_dtype_code &&
+                map_dtype_to_code(xk_out.dtype()) == input_dtype_code;
+            uint64_t qs = 1, ks = 1, fs = 1;
+            for (int axis = 3; axis >= 0; --axis) {
+                eligible &= xq.stride(axis) == qs && xq_out.stride(axis) == qs &&
+                    xk.stride(axis) == ks && xk_out.stride(axis) == ks;
+                qs *= xq.shape(axis);
+                ks *= xk.shape(axis);
+            }
+            for (int axis = 5; axis >= 0; --axis) {
+                eligible &= freqs.stride(axis) == fs;
+                fs *= freqs.shape(axis);
+            }
+            if (eligible && try_launch_rope_gqa(
+                    xq.data(), xk.data(), freqs.data(), nullptr, nullptr,
+                    xq_out.data(), xk_out.data(), batch, xq.shape(ha), xk.shape(ha),
+                    xq.shape(ta), head_dim, bnhd, split_half, true, 0.f,
+                    input_dtype_code, false, reinterpret_cast<cudaStream_t>(stream_ptr)))
+                return;
+            apply_rope(xq, freqs, xq_out, nb::none(), nb::none(), stream_ptr, split_half);
+            apply_rope(xk, freqs, xk_out, nb::none(), nb::none(), stream_ptr, split_half);
+            return;
+        }
+
         xk_data = xk.data();
         xk_out_data = xk_out.data();
         k_s0 = xk.stride(0); k_s1 = xk.stride(1);
@@ -738,22 +790,6 @@ void apply_rope(
             map_dtype_to_code(xk_out.dtype()) != map_dtype_to_code(xq.dtype())) {
             throw std::runtime_error("apply_rope inputs and outputs must share dtype");
         }
-    }
-
-    // Get input dtype code
-    int input_dtype_code = map_dtype_to_code(xq.dtype());
-    int output_dtype_code = map_dtype_to_code(xq_out.dtype());
-    if ((input_dtype_code != 1 && input_dtype_code != 2) ||
-        output_dtype_code != input_dtype_code) {
-        throw std::runtime_error(
-            "apply_rope inputs and outputs must share an FP16/BF16 dtype");
-    }
-
-    // Get freqs dtype code
-    int freqs_dtype_code = map_dtype_to_code(freqs.dtype());
-    if (freqs_dtype_code < 0 || freqs_dtype_code > 2) {
-        throw std::runtime_error(
-            "apply_rope frequencies must be FP32, FP16, or BF16");
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -950,6 +986,57 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
       epsilon, input_dtype_code,
       freqs_dtype_code, scale_dtype_code, false, split_half,
       reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+// Unequal-head inputs retain the single-tensor path for layouts the fast path cannot use.
+void rms_rope_gqa(nb::ndarray<nb::device::cuda> q, nb::ndarray<nb::device::cuda> k,
+                 nb::ndarray<nb::device::cuda> freqs,
+                 nb::ndarray<nb::device::cuda> q_scale,
+                 nb::ndarray<nb::device::cuda> k_scale,
+                 nb::ndarray<nb::device::cuda> q_out,
+                 nb::ndarray<nb::device::cuda> k_out, float epsilon,
+                 uintptr_t stream_ptr, bool split_half = false, int64_t rot_dim = 0) {
+  if (rot_dim != 0)
+    throw std::runtime_error("native grouped-query RMS-RoPE requires full rotation");
+  bool eligible = q.ndim() == 4 && k.ndim() == 4 && q_out.ndim() == 4 &&
+      k_out.ndim() == 4 && freqs.ndim() == 6 && q_scale.ndim() == 1 && k_scale.ndim() == 1;
+  if (eligible) {
+    const bool bnhd = freqs.shape(2) == 1 && freqs.shape(1) == q.shape(1);
+    const int head_axis = bnhd ? 2 : 1, token_axis = bnhd ? 1 : 2;
+    const int64_t batch = q.shape(0), heads = q.shape(head_axis),
+                  k_heads = k.shape(head_axis), tokens = q.shape(token_axis), D = q.shape(3);
+    const int weight_type = map_dtype_to_code(q_scale.dtype());
+    eligible = k.shape(0) == batch && k.shape(token_axis) == tokens && k.shape(3) == D &&
+        map_dtype_to_code(q.dtype()) == 2 && map_dtype_to_code(k.dtype()) == 2 &&
+        map_dtype_to_code(q_out.dtype()) == 2 && map_dtype_to_code(k_out.dtype()) == 2 &&
+        map_dtype_to_code(freqs.dtype()) == 0 && (weight_type == 0 || weight_type == 2) &&
+        map_dtype_to_code(k_scale.dtype()) == weight_type &&
+        q_scale.shape(0) == D && k_scale.shape(0) == D &&
+        q_scale.stride(0) == 1 && k_scale.stride(0) == 1 &&
+        freqs.shape(0) == 1 && freqs.shape(bnhd ? 2 : 1) == 1 &&
+        freqs.shape(token_axis) == tokens && freqs.shape(3) == D / 2 &&
+        freqs.shape(4) == 2 && freqs.shape(5) == 2;
+    uint64_t qs = 1, ks = 1, fs = 1;
+    for (int axis = 3; axis >= 0; --axis) {
+      eligible &= q_out.shape(axis) == q.shape(axis) && k_out.shape(axis) == k.shape(axis) &&
+          q.stride(axis) == qs && q_out.stride(axis) == qs &&
+          k.stride(axis) == ks && k_out.stride(axis) == ks;
+      qs *= q.shape(axis);
+      ks *= k.shape(axis);
+    }
+    for (int axis = 5; axis >= 0; --axis) {
+      eligible &= freqs.stride(axis) == fs;
+      fs *= freqs.shape(axis);
+    }
+    if (eligible && try_launch_rope_gqa(
+            q.data(), k.data(), freqs.data(), q_scale.data(), k_scale.data(),
+            q_out.data(), k_out.data(), batch, heads, k_heads, tokens, D,
+            bnhd, split_half, weight_type == 0, epsilon, 2, true,
+            reinterpret_cast<cudaStream_t>(stream_ptr)))
+      return;
+  }
+  rms_rope1(q, freqs, q_scale, q_out, epsilon, stream_ptr, split_half);
+  rms_rope1(k, freqs, k_scale, k_out, epsilon, stream_ptr, split_half);
 }
 
 // Nanobind wrapper: signed INT8 V quantization
@@ -1741,7 +1828,8 @@ void sol_producer_chunk_py(
     float rope_eps, int64_t rot_dim, int64_t t0, int64_t m,
     int64_t batch, int64_t seq_len, int64_t num_heads,
     uintptr_t stream_ptr,
-    std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt, int64_t token_aug = 0) {
+    std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt, int64_t token_aug = 0,
+    bool split_half = true) {
     if (batch != 1)
         throw std::runtime_error("sol_producer_chunk: the producer path is B=1 only");
     if (rot_dim <= 0 || rot_dim > 128 || rot_dim % 8)
@@ -1759,7 +1847,7 @@ void sol_producer_chunk_py(
     sol_producer_chunk(workspace.data(), qkv.data(), fab.data(), qw.data(),
                        kw.data(), kmean.data(), vscale.data(),
                        block_len ? block_len->data() : nullptr,
-                       rope_eps, (int)rot_dim, (int)t0, (int)m,
+                       rope_eps, (int)rot_dim, split_half, (int)t0, (int)m,
                        (int)batch, (int)seq_len, (int)num_heads, (int)token_aug,
                        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
@@ -2027,7 +2115,7 @@ void group_norm_silu_pad3d(
 {
     const bool norm = weight.size() > 0;
     const bool given = stats.size() > 0;
-    if (row_stride < W * C) {
+    if ((row_stride != -T && row_stride < W * C)) {
         throw std::invalid_argument("group_norm_silu_pad3d: row stride is shorter than a row");
     }
     if (norm && (static_cast<int64_t>(weight.size()) != C || static_cast<int64_t>(bias.size()) != C)) {
@@ -2040,7 +2128,7 @@ void group_norm_silu_pad3d(
         static_cast<int64_t>(out.size()) != B * C * (T + front) * (H + top + bottom) * (W + left + right)) {
         throw std::invalid_argument("group_norm_silu_pad3d: x/out sizes do not match the given shape");
     }
-    const int64_t chunks = (H * W + 1023) / 1024;
+    const int64_t chunks = comfy::group_norm_chunks(B * T, C, H * W);
     if (norm && !given && static_cast<int64_t>(workspace.size()) < 2 * B * T * (chunks * C + num_groups)) {
         throw std::invalid_argument("group_norm_silu_pad3d: workspace too small");
     }
@@ -2067,10 +2155,10 @@ void group_norm_stats3d(
     int dtype_code,
     uintptr_t stream_ptr)
 {
-    if (static_cast<int64_t>(x.size()) != B * C * T * H * W || row_stride < W * C) {
+    if (static_cast<int64_t>(x.size()) != B * C * T * H * W || (row_stride != -T && row_stride < W * C)) {
         throw std::invalid_argument("group_norm_stats3d: x size or row stride does not match the given shape");
     }
-    const int64_t chunks = (H * W + 1023) / 1024;
+    const int64_t chunks = comfy::group_norm_chunks(B * T, C, H * W);
     if (static_cast<int64_t>(workspace.size()) < 2 * B * T * chunks * C) {
         throw std::invalid_argument("group_norm_stats3d: workspace too small");
     }
@@ -5091,6 +5179,14 @@ NB_MODULE(_C, m) {
           nb::arg("epsilon"), nb::arg("stream_ptr"),
           nb::arg("split_half") = false, nb::arg("rot_dim") = 0);
 
+    m.def("rms_rope_gqa", &rms_rope_gqa, "Fused RMSNorm and RoPE for unequal head counts",
+          nb::arg("q"), nb::arg("k"), nb::arg("freqs"),
+          nb::arg("q_scale"), nb::arg("k_scale"), nb::arg("q_out"), nb::arg("k_out"),
+          nb::arg("epsilon"), nb::arg("stream_ptr"), nb::arg("split_half") = false,
+          nb::arg("rot_dim") = 0);
+
+    m.attr("apply_rope_gqa") = m.attr("apply_rope");
+
     m.def("rms_rope1", &rms_rope1, "Fused RMSNorm and RoPE for a single tensor",
           nb::arg("q"), nb::arg("freqs"), nb::arg("q_scale"), nb::arg("q_out"),
           nb::arg("epsilon"), nb::arg("stream_ptr"),
@@ -5327,7 +5423,8 @@ NB_MODULE(_C, m) {
           nb::arg("kw"), nb::arg("kmean"), nb::arg("vscale"),
           nb::arg("rope_eps"), nb::arg("rot_dim"), nb::arg("t0"), nb::arg("m"),
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(), nb::arg("token_aug") = 0);
+          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(), nb::arg("token_aug") = 0,
+          nb::arg("split_half") = true);
     m.def("sol_attn_core", &sol_attn_core_py,
           nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"),
           nb::arg("kmean_next"), nb::arg("vamax_out"),
