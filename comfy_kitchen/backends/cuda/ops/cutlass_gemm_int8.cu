@@ -20,7 +20,12 @@
 #include <algorithm>
 #include <climits>
 
-#include "int8_gemm/int8_gemm.cuh"
+extern "C" bool launch_cutlass_int8_sm90(
+    const void*, const void*, const float*, const float*, const void*, void*,
+    int, int, int, cudaStream_t);
+extern "C" bool launch_cutlass_int8_sm100(
+    const void*, const void*, const float*, const float*, const void*, void*,
+    int, int, int, cudaStream_t);
 
 // The scalar fast path is separate from the legacy vector-scale API, so its
 // existing callers, residual epilogue and SM120 instantiations stay unchanged.
@@ -40,17 +45,13 @@ extern "C" bool launch_cutlass_int8_dequant_scalar(
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
         return false;
-    const comfy::int8_gemm::Problem p{
-        static_cast<const int8_t*>(a), static_cast<const int8_t*>(b), xs, ws,
-        static_cast<const __nv_bfloat16*>(bias), static_cast<__nv_bfloat16*>(out),
-        int(m), int(n), int(k)};
 #ifdef COMFY_HAVE_INT8_SM90
     if (major == 9 && minor == 0)
-        return comfy::int8_gemm::launch_sm90(p, stream);
+        return launch_cutlass_int8_sm90(a, b, xs, ws, bias, out, int(m), int(n), int(k), stream);
 #endif
 #ifdef COMFY_HAVE_INT8_SM100
     if (major == 10 && minor == 0)
-        return comfy::int8_gemm::launch_sm100(p, stream);
+        return launch_cutlass_int8_sm100(a, b, xs, ws, bias, out, int(m), int(n), int(k), stream);
 #endif
     return false;
 }

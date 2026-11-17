@@ -230,7 +230,7 @@ if(EXISTS "${COMFY_CUTLASS_DIR}/cutlass/version.h")
     endforeach()
     list(REMOVE_DUPLICATES int8_tma_archs)
     foreach(cc IN LISTS int8_tma_archs)
-        add_library(comfy_int8_sm${cc} OBJECT ops/int8_gemm/tma.cu)
+        add_library(comfy_int8_sm${cc} OBJECT ops/cutlass_gemm_int8_tma.cu)
         set_target_properties(comfy_int8_sm${cc} PROPERTIES
             CUDA_ARCHITECTURES "${cc}a-real"
             CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)

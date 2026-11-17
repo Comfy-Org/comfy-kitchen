@@ -2,11 +2,13 @@
  * SPDX-FileCopyrightText: Copyright (c) 2026 Comfy Org. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
-#include "int8_gemm.cuh"
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <cstdint>
 #include <stdexcept>
 #include <cstdlib>
 #include <algorithm>
-#include "../cutlass_gemm_common.cuh"
+#include "cutlass_gemm_common.cuh"
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -23,7 +25,6 @@
 #include "cutlass/epilogue/fusion/sm100_callbacks_tma_warpspecialized.hpp"
 #endif
 
-namespace comfy::int8_gemm {
 namespace {
 using namespace cute;
 using Out = cutlass::bfloat16_t;
@@ -74,23 +75,24 @@ struct NativeGemm {
     using Kernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape, Mainloop, Epilogue, Scheduler>;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
 
-    static bool run(const Problem& p, int swizzle, cudaStream_t stream) {
-        const auto a = cutlass::make_cute_packed_stride(typename Kernel::StrideA{}, make_shape(p.m,p.k,1));
-        const auto b = cutlass::make_cute_packed_stride(typename Kernel::StrideB{}, make_shape(p.n,p.k,1));
-        const auto c = cutlass::make_cute_packed_stride(typename Kernel::StrideC{}, make_shape(p.m,p.n,1));
-        const auto d = cutlass::make_cute_packed_stride(typename Kernel::StrideD{}, make_shape(p.m,p.n,1));
+    static bool run(const void* a_ptr, const void* b_ptr, const float* x_scale, const float* w_scale,
+                    const void* bias, void* out, int m, int n, int k, int swizzle, cudaStream_t stream) {
+        const auto a = cutlass::make_cute_packed_stride(typename Kernel::StrideA{}, make_shape(m,k,1));
+        const auto b = cutlass::make_cute_packed_stride(typename Kernel::StrideB{}, make_shape(n,k,1));
+        const auto c = cutlass::make_cute_packed_stride(typename Kernel::StrideC{}, make_shape(m,n,1));
+        const auto d = cutlass::make_cute_packed_stride(typename Kernel::StrideD{}, make_shape(m,n,1));
         typename WScale::Arguments weight{};
-        weight.scalar_ptrs[0] = p.w_scale;
+        weight.scalar_ptrs[0] = w_scale;
         typename EVT::Arguments callback = {
-            {{{}, {p.x_scale, 0.f, {}}, {}}, weight, {}},
-            {reinterpret_cast<const Out*>(p.bias), Out(0), {}}, {}};
+            {{{}, {x_scale, 0.f, {}}, {}}, weight, {}},
+            {reinterpret_cast<const Out*>(bias), Out(0), {}}, {}};
         cutlass::KernelHardwareInfo hardware;
         if (cudaGetDevice(&hardware.device_id) != cudaSuccess ||
             cudaDeviceGetAttribute(&hardware.sm_count, cudaDevAttrMultiProcessorCount,
                                    hardware.device_id) != cudaSuccess) return false;
         typename Gemm::Arguments args{
-            cutlass::gemm::GemmUniversalMode::kGemm, {p.m,p.n,p.k,1},
-            {p.a,a,p.b,b}, {callback,nullptr,c,reinterpret_cast<Out*>(p.out),d}, hardware};
+            cutlass::gemm::GemmUniversalMode::kGemm, {m,n,k,1},
+            {static_cast<const int8_t*>(a_ptr),a,static_cast<const int8_t*>(b_ptr),b}, {callback,nullptr,c,reinterpret_cast<Out*>(out),d}, hardware};
         using Raster = decltype(args.scheduler.raster_order);
         args.scheduler.raster_order = swizzle < 0 ? Raster::AlongN : Raster::AlongM;
         args.scheduler.max_swizzle_size = std::abs(swizzle);
@@ -109,45 +111,46 @@ struct NativeGemm {
     }
 };
 
-bool launch(const Problem& p, cudaStream_t stream) {
+bool launch(const void* a_ptr, const void* b_ptr, const float* x_scale, const float* w_scale,
+            const void* bias, void* out, int m, int n, int k, cudaStream_t stream) {
     // TMA requires aligned K/N; leave small M and narrow outputs to the existing
     // fallback. Tile selection is independent of model shapes and bias.
-    if (p.m < 1024 || p.n < 128 || p.k < 256 || p.n % 8 || p.k % 16) return false;
+    if (m < 1024 || n < 128 || k < 256 || n % 8 || k % 16) return false;
 #if COMFY_INT8_GEMM_ARCH == 90
     // Alternate math and epilogue warpgroups when short K cannot hide the store.
-    if (p.k <= 4096) {
-        const int swizzle = int64_t(p.m) * p.k > comfy_cutlass::device_l2_bytes() / 2 ? -4 : 1;
-        return NativeGemm<128,128,1,1,0,true>::run(p, swizzle, stream);
+    if (k <= 4096) {
+        const int swizzle = int64_t(m) * k > comfy_cutlass::device_l2_bytes() / 2 ? -4 : 1;
+        return NativeGemm<128,128,1,1,0,true>::run(a_ptr, b_ptr, x_scale, w_scale, bias, out, m, n, k, swizzle, stream);
     }
-    return NativeGemm<128,256,2,1>::run(p, 1, stream);
+    return NativeGemm<128,256,2,1>::run(a_ptr, b_ptr, x_scale, w_scale, bias, out, m, n, k, 1, stream);
 #else
-    if (p.n <= 128) return NativeGemm<256,64,2,1>::run(p, 1, stream);
+    if (n <= 128) return NativeGemm<256,64,2,1>::run(a_ptr, b_ptr, x_scale, w_scale, bias, out, m, n, k, 1, stream);
     const int64_t l2 = comfy_cutlass::device_l2_bytes();
     // Reuse an activation band when streaming all rows would evict it from L2.
-    const int swizzle = int64_t(p.m) * p.k > l2 / 2 && int64_t(p.n) * p.k <= l2 * 3 / 4 ? -4 : 1;
+    const int swizzle = int64_t(m) * k > l2 / 2 && int64_t(n) * k <= l2 * 3 / 4 ? -4 : 1;
     const int clusters = std::max(1, comfy_cutlass::device_sm_count() / 2);
     auto wave_cost = [&](int columns) {
-        const int64_t tiles = ((int64_t(p.m) + 255) / 256) * ((p.n + columns - 1) / columns);
+        const int64_t tiles = ((int64_t(m) + 255) / 256) * ((n + columns - 1) / columns);
         return ((tiles + clusters - 1) / clusters) * columns;
     };
     // A narrower tile needs a clear wave-rounding advantage to offset its overhead.
-    if ((p.n % 192 == 0 && p.n % 256 != 0) || wave_cost(192) * 10 < wave_cost(256) * 9)
-        return NativeGemm<256,192,2,1>::run(p, swizzle, stream);
-    if (p.k >= 8192) return NativeGemm<256,256,2,1,64>::run(p, swizzle, stream);
-    return NativeGemm<256,256,2,1>::run(p, swizzle, stream);
+    if ((n % 192 == 0 && n % 256 != 0) || wave_cost(192) * 10 < wave_cost(256) * 9)
+        return NativeGemm<256,192,2,1>::run(a_ptr, b_ptr, x_scale, w_scale, bias, out, m, n, k, swizzle, stream);
+    if (k >= 8192) return NativeGemm<256,256,2,1,64>::run(a_ptr, b_ptr, x_scale, w_scale, bias, out, m, n, k, swizzle, stream);
+    return NativeGemm<256,256,2,1>::run(a_ptr, b_ptr, x_scale, w_scale, bias, out, m, n, k, swizzle, stream);
 #endif
 }
 }  // namespace
 
 #if COMFY_INT8_GEMM_ARCH == 90
-bool launch_sm90(const Problem& p, cudaStream_t stream) {
+extern "C" bool launch_cutlass_int8_sm90(
 #else
-bool launch_sm100(const Problem& p, cudaStream_t stream) {
+extern "C" bool launch_cutlass_int8_sm100(
 #endif
-    const bool launched = launch(p, stream);
+    const void* a, const void* b, const float* x_scale, const float* w_scale,
+    const void* bias, void* out, int m, int n, int k, cudaStream_t stream) {
+    const bool launched = launch(a, b, x_scale, w_scale, bias, out, m, n, k, stream);
     if (launched && cudaGetLastError() != cudaSuccess)
         throw std::runtime_error("INT8 GEMM launch failed");
     return launched;
 }
-
-}  // namespace comfy::int8_gemm

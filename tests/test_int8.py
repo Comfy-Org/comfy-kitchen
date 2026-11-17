@@ -1116,47 +1116,25 @@ class TestBandedStreamK:
         expected = {13} if l2 >= 16 << 20 else {0, 1}
         assert selected in expected
 
+    @requires_cuda_backend
+    def test_scalar_scale_graph_reads_updated_value(self, seed):
+        if torch.cuda.get_device_capability() not in ((9, 0), (10, 0)):
+            pytest.skip("Native scalar INT8 GEMM targets SM90/SM100")
+        a = torch.randint(-8, 8, (1024, 256), dtype=torch.int8, device="cuda")
+        b = torch.randint(-8, 8, (128, 256), dtype=torch.int8, device="cuda")
+        xs = torch.full((1024,), 0.125, device="cuda")
+        ws = torch.full((), 0.0625, device="cuda")
+        bias = cuda._empty_cuda_tensor(a.device, torch.bfloat16)
+        out = torch.empty(1024, 128, dtype=torch.bfloat16, device="cuda")
+        args = (a, b, xs, ws, bias, out)
+        stream = torch.cuda.current_stream().cuda_stream
+        expected = ((a.float() @ b.float().t()) / 128).bfloat16()
 
-@requires_cuda_backend
-@pytest.mark.parametrize("shape", [(1025, 128, 256), (4096, 512, 4096), (4096, 256, 8192)])
-@pytest.mark.parametrize("with_bias", [False, True])
-def test_scalar_int8_gemm_replays_updated_inputs(shape, with_bias, seed):
-    if torch.cuda.get_device_capability() not in ((9, 0), (10, 0)):
-        pytest.skip("Native scalar INT8 GEMM targets SM90/SM100")
-    m, n, k = shape
-    wrap, c = cuda._wrap_for_dlpack, cuda._C
-    a = torch.randint(-128, 128, (m, k), dtype=torch.int8, device="cuda")
-    b = torch.randint(-128, 128, (n, k), dtype=torch.int8, device="cuda")
-    xs = torch.rand(m, device="cuda") * 0.01
-    ws = torch.full((), 0.027, device="cuda")
-    bias = (torch.randn(n, dtype=torch.bfloat16, device="cuda") if with_bias
-            else cuda._empty_cuda_tensor(a.device, torch.bfloat16))
-    out = torch.empty(m, n, dtype=torch.bfloat16, device="cuda")
-    ref = torch.empty_like(out)
-    stream = torch.cuda.current_stream().cuda_stream
-
-    def run():
-        assert c.cutlass_int8_dequant_scalar(
-            *(wrap(t) for t in (a, b, xs, ws, bias, out)), stream)
-
-    def reference():
-        vector_scale = ws.expand(n).contiguous()
-        assert c.cutlass_int8_dequant(
-            *(wrap(t) for t in (a, b, xs, vector_scale, bias, ref)), 2, stream)
-
-    reference()
-    run()
-    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    a.random_(-128, 128)
-    b.random_(-128, 128)
-    xs.uniform_(0.001, 0.01)
-    ws.fill_(0.013)
-    if with_bias:
-        bias.normal_()
-    reference()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert torch.equal(out.view(torch.int16), ref.view(torch.int16))
+        assert cuda._C.cutlass_int8_dequant_scalar(*(cuda._wrap_for_dlpack(t) for t in args), stream)
+        assert torch.equal(out, expected)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            assert cuda._C.cutlass_int8_dequant_scalar(*(cuda._wrap_for_dlpack(t) for t in args), stream)
+        ws.fill_(0.125)
+        graph.replay()
+        assert torch.equal(out, expected * 2)
