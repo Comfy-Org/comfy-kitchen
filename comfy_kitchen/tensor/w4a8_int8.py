@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Grouped W4A8 / W6A8 weights executed through the shared INT8 linear operation.
+"""Grouped W3A8 / W4A8 / W6A8 weights executed through the shared INT8 linear operation.
 
 Weights are ConvRot-rotated and quantized per ``group_size``. The default (``bits=4``)
 uses a symmetric Lloyd-Max codebook and FP8 group scales; ``bits=6`` stores uniform
 6-bit codes (no codebook) in a 3K/4-byte row, at ~3x lower weight error for 1.5x the
-bytes. The bit depth is implied by the packed row width, so one layout class and one
-checkpoint format cover both. The tensor layout owns only metadata and operator
+bytes; ``bits=3`` is the codebook path with an 8-level table in a 3K/8-byte row. The bit
+depth is implied by the packed row width, so one layout class and one checkpoint format
+cover all three. The tensor layout owns only metadata and operator
 routing; eager, CUDA, and Triton backends own the operation implementations.
 """
 
@@ -27,9 +28,12 @@ from .base import (
     register_layout_op,
 )
 from .w4a8_packed import (
+    NESTED_CODEBOOK_SIZE,
     _mma_bits,
     default_w4a8_codebook,
+    is_nested_codebook,
     unpack_w4a8_mma_weight,
+    w4a8_mma_tier_numel,
 )
 
 
@@ -115,6 +119,7 @@ def w4a8_int8_linear(
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
     mma_packed: bool = False,
+    lsb_tier: torch.Tensor | None = None,
     input_act: str | None = None,
     input_act_weight: torch.Tensor | None = None,
     input_act_eps: float = 0.0,
@@ -129,7 +134,8 @@ def w4a8_int8_linear(
     with identical results. residual/residual_scale make the result
     ``residual + residual_scale * (x @ W.T + bias)`` (a pre-norm block's addcmul,
     with the linear rounded to out_dtype first), fused into the CUDA decode
-    kernel's epilogue and applied after the GEMM everywhere else.
+    kernel's epilogue and applied after the GEMM everywhere else. ``lsb_tier``
+    (packed only) widens each code of the record stream by its low bit.
     """
     kwargs = {
         "x": x,
@@ -148,6 +154,8 @@ def w4a8_int8_linear(
         "residual": residual,
         "residual_scale": residual_scale,
     }
+    if mma_packed:
+        kwargs["lsb_tier"] = lsb_tier
     operation = "w4a8_packed_linear" if mma_packed else "w4a8_int8_linear"
     impl = registry.get_implementation(operation, kwargs=kwargs)
     return impl(**kwargs)
@@ -170,6 +178,9 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         # Packed qdata interleaves codes and group scales; scale is then empty.
         mma_packed: bool = False
         transposed: bool = False
+        # Low bit of each packed code (nested codebook): qdata alone is the same weight
+        # one bit narrower. Last so a gathered copy without it is a prefix of one with it.
+        lsb_tier: torch.Tensor | None = None
 
         def _tensor_fields(self) -> list[str]:
             fields = ["scale", "s_channel"]
@@ -177,6 +188,8 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                 fields.append("correction")
             if self.codebook is not None:
                 fields.append("codebook")
+            if self.lsb_tier is not None:
+                fields.append("lsb_tier")
             return fields
 
         def _validate_tensor_fields(self):
@@ -210,10 +223,18 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                 raise ValueError(
                     f"correction must have shape {(groups, n)}, got {tuple(self.correction.shape)}"
                 )
-            if self.codebook is not None and tuple(self.codebook.shape) != (16,):
+            if self.codebook is not None and tuple(self.codebook.shape) not in (
+                (8,), (16,), (NESTED_CODEBOOK_SIZE,)
+            ):
                 raise ValueError(
-                    f"codebook must have shape (16,), got {tuple(self.codebook.shape)}"
+                    f"codebook must have shape (8,), (16,) or ({NESTED_CODEBOOK_SIZE},), "
+                    f"got {tuple(self.codebook.shape)}"
                 )
+            if self.lsb_tier is not None:
+                if not (self.mma_packed and is_nested_codebook(self.codebook)):
+                    raise ValueError("lsb_tier needs packed storage and the nested codebook")
+                if self.lsb_tier.dtype != torch.uint8 or tuple(self.lsb_tier.shape) != (w4a8_mma_tier_numel(n, k),):
+                    raise ValueError(f"lsb_tier must be {w4a8_mma_tier_numel(n, k)} uint8 bytes")
 
     @classmethod
     def quantize(
@@ -270,10 +291,14 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             return weight
         n, k = params.orig_shape
         if params.codebook is None:
-            # 6-bit codes are uniform; 4-bit without a codebook is not what the kernel decodes
+            # 6-bit codes are uniform; 3/4-bit without a codebook is not what the kernel decodes
             codebook_ok = qdata.shape[1] * 8 == k * 6
+        elif is_nested_codebook(params.codebook):
+            # Nested-codebook weights arrive packed from the checkpoint (host packer).
+            return weight
         else:
-            codebook_ok = torch.equal(params.codebook.float().cpu(), default_w4a8_codebook())
+            bits = 3 if qdata.shape[1] * 8 == k * 3 else 4
+            codebook_ok = torch.equal(params.codebook.float().cpu(), default_w4a8_codebook(bits))
         if (
             n % 16 != 0 or k % 256 != 0
             or params.group_size != 16
@@ -304,7 +329,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         s_rel = params.scale
         if params.mma_packed:
             n, k = params.orig_shape[::-1] if params.transposed else params.orig_shape
-            qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k)
+            qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k, lsb_tier=params.lsb_tier)
         return dequantize_w4a8_int8_weight(
             qdata,
             s_rel,
@@ -347,35 +372,35 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         return w4a8_int8_linear(
             x, qdata, s_rel, s_channel, codebook=codebook, correction=correction, bias=bias,
             group_size=params.group_size, convrot_groupsize=params.convrot_groupsize,
-            out_dtype=params.orig_dtype, mma_packed=params.mma_packed,
+            out_dtype=params.orig_dtype, mma_packed=params.mma_packed, lsb_tier=params.lsb_tier,
             input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
             residual=residual, residual_scale=residual_scale,
         )
 
     @classmethod
     def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:
-        if params.mma_packed:
+        if params.mma_packed and not is_nested_codebook(params.codebook):
             raise ValueError("GEMV-optimized weights are resident-only; save the canonical layout")
-        out = {
-            "": qdata,
-            "_s_rel": params.scale,
-            "_s_channel": params.s_channel,
-        }
+        out = {"": qdata, "_s_channel": params.s_channel}
+        if not params.mma_packed:
+            out["_s_rel"] = params.scale
         if params.correction is not None:
             out["_correction"] = params.correction
         if params.codebook is not None:
             out["_codebook"] = params.codebook
+        if params.lsb_tier is not None:
+            out["_lsb_tier"] = params.lsb_tier
         return out
 
     @classmethod
     def bits(cls, qtensor: QuantizedTensor) -> int:
-        """Code width implied by the packed row: K/2 bytes at 4 bits, 3K/4 at 6."""
+        """Code width implied by the packed row: 3K/8 bytes at 3 bits, K/2 at 4, 3K/4 at 6."""
         from comfy_kitchen.backends.eager.w4a8_int8 import _w4a8_geometry
 
         params = qtensor._params
         if params.mma_packed:
             n, k = params.orig_shape
-            return _mma_bits(qtensor._qdata.numel(), n, k)
+            return _mma_bits(qtensor._qdata.numel(), n, k) + (params.lsb_tier is not None)
         return _w4a8_geometry(qtensor._qdata, params.scale, params.group_size)[2]
 
     @classmethod
@@ -392,6 +417,38 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             # requantize reruns per layer under VRAM offload; the search is quantize-time only
             "scale_search": False,
         }
+
+
+def cat_packed_weights(weights: tuple[QuantizedTensor, ...]) -> QuantizedTensor | None:
+    """Concatenate compatible packed row streams, preserving their active precision tier."""
+    first = weights[0]
+    params = first._params
+    if not params.mma_packed or params.transposed or params.correction is not None:
+        return None
+    bits = AsymW4A8Int8Layout.bits(first)
+    fields = params._tensor_fields()
+    for weight in weights[1:]:
+        other = weight._params
+        if (weight._layout_cls != first._layout_cls or not other.mma_packed or other.transposed
+                or other.correction is not None or other.orig_shape[1] != params.orig_shape[1]
+                or other.orig_dtype != params.orig_dtype or other.group_size != params.group_size
+                or other.convrot_groupsize != params.convrot_groupsize
+                or other._tensor_fields() != fields or AsymW4A8Int8Layout.bits(weight) != bits):
+            return None
+        for name in fields:
+            a, b = getattr(params, name), getattr(other, name)
+            if a.dtype != b.dtype or a.device != b.device:
+                return None
+        if params.codebook is not None and not torch.equal(params.codebook, other.codebook):
+            return None
+    # Snapshot before the caller overwrites member storage, which may be in reverse row order.
+    qdata = torch.cat([weight._qdata for weight in weights])
+    s_channel = torch.cat([weight._params.s_channel for weight in weights])
+    tier = None if params.lsb_tier is None else torch.cat([weight._params.lsb_tier for weight in weights])
+    return QuantizedTensor(qdata, first._layout_cls, dataclasses.replace(
+        params, orig_shape=(sum(weight.shape[0] for weight in weights), params.orig_shape[1]),
+        s_channel=s_channel, codebook=None if params.codebook is None else params.codebook.clone(), lsb_tier=tier,
+    ))
 
 
 def _is_w4a8(weight: object) -> bool:
@@ -424,6 +481,7 @@ def _w4a8_int8_forward(
         convrot_groupsize=params.convrot_groupsize,
         out_dtype=out_dtype,
         mma_packed=params.mma_packed,
+        lsb_tier=params.lsb_tier,
     )
 
 

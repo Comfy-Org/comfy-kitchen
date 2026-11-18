@@ -220,8 +220,17 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
-from comfy_kitchen.tensor.w4a8_packed import _FIXED_LUT, _mma_bits, w4a8_mma_record_bytes  # noqa: E402
+from comfy_kitchen.tensor.w4a8_packed import (  # noqa: E402
+    _mma_bits,
+    default_w4a8_codebook,
+    is_nested_codebook,
+    nested_w4a8_codebook,
+    w4a8_level_table,
+    w4a8_mma_packed_numel,
+    w4a8_mma_tier_numel,
+)
 from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
+    dequantize_w4a8_int8_weight as eager_dequantize_w4a8_int8_weight,
     w4a8_int8_linear as eager_w4a8_int8_linear,
 )
 from comfy_kitchen.constraints import (  # noqa: E402
@@ -260,12 +269,14 @@ _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBA
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
 _W4A8_CHUNKED = os.environ.get("COMFY_KITCHEN_W4A8_CHUNKED", "1") != "0"
-_W4A8_FIXED_DECODE_LUTS: dict[torch.device, torch.Tensor] = {}
+_W4A8_FIXED_DECODE_LUTS: dict[tuple[torch.device, int, bool], torch.Tensor] = {}
 
 
-def _w4a8_fixed_decode_lut(device: torch.device) -> torch.Tensor:
-    if (decode_lut := _W4A8_FIXED_DECODE_LUTS.get(device)) is None:
-        codebook = torch.tensor(_FIXED_LUT, dtype=torch.float32)
+def _w4a8_fixed_decode_lut(device: torch.device, bits: int = 4, nested: bool = False) -> torch.Tensor:
+    """[256 fp8 scales, 2^bits codes] int8 table for the fixed 3- or 4-bit codebook, or
+    for the nested codebook's table of that width."""
+    if (decode_lut := _W4A8_FIXED_DECODE_LUTS.get((device, bits, nested))) is None:
+        codebook = w4a8_level_table(nested_w4a8_codebook(), bits) if nested else default_w4a8_codebook(bits)
         scales = torch.arange(256, dtype=torch.uint8)
         scales = scales.view(torch.float8_e4m3fn).float()
         table = (
@@ -279,7 +290,7 @@ def _w4a8_fixed_decode_lut(device: torch.device) -> torch.Tensor:
         # stream can read it, and keep it outside execution-scoped allocations.
         with allocation_context():
             decode_lut = table.to(device)
-        _W4A8_FIXED_DECODE_LUTS[device] = decode_lut
+        _W4A8_FIXED_DECODE_LUTS[(device, bits, nested)] = decode_lut
     return decode_lut
 
 
@@ -1569,8 +1580,11 @@ def quantize_w4a8_int8_weight(
     codebook g16, or 6-bit without the quantize-time scale search; fp8 scales). W4A8
     uses staged CUDA requant when fusion is unavailable; other configs use chunked eager."""
     validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
+    # The fused and staged kernels take the 16-entry table only; the nested codebook is decoded
+    # through its level tables in the chunked path.
     fused_ok = scale_dtype == torch.float8_e4m3fn and symmetric and (
-        (bits == 4 and codebook and group_size == 16)
+        (bits == 4 and codebook and group_size == 16
+         and (codebook_tensor is None or not is_nested_codebook(codebook_tensor)))
         or (bits == 6 and not scale_search and group_size in (16, 32, 64))
     )
     if fused_ok:
@@ -2082,14 +2096,15 @@ def _w4a8_mma_linear(
     x_2d, rotated, partial_absmax, act_weight, input_act_eps, input_act, xq, xs,
     qdata, s_channel, bias_float, resid_2d, resid_scale, out,
     convrot_groupsize, group_size, output_dtype_code, stream_ptr,
+    nested=False, lsb_tier=None,
 ):
     """Quantize x_2d and run the streamed MMA GEMM into out."""
     m, n = out.shape
     # Call-local split-K sums and counters also isolate independently replayed graphs.
     scratch = torch.zeros(m * n + n // 16, dtype=torch.int32, device=out.device)
     workspace, counters = scratch[:m * n].view(m, n), scratch[m * n:]
-    bits = _mma_bits(qdata.numel(), n, xq.shape[1])
-    decode_lut = _w4a8_fixed_decode_lut(qdata.device) if bits == 4 else None
+    bits = _mma_bits(qdata.numel(), n, xq.shape[1]) + (lsb_tier is not None)
+    decode_lut = _w4a8_fixed_decode_lut(qdata.device, bits, nested) if bits != 6 else None
     used = _C.w4a8_codebook_mma_linear(
         _wrap_for_dlpack(x_2d),
         _wrap_for_dlpack(rotated) if rotated is not None else None,
@@ -2099,6 +2114,7 @@ def _w4a8_mma_linear(
         _input_act_code(input_act),
         _wrap_for_dlpack(xq),
         _wrap_for_dlpack(qdata),
+        _wrap_for_dlpack(lsb_tier) if lsb_tier is not None else None,
         _wrap_for_dlpack(decode_lut) if decode_lut is not None else None,
         _wrap_for_dlpack(s_channel),
         _wrap_for_dlpack(xs),
@@ -2468,6 +2484,14 @@ def dequantize_w4a8_int8_weight(
         group_size,
         convrot_groupsize,
     )
+    if is_nested_codebook(codebook):
+        table = _canonical_level_table(qdata, s_rel, codebook, group_size)
+        if table is None:
+            return eager_dequantize_w4a8_int8_weight(
+                qdata, s_rel, s_channel, codebook=codebook, correction=correction,
+                group_size=group_size, convrot_groupsize=convrot_groupsize, output_dtype=output_dtype,
+            )
+        codebook = table
     int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
     weight_rotated = _dequantize_w4a8_int8_weight_from_int8(
         int8_weight,
@@ -2479,6 +2503,15 @@ def dequantize_w4a8_int8_weight(
     return rotate_int8_convrot_weight(weight_rotated.contiguous(), convrot_groupsize).to(output_dtype)
 
 
+def _canonical_level_table(qdata, s_rel, codebook, group_size):
+    """The [2^bits] table of a nested codebook that a canonical weight's codes index, or
+    None for 5-bit codes, which only the eager decode reads."""
+    bits = _w4a8_geometry(qdata, s_rel, group_size)[2]
+    if bits == 5:
+        return None
+    return w4a8_level_table(codebook, bits).contiguous()
+
+
 def pack_w4a8_mma_weight_(dest: torch.Tensor, s_rel: torch.Tensor):
     """Canonical codes at dest's start -> packed records in the same storage.
 
@@ -2487,7 +2520,11 @@ def pack_w4a8_mma_weight_(dest: torch.Tensor, s_rel: torch.Tensor):
     """
     n, groups = s_rel.shape
     k = groups * 16
-    bits = 4 if dest.numel() == n * k * 9 // 16 else 6
+    bits = _mma_bits(dest.numel(), n, k)
+    if bits != 6:
+        # Packing runs eagerly; build the decode table here so a first decode that
+        # lands inside CUDA graph capture does not copy it from pageable host memory.
+        _w4a8_fixed_decode_lut(dest.device, bits)
     scales = s_rel.view(torch.uint8).clone()
     scratch = torch.empty(2 * k * bits, dtype=torch.uint8, device=dest.device)
     _C.pack_w4a8_mma_inplace(
@@ -2551,6 +2588,15 @@ def w4a8_int8_linear(
         group_size,
         convrot_groupsize,
     )
+    if is_nested_codebook(codebook):
+        table = _canonical_level_table(qdata, s_rel, codebook, group_size)
+        if table is None:
+            return eager_w4a8_int8_linear(
+                x, qdata, s_rel, s_channel, codebook=codebook, correction=correction, bias=bias,
+                group_size=group_size, convrot_groupsize=convrot_groupsize, out_dtype=out_dtype,
+                input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
+            )
+        codebook = table
     if x.shape[-1] != k * _input_act_width(input_act):
         raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
     groups = k // group_size
@@ -2667,6 +2713,7 @@ def w4a8_packed_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    lsb_tier: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Resident packed W4A8/W6A8: small-M MMA or direct packed dequantization for prefill."""
     if input_act in (None, "none"):
@@ -2687,16 +2734,28 @@ def w4a8_packed_linear(
     if input_act is not None and not fuse_act:
         x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
         input_act = None
+    widths = (3, 4) if lsb_tier is not None else (3, 4, 6)
     if (
         qdata.dim() != 1
         or qdata.dtype != torch.int8
         or n % 16
-        or qdata.numel() not in (n * k * w4a8_mma_record_bytes(4) // 512, n * k * w4a8_mma_record_bytes(6) // 512)
+        or qdata.numel() not in tuple(w4a8_mma_packed_numel(n, k, b) for b in widths)
         or s_rel.numel() != 0
         or group_size != 16
         or correction is not None
+        or (lsb_tier is not None and not (
+            is_nested_codebook(codebook)
+            and lsb_tier.dtype == torch.uint8
+            and lsb_tier.numel() == w4a8_mma_tier_numel(n, k)
+            and lsb_tier.is_contiguous()
+        ))
     ):
         raise ValueError("invalid MMA-packed W4A8 operands")
+    nested = is_nested_codebook(codebook)
+    if nested:
+        # the kernels read the table of the decoded width
+        bits = _mma_bits(qdata.numel(), n, k) + (lsb_tier is not None)
+        codebook = w4a8_level_table(codebook, bits).contiguous()
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     if residual is not None and not (
@@ -2706,6 +2765,7 @@ def w4a8_packed_linear(
             w4a8_packed_linear(
                 x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
                 convrot_groupsize, out_dtype, input_act, input_act_weight, input_act_eps,
+                lsb_tier=lsb_tier,
             ),
             residual,
             residual_scale,
@@ -2734,13 +2794,14 @@ def w4a8_packed_linear(
             qdata, s_channel, bias_float, resid_2d, resid_scale, out,
             convrot_groupsize, group_size, DTYPE_TO_CODE[out_dtype],
             torch.cuda.current_stream(x.device).cuda_stream,
+            nested=nested, lsb_tier=lsb_tier,
         )
     else:
         bias_arg = _gemm_vector_arg(bias, x.device, out_dtype) if bias is not None else None
         used, _, _ = _w4a8_linear_chunked(
             x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
             convrot_groupsize, group_size, True,
-            input_act, input_act_weight, input_act_eps,
+            input_act, input_act_weight, input_act_eps, lsb_tier=lsb_tier,
         )
         if not used:
             raise RuntimeError("Packed W4A8 prefill is unsupported by the INT8 GEMM")
@@ -2771,7 +2832,7 @@ def _w4a8_chunked_act_fusable(x: torch.Tensor, input_act: str | None, convrot_gr
 def _w4a8_linear_chunked(
     x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
     convrot_groupsize, group_size, mma_packed,
-    input_act=None, input_act_weight=None, input_act_eps=0.0,
+    input_act=None, input_act_weight=None, input_act_eps=0.0, lsb_tier=None,
 ):
     """Shared bounded INT8 GEMM; the native dequantizer reads the selected storage format.
 
@@ -2813,6 +2874,7 @@ def _w4a8_linear_chunked(
             output_dtype_code,
             stream_ptr,
             mma_packed,
+            _wrap_for_dlpack(lsb_tier) if lsb_tier is not None else None,
         )
         return used, xq, xs
     else:
@@ -2840,6 +2902,7 @@ def _w4a8_linear_chunked(
         output_dtype_code,
         stream_ptr,
         mma_packed,
+        _wrap_for_dlpack(lsb_tier) if lsb_tier is not None else None,
     )
     return used, xq, xs
 
