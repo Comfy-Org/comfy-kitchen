@@ -10,6 +10,7 @@ order of the additions cannot matter, and at the real shape it must not be furth
 fp64 reference than eager.
 """
 
+import contextlib
 import importlib
 
 import pytest
@@ -125,6 +126,25 @@ def _call_rule():
     triton_backend = importlib.import_module("comfy_kitchen.backends.triton")
     (rule,) = triton_backend._build_constraints()[OP].call_rules
     return rule
+
+
+@contextlib.contextmanager
+def _ran(expected):
+    # the backend whose implementation ran, per call in the block: the registry looks the
+    # function up on the backend module at call time, so both backends' functions are wrapped
+    # (use_backend falls back to eager without saying so)
+    ran = []
+    with pytest.MonkeyPatch.context() as mp:
+        for name in ("eager", "triton"):
+            module = importlib.import_module("comfy_kitchen.backends." + name)
+
+            def recording(*args, _impl=getattr(module, OP), _name=name, **kwargs):
+                ran.append(_name)
+                return _impl(*args, **kwargs)
+
+            mp.setattr(module, OP, recording)
+        yield
+    assert ran == expected, ran
 
 
 # (channels, height, width, hot): the template call is C 16, 1536 x 5376 (warp_state's shrink
@@ -290,7 +310,7 @@ class TestSumIndexedValuesTriton:
         kwargs = _kwargs(image, index_matrix)
         assert registry.validate_backend_for_call("triton", OP, kwargs).success
         assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with _ran(["triton"]), ck.use_backend("triton"):
             got = ck.sum_indexed_values(image, index_matrix)
         ref = eager_backend.sum_indexed_values(**kwargs)
         ref64 = _reference64(image, index_matrix)
@@ -335,6 +355,18 @@ class TestSumIndexedValuesTriton:
         got, _, _ = self._check(image, index_matrix)
         assert torch.equal(got[1::2], torch.zeros_like(got[1::2]))
 
+    @pytest.mark.parametrize("pixel", [0, 1000, -1])
+    def test_negative_index_raises(self, pixel):
+        # the kernel writes at out + index * C, so a negative index would land before the
+        # output; index_add_ raises on it too
+        image = _image(16, 48, 168, device="cuda")
+        index_matrix = _index(48, 168, "runs", device="cuda")
+        index_matrix.view(-1)[pixel] = -1
+        kwargs = _kwargs(image, index_matrix)
+        assert registry.get_capable_backend(OP, kwargs) == "triton"
+        with pytest.raises(ValueError, match="must be >= 0"), ck.use_backend("triton"):
+            ck.sum_indexed_values(image, index_matrix)
+
     def test_real_shape_served(self):
         # the template call at its captured size: image [16, 1536, 5376] fp32, index [1536, 5376]
         # int64 with about half of the pixels in one group
@@ -367,7 +399,7 @@ class TestSumIndexedValuesTriton:
             kwargs = _kwargs(img, idx)
             assert not registry.validate_backend_for_call("triton", OP, kwargs).success
             assert registry.get_capable_backend(OP, kwargs) == "eager"
-            with ck.use_backend("triton"):
+            with _ran(["eager"]), ck.use_backend("triton"):
                 got = ck.sum_indexed_values(img, idx)
             assert torch.equal(got, _stock_sum_indexed_values(img, idx))
         # a strided index goes to eager too; like the stock view(-1), eager does not take it
@@ -384,7 +416,7 @@ class TestSumIndexedValuesTriton:
         try:
             assert not registry.validate_backend_for_call("triton", OP, kwargs).success
             assert registry.get_capable_backend(OP, kwargs) == "eager"
-            with ck.use_backend("triton"):
+            with _ran(["eager"]), ck.use_backend("triton"):
                 got = ck.sum_indexed_values(image, index_matrix)
             assert torch.equal(got, _stock_sum_indexed_values(image, index_matrix))
         finally:

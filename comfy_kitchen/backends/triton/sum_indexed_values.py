@@ -15,8 +15,10 @@ The partial sums of a group spread over several runs (several programs, or pixel
 adjacent) are added in a varying order, so those rows can differ in the last bits from call to
 call, as they do with ``index_add_``; a group held by one run is one atomic onto zero. The
 image is read as ``[C, H*W]`` (contiguous), the index as ``H*W`` int64. Launch configuration:
-1024 pixels per program, 8 warps, on CUDA and HIP; ``max().item()`` and ``torch.zeros`` as in
-the eager path.
+1024 pixels per program, 8 warps, on CUDA and HIP; ``torch.zeros`` as in the eager path. The
+group count comes from ``torch.aminmax`` instead of ``max().item()``: the kernel writes at
+``out + index * C``, so a negative index raises ``ValueError`` here instead of writing before
+the output.
 """
 
 import torch
@@ -68,7 +70,12 @@ def _sum_indexed_values_kernel(
 def sum_indexed_values(image: torch.Tensor, index_matrix: torch.Tensor) -> torch.Tensor:
     channels, h, w = image.shape
     n = h * w
-    groups = int(index_matrix.max().item()) + 1
+    lo, hi = torch.stack(torch.aminmax(index_matrix)).tolist()
+    if lo < 0:
+        raise ValueError(
+            f"sum_indexed_values: index_matrix must be >= 0, got values in [{lo}, {hi}]"
+        )
+    groups = hi + 1
     out = torch.zeros((groups, channels), dtype=image.dtype, device=image.device)
     _sum_indexed_values_kernel[(triton.cdiv(n, _BLOCK_P),)](
         image,

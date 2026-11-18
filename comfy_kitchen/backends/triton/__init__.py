@@ -130,9 +130,7 @@ def _build_constraints() -> dict:
         return ValidationResult.ok()
 
     def _sum_indexed_values_call_rule(kwargs):
-        # No size threshold: the VOID warped-noise call (image [16, 1536, 5376] fp32, about half
-        # of the pixels in one group) was faster than ComfyUI's current path on an RTX 5090 and
-        # on a Radeon 8060S (per-call numbers in the PR that added this op).
+        # no size threshold
         image, index = kwargs.get("image"), kwargs.get("index_matrix")
         if image is None or index is None:
             return ValidationResult.ok()
@@ -149,7 +147,7 @@ def _build_constraints() -> dict:
         if not image.is_contiguous() or not index.is_contiguous():
             return ValidationResult.fail("image", "image and index_matrix must be contiguous")
         if not 1 <= image.shape[0] <= 16:
-            # a 1024-pixel tile of up to 16 channels fits the 64 KB of shared memory of gfx1151
+            # a 1024-pixel tile of up to 16 fp32 channels fits in 64 KB of shared memory
             return ValidationResult.fail("image", "channels must be in [1, 16]")
         if not 1 <= index.numel() <= 2**31 - 1024:
             # pixel offsets are int32, up to the end of the last 1024-pixel tile
