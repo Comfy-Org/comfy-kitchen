@@ -259,6 +259,26 @@ class TestW4A8PackedMMA:
             assert torch.equal(weight.dequantize(), reference.dequantize())
         assert not torch.equal(first[0], first[1])
 
+    @pytest.mark.parametrize(("bits", "levels"), [(4, 8), (3, 16), (5, 16), (6, 8)])
+    def test_repack_leaves_a_codebook_of_the_wrong_width_alone(self, bits, levels, seed):
+        # The codebook length is checked against the code width before the in-place pack:
+        # a mismatched weight stays canonical instead of being rewritten and then rejected.
+        n, k = 272, 1280
+        qdata, s_rel, s_channel, _, _ = _packed_weight(n, k, bits=bits)
+        storage = torch.empty(qdata.nbytes + s_rel.nbytes, dtype=torch.uint8, device="cuda")
+        resident_q = storage[:qdata.nbytes].view(torch.int8).view_as(qdata)
+        resident_s = storage[qdata.nbytes:].view(s_rel.dtype).view_as(s_rel)
+        resident_q.copy_(qdata)
+        resident_s.copy_(s_rel)
+        before = storage.clone()
+        params = AsymW4A8Int8Layout.Params(
+            scale=resident_s, s_channel=s_channel, codebook=default_w4a8_codebook(levels).cuda(),
+            orig_dtype=torch.bfloat16, orig_shape=(n, k),
+        )
+        weight = QuantizedTensor(resident_q, "AsymW4A8Int8Layout", params)
+        assert weight.optimize_for_gemv(storage) is weight
+        assert torch.equal(storage, before)
+
     @pytest.mark.parametrize(("n", "k"), [(16, 256), (272, 1280), (17408, 5120), (5120, 17408)])
     @pytest.mark.parametrize("bits", [3, 4, 5, 6])
     def test_inplace_pack_roundtrip_and_stream_order(self, n, k, bits, seed):

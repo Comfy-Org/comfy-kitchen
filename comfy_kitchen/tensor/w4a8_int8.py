@@ -276,14 +276,18 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             or torch.cuda.get_device_capability(qdata.device) < (8, 0)
         ):
             return weight
+        from comfy_kitchen.backends.eager.w4a8_int8 import _CODEBOOK_LEVELS
+
         n, k = params.orig_shape
-        if params.codebook is None:
-            # 6/5-bit codes are uniform; 4-bit without a codebook is not what the kernel decodes
-            codebook_ok = qdata.shape[1] * 8 in (k * 6, k * 5)
-        else:
-            # the stream kernel decodes 4-bit through a 16-entry and 3-bit through an 8-entry
-            # table, built from this codebook below
-            codebook_ok = params.codebook.numel() in (8, 16)
+        # The codebook has to match the stored width before anything is rewritten in place:
+        # 3/4-bit codes index an 8/16-entry table (the stream's decode table is built from it
+        # below), 5/6-bit codes are uniform and carry none.
+        bits = qdata.shape[1] * 8 // k
+        levels = None if params.codebook is None else params.codebook.numel()
+        codebook_ok = (
+            bits in (3, 4, 5, 6) and qdata.shape[1] * 8 == k * bits
+            and levels == _CODEBOOK_LEVELS.get(bits)
+        )
         if (
             n % 16 != 0 or k % 256 != 0
             or params.group_size != 16
