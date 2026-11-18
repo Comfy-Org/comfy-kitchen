@@ -63,8 +63,10 @@ def qk_layernorm_rope_partial(
     q = q.view(b, s, n, d)
     k = k.view(b, s, n, d)
 
-    q = functional.layer_norm(q, (d,), q_weight, q_bias, eps).view(b, s, n, d)
-    k = functional.layer_norm(k, (d,), k_weight, k_bias, eps).view(b, s, n, d)
+    # layer_norm returns float32 under CUDA autocast; keep the input dtype as the fake and
+    # triton paths do (a no-op otherwise)
+    q = functional.layer_norm(q, (d,), q_weight, q_bias, eps).to(q.dtype).view(b, s, n, d)
+    k = functional.layer_norm(k, (d,), k_weight, k_bias, eps).to(k.dtype).view(b, s, n, d)
 
     q_img = q[:, text_len:].transpose(1, 2)
     k_img = k[:, text_len:].transpose(1, 2)

@@ -10,6 +10,7 @@ rotation in fp32 and rounds once, so q and k are compared to eager and to an fp3
 a tolerance and must never be further from the fp32 reference than eager.
 """
 
+import contextlib
 import importlib
 
 import pytest
@@ -152,6 +153,25 @@ def _call_rule():
     triton_backend = importlib.import_module("comfy_kitchen.backends.triton")
     (rule,) = triton_backend._build_constraints()[OP].call_rules
     return rule
+
+
+@contextlib.contextmanager
+def _ran(expected):
+    # the backend whose implementation ran, per call in the block: the registry looks the
+    # function up on the backend module at call time, so both backends' functions are wrapped
+    # (use_backend falls back to eager without saying so)
+    ran = []
+    with pytest.MonkeyPatch.context() as mp:
+        for name in ("eager", "triton"):
+            module = importlib.import_module("comfy_kitchen.backends." + name)
+
+            def recording(*args, _impl=getattr(module, OP), _name=name, **kwargs):
+                ran.append(_name)
+                return _impl(*args, **kwargs)
+
+            mp.setattr(module, OP, recording)
+        yield
+    assert ran == expected, ran
 
 
 # (batch, S, text_len, heads, head_dim): the VOID template call is batch 2 (cond and uncond
@@ -348,7 +368,7 @@ class TestQkLayernormRopePartialTriton:
         kwargs = _kwargs(inputs, text_len, heads, eps)
         assert registry.validate_backend_for_call("triton", OP, kwargs).success
         assert registry.get_capable_backend(OP, kwargs) == "triton"
-        with ck.use_backend("triton"):
+        with _ran(["triton"]), ck.use_backend("triton"):
             got = _kitchen(inputs, text_len, heads, eps)
         ref = eager_backend.qk_layernorm_rope_partial(**kwargs)
         ref32 = _reference32(inputs, text_len, heads, eps)
@@ -411,6 +431,18 @@ class TestQkLayernormRopePartialTriton:
             assert _rel(g, r32) < 1e-2
             assert _err(g, r32)[0] <= _err(r, r32)[0]
 
+    def test_eager_keeps_dtype_under_autocast(self):
+        # layer_norm runs in float32 under CUDA autocast; eager must still return the input
+        # dtype, as the fake and triton paths do
+        inputs = _inputs(2, 150, 11, 48, 64, device="cuda", dtype=torch.bfloat16)
+        kwargs = _kwargs(inputs, 11, 48)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            got = eager_backend.qk_layernorm_rope_partial(**kwargs)
+        ref = eager_backend.qk_layernorm_rope_partial(**kwargs)
+        for g, r in zip(got, ref, strict=True):
+            assert g.dtype == torch.bfloat16
+            assert g.shape == r.shape and g.stride() == r.stride()
+
     def test_real_shape_served(self):
         # the VOID template call at its captured size: B 2, S 15346, 226 text tokens, 48 x 64
         inputs = _inputs(2, 15346, 226, 48, 64, device="cuda", dtype=torch.bfloat16)
@@ -422,7 +454,7 @@ class TestQkLayernormRopePartialTriton:
             kwargs = _kwargs(inputs, text_len, heads)
             assert not registry.validate_backend_for_call("triton", OP, kwargs).success
             assert registry.get_capable_backend(OP, kwargs) == "eager"
-            with ck.use_backend("triton"):
+            with _ran(["eager"]), ck.use_backend("triton"):
                 got = _kitchen(inputs, text_len, heads)
             ref = _stock(inputs, text_len, heads)
             for g, r in zip(got, ref, strict=True):

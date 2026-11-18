@@ -15,9 +15,9 @@ consecutive ``[head_dim]`` rows of the contiguous ``[B, S, heads * head_dim]`` p
 rounded once to the output dtype and written in the input layout, so the normalized tensors,
 the video-token copies and the concatenation are never written out.
 
-Launch configuration (same kernel body), picked per GPU from the measured shapes:
-  CUDA: block_r 32 rows, 4 warps (RTX 5090)
-  HIP:  block_r 64 rows, 8 warps (Radeon 8060S)
+Launch configuration (same kernel body):
+  CUDA: block_r 32 rows, 4 warps
+  HIP:  block_r 64 rows, 8 warps
 """
 
 import torch
