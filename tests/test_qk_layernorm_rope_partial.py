@@ -210,6 +210,13 @@ class TestQkLayernormRopePartialEager:
             assert o.shape == (2, 37, 128)
             assert o.is_contiguous()
 
+    def test_empty_batch(self):
+        inputs = _inputs(0, 37, 7, 4, 32)
+        with ck.use_backend("eager"):
+            out = _kitchen(inputs, 7, 4)
+        for o in out:
+            assert o.shape == (0, 37, 128)
+
     def test_text_rows_only_normalized(self):
         inputs = _inputs(1, 13, 4, 2, 16)
         q, _, wq, bq = inputs[:4]

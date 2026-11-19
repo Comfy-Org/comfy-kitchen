@@ -31,12 +31,13 @@ from comfy_kitchen.registry import registry
 
 
 def _apply_rotary_emb(x, freqs_cos_sin):
-    # comfy/ldm/cogvideo/model.py apply_rotary_emb, as it is
+    # comfy/ldm/cogvideo/model.py apply_rotary_emb, with the pair count written out instead of
+    # -1 so that an empty batch (accepted by the op) reshapes too; the same values otherwise
     cos, sin = freqs_cos_sin
     cos = cos[None, None, :, :].to(x.device)
     sin = sin[None, None, :, :].to(x.device)
 
-    x_real, x_imag = x.reshape(*x.shape[:-1], -1, 2).unbind(-1)
+    x_real, x_imag = x.reshape(*x.shape[:-1], x.shape[-1] // 2, 2).unbind(-1)
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(3)
 
     return (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
