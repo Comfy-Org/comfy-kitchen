@@ -164,6 +164,11 @@ def test_hip_drops_gemms_without_matrix_cores():
     # The fused W4A8 requantize is elementwise too: it packs weights and never
     # reaches a matrix core, so RDNA2 must keep it.
     assert "quantize_w4a8_int8_weight" in without
+    # INT8 linear has a SIMT v_dot4 path (ops/gemm_int8.hip), so RDNA2 keeps it;
+    # its modulated forms and every other GEMM still need matrix cores.
+    assert "int8_linear" in without
+    assert "int8_linear_modulated" not in without
+    assert "int8_linear_rms_modulated" not in without
 
 
 def test_hip_advertises_every_inplace_rope_entry():

@@ -210,8 +210,8 @@ def _has_nonduplicated_wmma(device: torch.device | int | None = None) -> bool:
     return _gfx_arch(device) in (_ARCH_WMMA_GFX12 | _ARCH_WMMA_GFX117)
 
 
-# The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
-# or a scalar reduction and runs on any supported architecture. This set names the
+# The GEMMs need matrix cores, except the INT8 one, which also has a SIMT
+# v_dot4 path for RDNA2 (see ops/gemm_int8.hip). This set names the
 # registry-dispatched GEMMs so _build_constraints can drop them on RDNA2; the fp8
 # GEMM is not among them because it is reached through scaled_mm_v2's _hip_fp8_gemm,
 # which gates on has_wmma() itself rather than through the registry.
@@ -219,7 +219,6 @@ _WMMA_ONLY_OPS = frozenset({
     "fp16_conv3d",
     "fp16_conv3d_out",
     "fp16_linear",
-    "int8_linear",
     "int8_linear_modulated",
     "int8_linear_rms_modulated",
     "na3d",
@@ -227,7 +226,6 @@ _WMMA_ONLY_OPS = frozenset({
     "sol_attn",
     "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
-    "w4a8_int8_linear",
 })
 
 
@@ -916,7 +914,11 @@ def int8_linear(
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
+    """INT8 linear with dynamic row-wise activation quantization.
+
+    Runs the WMMA tile kernel where the device has matrix cores and the SIMT
+    ``v_dot4`` tile kernel where it does not (RDNA2).
+    """
     x, input_act, act_weight = _split_input_act(
         x, input_act, input_act_weight, input_act_eps, convrot, convrot_groupsize)
     # k_act is the activated (quantized) row width: swiglu and situ halve the raw row.
@@ -970,7 +972,11 @@ def int8_linear(
         q_rows = (m + 127) // 128 * 128 if tiled else m
         q = torch.empty((q_rows, k), dtype=torch.int8, device=x.device)
         x_scale = torch.empty((m,), dtype=torch.float32, device=x.device)
-        _C.quantize_int8_rowwise(_dl(x2d), _dl(q), _dl(x_scale), m, k, _stream(x), tiled)
+        # The extension resolves the INT8 schedule from the current HIP device, not
+        # from the stream, so hold the operand's device across the quantizer and the
+        # GEMM behind it.
+        with torch.cuda.device(x.device):
+            _C.quantize_int8_rowwise(_dl(x2d), _dl(q), _dl(x_scale), m, k, _stream(x), tiled)
 
     x_scale = x_scale.reshape(-1).contiguous()
     if bias is not None:
@@ -978,12 +984,13 @@ def int8_linear(
 
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
-    gemm(
-        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
-        0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias), m, n, k,
-        DTYPE_TO_CODE[out_dtype], _stream(x),
-    )
+    with torch.cuda.device(x.device):
+        gemm(
+            _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
+            0 if weight_scale.numel() == 1 else 1,
+            None if bias is None else _dl(bias), m, n, k,
+            DTYPE_TO_CODE[out_dtype], _stream(x),
+        )
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
     # pre-norm blocks apply it to.
@@ -1100,12 +1107,13 @@ def int8_linear_modulated(
     )
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
-    gemm(
-        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
-        0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
-    )
+    with torch.cuda.device(x.device):
+        gemm(
+            _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
+            0 if weight_scale.numel() == 1 else 1,
+            None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
@@ -1177,12 +1185,13 @@ def int8_linear_rms_modulated(
     )
     out = torch.empty((m, n), dtype=out_dtype, device=x.device)
     gemm = _C.int8_gemm_a_tiled128 if tiled else _C.int8_gemm
-    gemm(
-        _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
-        0 if weight_scale.numel() == 1 else 1,
-        None if bias is None else _dl(bias),
-        m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
-    )
+    with torch.cuda.device(x.device):
+        gemm(
+            _dl(q), _dl(weight), _dl(out), _dl(x_scale), _dl(weight_scale),
+            0 if weight_scale.numel() == 1 else 1,
+            None if bias is None else _dl(bias),
+            m, n, k, DTYPE_TO_CODE[out_dtype], _stream(x),
+        )
     return out.reshape(*orig_shape[:-1], n)
 
 
@@ -1643,10 +1652,15 @@ def w4a8_int8_linear(
         )
         return torch.nn.functional.linear(x, weight, bias).to(out_dtype)
 
-    if not convrot_ok:
+    if not convrot_ok or not has_wmma():
+        # No matrix cores (RDNA2) or an unsupported ConvRot group: unpack to INT8 and
+        # run the regular int8_linear, which takes the SIMT v_dot4 GEMM on RDNA2.
+        # The chunked decode+GEMM below is WMMA-only.
         int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
-        return _eager.int8_linear(
-            x, int8_weight, s_channel, bias, out_dtype, True, convrot_groupsize
+        return int8_linear(
+            x, int8_weight, s_channel, bias, out_dtype, True, convrot_groupsize,
+            input_act=input_act, input_act_weight=act_weight,
+            input_act_eps=input_act_eps,
         )
 
     return _w4a8_int8_linear_chunked(

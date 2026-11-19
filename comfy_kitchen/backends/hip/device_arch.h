@@ -42,4 +42,17 @@ inline bool use_nonduplicated_wmma_schedule() {
     return cached_device_query<select_nonduplicated_wmma>();
 }
 
+inline bool select_has_wmma(int device) {
+    hipDeviceProp_t properties{};
+    if (hipGetDeviceProperties(&properties, device) != hipSuccess) return false;
+    return std::strncmp(properties.gcnArchName, "gfx11", 5) == 0 ||
+        std::strncmp(properties.gcnArchName, "gfx12", 5) == 0;
+}
+
+// Matrix cores: the line the WMMA policies in mma.h are built on, and what the
+// INT8 GEMM dispatches on. RDNA2 and older take the SIMT v_dot4 path instead.
+inline bool device_has_wmma() {
+    return cached_device_query<select_has_wmma>();
+}
+
 }  // namespace comfy::hip_backend

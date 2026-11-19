@@ -44,6 +44,122 @@ __global__ __launch_bounds__(256) void gemv_int8_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// SIMT path (RDNA2 and older): no matrix cores, so the MMA is v_dot4c_i32_i8
+// (dot4_i8 in mma.h) over a register-tiled outer product. Each thread owns a
+// TM x TN output tile; lanes cover consecutive N, so a wave reads 32 distinct
+// weight rows and writes 32 consecutive output columns.
+// ---------------------------------------------------------------------------
+template <typename Epi, typename OutT, int BM, int BN, int BKB, int THREADS, int WM, int WN>
+__global__ __launch_bounds__(THREADS) void gemm_int8_simt_kernel(
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
+    int M, int N, int kbytes, int ldc, Epi epi) {
+
+    constexpr int TM = BM / WM;
+    constexpr int TN = BN / WN;
+    constexpr int kStride = BKB + kLdsPad;
+    static_assert(WM * WN == THREADS, "the thread grid must match the block");
+    static_assert(BM == WM * TM && BN == WN * TN, "the thread tile must tile the block");
+    // The K loop reads two 4-byte steps per LDS access, and kLdsPad keeps every
+    // row a whole number of 8-byte units.
+    static_assert(BKB % 8 == 0, "BKB must be a whole number of 8-byte K steps");
+
+    __shared__ __align__(16) uint8_t As[BM * kStride];
+    __shared__ __align__(16) uint8_t Bs[BN * kStride];
+
+    const int col_lane = threadIdx.x % WN;
+    const int row_lane = threadIdx.x / WN;
+
+    // Grouped block ordering for L2 locality, as in gemm_wmma_kernel: consecutive
+    // blocks advance along M within a group of kGroupM block-rows, so the blocks
+    // resident at once share one weight tile instead of streaming the whole W.
+    constexpr int kGroupM = 4;
+    const int blocks_n = gridDim.x;
+    const int blocks_m = gridDim.y;
+    const int bid = blockIdx.y * blocks_n + blockIdx.x;
+    const int per_group = kGroupM * blocks_n;
+    const int group = bid / per_group;
+    const int idx_in_group = bid - group * per_group;
+    const int group_rows = min(kGroupM, blocks_m - group * kGroupM);
+    const int m0 = (group * kGroupM + idx_in_group % group_rows) * BM;
+    const int n0 = (idx_in_group / group_rows) * BN;
+
+    int acc[TM][TN];
+    #pragma unroll
+    for (int i = 0; i < TM; ++i)
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = 0;
+
+    TileStager<BM, BKB, THREADS, true> sa;
+    TileStager<BN, BKB, THREADS, true> sb;
+    sa.load(A, m0, M, 0, kbytes);
+    sb.load(B, n0, N, 0, kbytes);
+    sa.store(As);
+    sb.store(Bs);
+    __syncthreads();
+
+    for (int kb0 = 0; kb0 < kbytes; kb0 += BKB) {
+        const int knext = kb0 + BKB;
+        const bool has_next = knext < kbytes;
+        if (has_next) {
+            sa.load(A, m0, M, knext, kbytes);
+            sb.load(B, n0, N, knext, kbytes);
+        }
+
+        // Two K steps per LDS read: the 8-byte loads halve the LDS instruction
+        // count, which is what this loop is limited by. Fully unrolling the K
+        // block instead lets the compiler hoist every load and take the whole
+        // register file (256 VGPRs), which measured 6x slower.
+        #pragma unroll 1
+        for (int kk = 0; kk < BKB; kk += 8) {
+            int2 av[TM], bv[TN];
+            #pragma unroll
+            for (int i = 0; i < TM; ++i)
+                av[i] = *reinterpret_cast<const int2*>(As + (row_lane + i * WM) * kStride + kk);
+            #pragma unroll
+            for (int j = 0; j < TN; ++j)
+                bv[j] = *reinterpret_cast<const int2*>(Bs + (col_lane + j * WN) * kStride + kk);
+            #pragma unroll
+            for (int i = 0; i < TM; ++i)
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    acc[i][j] = dot4_i8(av[i].x, bv[j].x, acc[i][j]);
+                    acc[i][j] = dot4_i8(av[i].y, bv[j].y, acc[i][j]);
+                }
+        }
+
+        if (has_next) {
+            __syncthreads();
+            sa.store(As);
+            sb.store(Bs);
+            __syncthreads();
+        }
+    }
+
+    epi.init();
+    #pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int r = m0 + row_lane + i * WM;
+        if (r >= M) continue;
+        OutT* crow = C + static_cast<int64_t>(r) * ldc;
+        #pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int col = n0 + col_lane + j * WN;
+            if (col >= N) continue;
+            crow[col] = static_cast<OutT>(epi(r, col, static_cast<float>(acc[i][j])));
+        }
+    }
+}
+
+template <typename OutT, typename Epi>
+static void launch_int8_simt(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N, int K,
+                             int ldc, Epi epi, hipStream_t stream) {
+    constexpr int BM = 128, BN = 128, BKB = 64, THREADS = 256, WM = 8, WN = 32;
+    dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+    gemm_int8_simt_kernel<Epi, OutT, BM, BN, BKB, THREADS, WM, WN>
+        <<<grid, THREADS, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
+}
+
 template <typename OutT>
 static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N, int K, int ldc,
                         EpiRowwise epi, hipStream_t stream) {
@@ -56,7 +172,11 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         return;
     }
-    launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
+    if (device_has_wmma()) {
+        launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
+        return;
+    }
+    launch_int8_simt(Au, Bu, C, M, N, K, ldc, epi, stream);
 }
 
 }  // namespace comfy::hip_backend
