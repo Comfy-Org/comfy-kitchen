@@ -279,6 +279,16 @@ class TestW4A8PackedMMA:
         assert weight.optimize_for_gemv(storage) is weight
         assert torch.equal(storage, before)
 
+    def test_copy_rebinds_the_shared_decode_table(self):
+        # equal codebooks share one cached decode table, so copy_ must not write through it
+        shared, other = torch.zeros(256, 16, dtype=torch.int8), torch.ones(256, 16, dtype=torch.int8)
+        dst, src = (AsymW4A8Int8Layout.Params(
+            scale=torch.empty(0), s_channel=torch.ones(16), codebook=default_w4a8_codebook(16),
+            orig_dtype=torch.bfloat16, orig_shape=(16, 256), mma_packed=True, decode_lut=lut,
+        ) for lut in (shared, other))
+        dst.copy_from(src)
+        assert dst.decode_lut is other and not shared.any()
+
     @pytest.mark.parametrize(("n", "k"), [(16, 256), (272, 1280), (17408, 5120), (5120, 17408)])
     @pytest.mark.parametrize("bits", [3, 4, 5, 6])
     def test_inplace_pack_roundtrip_and_stream_order(self, n, k, bits, seed):

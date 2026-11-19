@@ -187,6 +187,14 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                 fields.append("decode_lut")
             return fields
 
+        def copy_from(self, src: BaseLayoutParams, non_blocking: bool = False) -> None:
+            # decode_lut is the backend's cached table, shared by every weight with the same
+            # codebook: take src's by reference instead of writing through ours.
+            object.__setattr__(self, "decode_lut", None)
+            super().copy_from(src, non_blocking=non_blocking)
+            if self.decode_lut is not None:
+                object.__setattr__(self, "decode_lut", self.decode_lut.to(self.s_channel.device))
+
         def _validate_tensor_fields(self):
             if len(self.orig_shape) != 2:
                 raise ValueError(f"orig_shape must be 2D, got {self.orig_shape}")
