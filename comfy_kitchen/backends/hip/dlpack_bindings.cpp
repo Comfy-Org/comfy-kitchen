@@ -962,9 +962,9 @@ void unpack_int4(nb::ndarray<> q, nb::ndarray<> out, int64_t nbytes, uintptr_t s
 
 // scale_code names the s_rel storage: 0 float32, 5 e4m3 (crossing as uint8, as
 // elsewhere). codebook is optional; without it the levels are uniform.
-// Fused ConvRot + W4A8/W6A8 requantize from the raw weight [N, K]: packed codes
-// [N, K*bits/8], raw e4m3 s_rel [N, K/group_size] and f32 s_channel [N] in one launch.
-// codebook is 16 floats at 4 bits and ignored at 6. The rotation reads 16-byte
+// Fused ConvRot + W4A8/W6A8 (and 3/5-bit) requantize from the raw weight [N, K]: packed
+// codes [N, K*bits/8], raw e4m3 s_rel [N, K/group_size] and f32 s_channel [N] in one launch.
+// codebook is 16 floats at 4 bits, 8 at 3, and ignored at 5/6. The rotation reads 16-byte
 // vectors, so the weight has to start 16-byte aligned.
 void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
                                  nb::ndarray<> packed, nb::ndarray<> s_rel,
@@ -973,10 +973,11 @@ void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
     constexpr const char* kFn = "quantize_wxa8_convrot_fused";
     require_nonneg(N, kFn, "N");
     require_nonneg(K, kFn, "K");
-    if (!((bits == 4 && group_size == 16) ||
-          (bits == 6 && (group_size == 16 || group_size == 32 || group_size == 64)))) {
+    const bool codebook_bits = bits == 4 || bits == 3, uniform_bits = bits == 6 || bits == 5;
+    if (!((codebook_bits && group_size == 16) ||
+          (uniform_bits && (group_size == 16 || group_size == 32 || group_size == 64)))) {
         throw std::runtime_error(std::string(kFn) +
-                                 ": bits/group_size must be 4/16 or 6/{16,32,64}");
+                                 ": bits/group_size must be 4/16, 3/16, 6/{16,32,64} or 5/{16,32,64}");
     }
     if (K % 256 != 0 || K % group_size != 0) {
         throw std::runtime_error(std::string(kFn) +
@@ -986,8 +987,8 @@ void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
     require_dtype(packed, 4, 4, kFn, "packed");
     require_dtype(s_rel, 3, 3, kFn, "s_rel");
     require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
-    if (bits == 4) {
-        require_scale_len(codebook, 16, kFn, "codebook");
+    if (codebook_bits) {
+        require_scale_len(codebook, bits == 4 ? 16 : 8, kFn, "codebook");
     }
     require_len(weight, static_cast<int64_t>(N) * K, kFn, "weight");
     require_len(packed, static_cast<int64_t>(N) * K * bits / 8, kFn, "packed");
@@ -997,7 +998,7 @@ void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
     }
 
     launch_quantize_wxa8_convrot_fused_kernel(
-        weight.data(), bits == 4 ? codebook.data() : nullptr, packed.data(), s_rel.data(),
+        weight.data(), codebook_bits ? codebook.data() : nullptr, packed.data(), s_rel.data(),
         s_channel.data(), N, K, bits, group_size, map_dtype_to_code(weight.dtype()), stochastic,
         seed, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
@@ -1046,17 +1047,21 @@ static int w4a8_bits(const nb::ndarray<>& qdata, int N, int K, int group_size,
         return 4;
     }
     const int64_t bits = cols * 8 / K;
-    if ((bits != 4 && bits != 6) || cols * 8 != static_cast<int64_t>(K) * bits) {
+    if ((bits != 3 && bits != 4 && bits != 5 && bits != 6) || cols * 8 != static_cast<int64_t>(K) * bits) {
         throw std::runtime_error(std::string(fn) +
-                                 ": packed width must be K/2 (4-bit) or 3K/4 (6-bit)");
+                                 ": packed width must be 3K/8, K/2, 5K/8 or 3K/4 (3/4/5/6-bit)");
     }
-    if (bits == 6 && (K % 32 != 0 || group_size < 16 || group_size % 16 != 0)) {
-        throw std::runtime_error(std::string(fn) +
-                                 ": 6-bit storage needs K % 32 == 0 and group_size a "
-                                 "multiple of 16");
+    const int64_t k_align = bits == 6 ? 32 : 64;
+    if (bits != 4 && (K % k_align != 0 || group_size < 16 || group_size % 16 != 0)) {
+        throw std::runtime_error(std::string(fn) + ": " + std::to_string(bits) +
+                                 "-bit storage needs K % " + std::to_string(k_align) +
+                                 " == 0 and group_size a multiple of 16");
     }
-    if (bits == 6 && has_codebook) {
-        throw std::runtime_error(std::string(fn) + ": 6-bit storage has no codebook");
+    if ((bits == 5 || bits == 6) && has_codebook) {
+        throw std::runtime_error(std::string(fn) + ": " + std::to_string(bits) + "-bit storage has no codebook");
+    }
+    if (bits == 3 && !has_codebook) {
+        throw std::runtime_error(std::string(fn) + ": 3-bit storage needs its 8-entry codebook");
     }
     return static_cast<int>(bits);
 }
@@ -1082,7 +1087,7 @@ void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int 
     require_len(out, static_cast<int64_t>(N) * K, kFn, "out");
     require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
     if (codebook.has_value()) {
-        require_scale_len(*codebook, 16, kFn, "codebook");
+        require_scale_len(*codebook, bits == 3 ? 8 : 16, kFn, "codebook");
     }
 
     launch_dequant_int4_grouped_to_int8_kernel(
@@ -1129,7 +1134,7 @@ void w4a8_int8_gemm_chunked(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<>
     require_scale_len(xs, static_cast<size_t>(M), kFn, "xs");
     require_bias(bias, N, kFn);
     if (codebook.has_value()) {
-        require_scale_len(*codebook, 16, kFn, "codebook");
+        require_scale_len(*codebook, bits == 3 ? 8 : 16, kFn, "codebook");
     }
 
     launch_w4a8_int8_gemm_chunked_kernel(
@@ -1171,7 +1176,7 @@ bool w4a8_codebook_gemv(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<> s_r
     require_scale_len(xs, static_cast<size_t>(M), kFn, "xs");
     require_bias(bias, N, kFn);
     if (codebook.has_value()) {
-        require_scale_len(*codebook, 16, kFn, "codebook");
+        require_scale_len(*codebook, bits == 3 ? 8 : 16, kFn, "codebook");
     }
 
     const bool used = launch_w4a8_codebook_gemv_kernel(
