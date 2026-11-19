@@ -1,11 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Eager W4A8 / W6A8 weight preparation, dequantization, and linear operations.
+"""Eager W3A8 / W4A8 / W5A8 / W6A8 weight preparation, dequantization, and linear operations.
 
-Both bit widths share one storage contract: ``qdata`` is an int8 [N, K*bits/8] tensor. At
-4 bits a row is K/2 bytes of packed nibbles (even col = low nibble). At 6 bits the row is the
-same K/2-byte nibble plane followed by a K/4-byte plane holding each code's top 2 bits (col c
-in byte c//4 at bit 2*(c%4)), so every consumer reads the width and infers the bit depth.
+All bit widths share one storage contract: ``qdata`` is an int8 [N, K*bits/8] tensor built from
+bit planes, and every consumer reads the row width and infers the bit depth:
+  4 bits: a K/2-byte nibble plane (even col = low nibble).
+  6 bits: the nibble plane, then a K/4-byte 2-bit plane of each code's top 2 bits (col c in
+          byte c//4 at bit 2*(c%4)).
+  5 bits: the nibble plane, then a K/8-byte 1-bit plane of each code's top bit (col c in byte
+          c//8 at bit c%8).
+  3 bits: a K/4-byte 2-bit plane of each code's low 2 bits (byte c//4, bit 2*(c%4)), then the
+          K/8-byte 1-bit plane of the top bit.
+Levels: 4-bit codes index a 16-entry codebook (or the uniform q-8 grid), 3-bit codes an 8-entry
+Lloyd-Max codebook, 5- and 6-bit codes are uniform (c-16, c-32) with no codebook.
 """
 
 from __future__ import annotations
@@ -13,7 +20,7 @@ from __future__ import annotations
 import torch
 
 from comfy_kitchen.backends._activations import apply_input_act, apply_residual
-from comfy_kitchen.tensor.w4a8_packed import _FIXED_LUT, _pack_codes, _unpack_codes, unpack_w4a8_mma_weight
+from comfy_kitchen.tensor.w4a8_packed import _pack_codes, _unpack_codes, default_w4a8_codebook, unpack_w4a8_mma_weight
 
 from .quantization import int8_linear, rotate_int8_convrot_weight
 
@@ -29,6 +36,15 @@ _ALS_ITERS = 2
 # measured WORSE than uniform at this rate (both in fp32 and through the int8 grid), so the
 # 6-bit path has no codebook and the kernels decode (c - 32) * s_rel.
 _W6_LEVELS = 31
+# W5A8 follows the same uniform recipe one bit down: -15..15 stored as q+16 in [1, 31].
+_W5_LEVELS = 15
+_UNIFORM_LEVELS = {5: _W5_LEVELS, 6: _W6_LEVELS}
+# W3A8 codes index an 8-entry Lloyd-Max table (a uniform 8-level grid measured ~7% worse on
+# rotated weights): the frozen _FIXED_LUT8 under the same kurtosis gate as the 16-entry table
+# (a per-tensor fit lands on the same levels), stored like the 4-bit codebook.
+_W3_CODEBOOK_LEVELS = 8
+_CODEBOOK_LEVELS = {3: _W3_CODEBOOK_LEVELS, 4: 16}
+_SUPPORTED_BITS = (3, 4, 5, 6)
 # Grid-aware group-scale search (W6A8, quantize-time only): the ALS scale and its two
 # stored-dtype neighbours (one e4m3 ulp = 12.5% either side; +-3% for fp32 scales), keeping
 # per group the one whose decoded int8 levels reconstruct the group best. That reaches the
@@ -37,13 +53,15 @@ _SCALE_SEARCH_FP32_STEP = 0.03
 _E4M3_MAX_FINITE_BITS = 0x7E  # 0x7F is NaN in e4m3fn
 
 
-def _check_six_bit_layout(k: int, group_size: int) -> None:
-    """6-bit rows are 3K/4 bytes: K % 32 keeps every row and its high plane 8-byte aligned,
-    and a 16-col decode vector must not span groups. Finer groups buy nothing at 6 bits
-    (g16 already sits on the int8 rounding floor), so they are not a supported layout."""
-    if k % 32 != 0 or group_size < 16 or group_size % 16 != 0:
+def _check_plane_layout(k: int, group_size: int, bits: int) -> None:
+    """Multi-plane rows (3, 5, 6 bits) need every plane 8-byte aligned and a 16-col decode
+    vector that never spans groups: K % 32 at 6 bits (planes of K/2 and K/4 bytes), K % 64
+    at 3 and 5 bits (a K/8-byte 1-bit plane), group_size a multiple of 16. Finer groups buy
+    nothing at these widths, so they are not a supported layout."""
+    k_align = 32 if bits == 6 else 64
+    if k % k_align != 0 or group_size < 16 or group_size % 16 != 0:
         raise ValueError(
-            "6-bit storage needs K divisible by 32 and group_size a multiple of 16, "
+            f"{bits}-bit storage needs K divisible by {k_align} and group_size a multiple of 16, "
             f"got K={k}, group_size={group_size}"
         )
 
@@ -56,15 +74,16 @@ def _w4a8_geometry(
     n, cols = qdata.shape
     k = s_rel.shape[1] * group_size
     bits = (cols * 8) // k if k > 0 else 0
-    if k <= 0 or bits not in (4, 6) or k * bits != cols * 8:
-        raise ValueError(f"packed row width {cols} does not match K={k} at 4 or 6 bits")
-    if bits == 6:
-        _check_six_bit_layout(k, group_size)
+    if k <= 0 or bits not in _SUPPORTED_BITS or k * bits != cols * 8:
+        raise ValueError(f"packed row width {cols} does not match K={k} at 3, 4, 5 or 6 bits")
+    if bits != 4:
+        _check_plane_layout(k, group_size, bits)
     return n, k, bits
 
 
-def _codebook_for(normalized: torch.Tensor) -> torch.Tensor:
-    """Frozen LUT unless the group-normalized rotated weight is heavy-tailed, then fit."""
+def _codebook_for(normalized: torch.Tensor, levels: int = 16) -> torch.Tensor:
+    """Frozen LUT (16 levels at 4 bits, 8 at 3) unless the group-normalized rotated weight is
+    heavy-tailed, then fit per tensor."""
     x = normalized.detach().flatten()
     if x.numel() > _KURTOSIS_SAMPLE:
         gen = torch.Generator(device=x.device).manual_seed(0)
@@ -72,8 +91,8 @@ def _codebook_for(normalized: torch.Tensor) -> torch.Tensor:
     x = x.float()
     excess_kurtosis = ((x - x.mean()) / (x.std() + 1e-9)).pow(4).mean() - 3.0
     if excess_kurtosis.item() <= _W4A8_GATE_KURTOSIS:
-        return torch.tensor(_FIXED_LUT, device=normalized.device, dtype=torch.float32)
-    return _fit_codebook(normalized)
+        return default_w4a8_codebook(levels).to(normalized.device)
+    return _fit_codebook(normalized, levels=levels)
 
 
 def _assign_codes(normalized: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
@@ -194,11 +213,11 @@ def validate_w4a8_weight_shape(
     """Validate a floating weight (and the requested layout) before W4A8/W6A8 preparation."""
     if weight.dim() != 2:
         raise ValueError(f"W4A8 weight must be 2D, got shape {tuple(weight.shape)}")
-    if bits not in (4, 6):
-        raise ValueError(f"bits must be 4 or 6, got {bits}")
+    if bits not in _SUPPORTED_BITS:
+        raise ValueError(f"bits must be 3, 4, 5 or 6, got {bits}")
     k = weight.shape[1]
-    if bits == 6:
-        _check_six_bit_layout(k, group_size)
+    if bits != 4:
+        _check_plane_layout(k, group_size, bits)
     if (
         k % 16 != 0
         or k % group_size != 0
@@ -230,13 +249,15 @@ def _quantize_rotated_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Quantize an already ConvRot-rotated weight into W4A8 (or W6A8) storage.
+    """Quantize an already ConvRot-rotated weight into W3A8 / W4A8 / W5A8 / W6A8 storage.
 
     ``codebook_override`` lets a chunked caller pin the same table across chunks; when None
     it is chosen from this (sub)tensor via _codebook_for. ``stochastic_rounding`` > 0 seeds
-    stochastic rounding of the final level assignment (the LoRA-merge path). ``bits=6`` is
-    symmetric, uniform and codebook-free; ``scale_search`` (6-bit only) runs the grid-aware
-    group-scale search, which the requantize path turns off.
+    stochastic rounding of the final level assignment (the LoRA-merge path). ``bits`` 5 and 6
+    are symmetric, uniform and codebook-free; 3 always uses an 8-entry codebook (frozen
+    unless heavy-tailed, like 4);
+    ``scale_search`` (5- and 6-bit only) runs the grid-aware group-scale search, which the
+    requantize path turns off.
     """
     if scale_dtype not in (torch.float32, torch.float8_e4m3fn):
         raise ValueError(f"scale_dtype must be float32 or float8_e4m3fn, got {scale_dtype}")
@@ -247,27 +268,31 @@ def _quantize_rotated_w4a8_int8_weight(
     grouped_weight = weight.float().view(n, groups, group_size)
 
     codebook_tensor = None
-    level_table = None  # levels the grid assignment decodes against (codebook or uniform-6)
-    if bits == 6 or (symmetric and codebook):
-        # One ALS loop for both level tables. 6-bit levels are the integers -31..31, so the
-        # stored s_rel is the per-level step the kernels multiply (c - 32) by and the group
-        # scale starts at amax / 31; the codebook is normalized, so its scale starts at amax.
+    level_table = None  # levels the grid assignment decodes against (codebook or uniform)
+    uniform = bits in _UNIFORM_LEVELS
+    if (uniform or bits == 3) and not symmetric:
+        raise ValueError(f"{bits}-bit storage is symmetric only")
+    if uniform or bits == 3 or (symmetric and codebook):
+        # One ALS loop for both level tables. Uniform levels are the integers -L..L (L = 15
+        # at 5 bits, 31 at 6), so the stored s_rel is the per-level step the kernels multiply
+        # (c - L - 1) by and the group scale starts at amax / L; a codebook is normalized, so
+        # its scale starts at amax.
         amax = grouped_weight.abs().amax(dim=-1, keepdim=True)
-        if bits == 6:
-            level_table = torch.arange(
-                -_W6_LEVELS, _W6_LEVELS + 1, device=weight.device, dtype=torch.float32
-            )
-            group_scale = (amax / _W6_LEVELS).clamp(min=1e-8)
+        if uniform:
+            lmax = _UNIFORM_LEVELS[bits]
+            level_table = torch.arange(-lmax, lmax + 1, device=weight.device, dtype=torch.float32)
+            group_scale = (amax / lmax).clamp(min=1e-8)
 
             def assign(normalized):  # nearest integer level: round, no search needed
-                return (normalized.round_().clamp_(-_W6_LEVELS, _W6_LEVELS) + _W6_LEVELS).to(torch.int32)
+                return (normalized.round_().clamp_(-lmax, lmax) + lmax).to(torch.int32)
 
             quantized = assign(grouped_weight / group_scale)
         else:
             group_scale = amax.clamp(min=1e-8)
             normalized = grouped_weight / group_scale
             codebook_tensor = (
-                codebook_override if codebook_override is not None else _codebook_for(normalized)
+                codebook_override if codebook_override is not None
+                else _codebook_for(normalized, _CODEBOOK_LEVELS[bits])
             )
             level_table = codebook_tensor
 
@@ -307,14 +332,14 @@ def _quantize_rotated_w4a8_int8_weight(
     if scale_dtype != torch.float32:
         s_rel = s_rel.to(scale_dtype).contiguous()
     if level_table is not None:
-        searched = bits == 6 and scale_search
+        searched = uniform and scale_search
         if searched:
             s_rel, unsigned = _search_group_scale(grouped_weight, s_rel, s_channel, level_table)
         if not searched or stochastic_rounding > 0:  # SR needs its own (seeded) assignment
             levels = _grid_levels(level_table, s_rel)
             unsigned = _assign_grid(grouped_weight, levels, s_channel, stochastic_rounding)
-        if bits == 6:
-            unsigned.add_(1)  # level index 0..62 -> stored code q+32 in 1..63
+        if uniform:
+            unsigned.add_(1)  # level index 0..2L -> stored code q+L+1 (1..31 / 1..63)
         unsigned = unsigned.view(n, k)
 
     packed = _pack_codes(unsigned, bits)
@@ -379,6 +404,7 @@ def _decide_codebook(
     rotate_fn,
     group_size: int,
     convrot_groupsize: int,
+    levels: int = 16,
 ) -> torch.Tensor:
     """Choose one codebook for the whole tensor from a bounded, deterministic row sample that
     spans every chunk (evenly strided rows), so the choice never depends on the chunk size."""
@@ -392,7 +418,7 @@ def _decide_codebook(
     rotated = rotate_fn(sample.contiguous(), convrot_groupsize)
     grouped = rotated.float().view(sample.shape[0], k // group_size, group_size)
     normalized = grouped / grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
-    return _codebook_for(normalized)
+    return _codebook_for(normalized, levels)
 
 
 def _quantize_w4a8_chunked(
@@ -426,15 +452,15 @@ def _quantize_w4a8_chunked(
     n, k = weight.shape
     block = max(1, _QUANT_ROW_ELEM_BUDGET // max(k, 1))
     override = None
-    if bits == 6:
-        if not symmetric:
-            raise ValueError("6-bit storage is symmetric only")
-        codebook = False  # uniform only; a 6-bit table is never fit or stored
+    if bits in _UNIFORM_LEVELS:
+        codebook = False  # uniform only; a 5/6-bit table is never fit or stored
+    if bits == 3:
+        codebook = True  # always the 8-entry table (frozen unless heavy-tailed, like 4-bit)
     if symmetric and codebook:
         override = (
             codebook_override.to(device=weight.device, dtype=torch.float32)
             if codebook_override is not None
-            else _decide_codebook(weight, rotate_fn, group_size, convrot_groupsize)
+            else _decide_codebook(weight, rotate_fn, group_size, convrot_groupsize, _CODEBOOK_LEVELS[bits])
         )
 
     if n <= block:
@@ -502,7 +528,7 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Rotate and prepare a floating weight for grouped W4A8 (``bits=4``) or W6A8 storage."""
+    """Rotate and prepare a floating weight for grouped W3A8 / W4A8 / W5A8 / W6A8 storage."""
     validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
     return _quantize_w4a8_chunked(
         weight,
@@ -525,7 +551,7 @@ def _dequant_int4_grouped_to_int8(
     codebook: torch.Tensor | None,
     group_size: int,
 ) -> torch.Tensor:
-    """Decode grouped INT4/INT6 storage to the INT8 grid consumed by the GEMM."""
+    """Decode grouped INT3/INT4/INT5/INT6 storage to the INT8 grid consumed by the GEMM."""
     n, k, bits = _w4a8_geometry(qdata, s_rel, group_size)
     groups = k // group_size
     quantized = _unpack_codes(qdata, k, bits)
@@ -554,8 +580,10 @@ def validate_w4a8_operands(
     if group_size < 4 or (16 % group_size != 0 and group_size % 16 != 0):
         raise ValueError(f"group_size={group_size} must be >=4 and divide 16 or be a multiple of 16")
     n, k, bits = _w4a8_geometry(qdata, s_rel, group_size)  # k = groups * group_size
-    if bits == 6 and (codebook is not None or correction is not None):
-        raise ValueError("6-bit storage is uniform and symmetric: no codebook or correction")
+    if bits in _UNIFORM_LEVELS and (codebook is not None or correction is not None):
+        raise ValueError(f"{bits}-bit storage is uniform and symmetric: no codebook or correction")
+    if bits == 3 and (codebook is None or correction is not None):
+        raise ValueError("3-bit storage needs its 8-entry codebook and has no correction")
     if k % 16 != 0 or k % convrot_groupsize != 0:
         raise ValueError(
             f"K={k} must be divisible by 16 and convrot_groupsize={convrot_groupsize}"
@@ -568,8 +596,8 @@ def validate_w4a8_operands(
         raise ValueError(f"s_channel must have shape {(n,)}, got {tuple(s_channel.shape)}")
     if correction is not None and tuple(correction.shape) != (groups, n):
         raise ValueError(f"correction must have shape {(groups, n)}, got {tuple(correction.shape)}")
-    if codebook is not None and tuple(codebook.shape) != (16,):
-        raise ValueError(f"codebook must have shape (16,), got {tuple(codebook.shape)}")
+    if codebook is not None and tuple(codebook.shape) != (_CODEBOOK_LEVELS.get(bits, 16),):
+        raise ValueError(f"codebook must have shape ({_CODEBOOK_LEVELS.get(bits, 16)},), got {tuple(codebook.shape)}")
     return n, k, bits
 
 
@@ -712,6 +740,7 @@ def w4a8_packed_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    decode_lut: torch.Tensor | None = None,  # the CUDA stream's table; eager decodes through codebook
 ) -> torch.Tensor:
     """Portable fallback for resident packed weights."""
     x = apply_input_act(x, input_act, input_act_weight, input_act_eps)

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 //
-// Fused W4A8 / W6A8 GEMV for decode (M <= 8). The chunked path decodes the whole
+// Fused W4A8 / W6A8 (and 3/5-bit) GEMV for decode (M <= 8). The chunked path decodes the whole
 // packed weight into an INT8 workspace and the GEMM reads it back, which at these row
 // counts costs three times the traffic of the packed weight itself. Here one wave
 // owns one output column, decodes its 16-column vectors in registers and dots
@@ -27,7 +27,7 @@ __global__ __launch_bounds__(kWave* kW4a8GemvWaves) void w4a8_codebook_gemv_kern
     const int8_t* __restrict__ xq,        // [M, K] rotated + quantized activation
     const int8_t* __restrict__ qw,        // [N, K * BITS / 8] packed codes
     const uint8_t* __restrict__ s_rel,    // [N, K/G] raw e4m3
-    const float* __restrict__ codebook,   // 16 levels, or null for (code - 8)
+    const float* __restrict__ codebook,   // 16 levels (4-bit, or null for code - 8); 8 levels at 3 bits
     OutT* __restrict__ out,               // [M, N]
     int M, int N, int K, int group_size, EpiRowwise epi) {
 
@@ -36,6 +36,11 @@ __global__ __launch_bounds__(kWave* kW4a8GemvWaves) void w4a8_codebook_gemv_kern
         if (threadIdx.x < 16) {
             cb[threadIdx.x] =
                 codebook ? codebook[threadIdx.x] : (static_cast<float>(threadIdx.x) - 8.0f);
+        }
+        __syncthreads();
+    } else if constexpr (BITS == 3) {
+        if (threadIdx.x < 8) {
+            cb[threadIdx.x] = codebook[threadIdx.x];
         }
         __syncthreads();
     }
@@ -47,7 +52,7 @@ __global__ __launch_bounds__(kWave* kW4a8GemvWaves) void w4a8_codebook_gemv_kern
     }
 
     const int k_half = K / 2;
-    const int nvec = k_half / 8;  // 16-column vectors per weight row
+    const int nvec = K / 16;  // 16-column vectors per weight row
     const int64_t row_bytes = static_cast<int64_t>(K) * BITS / 8;
     const int8_t* __restrict__ wrow = qw + static_cast<int64_t>(n) * row_bytes;
     const uint8_t* __restrict__ srow = s_rel + static_cast<int64_t>(n) * (K / group_size);
@@ -66,12 +71,16 @@ __global__ __launch_bounds__(kWave* kW4a8GemvWaves) void w4a8_codebook_gemv_kern
     // only naturally aligned when both the row base (steps of K * BITS / 8 bytes)
     // and the half-row are multiples of 16 bytes, which is also when the pair loop
     // divides the row evenly. Anything else walks one vector per lane instead.
-    if ((k_half & 15) == 0 && (row_bytes & 15) == 0) {
+    // 3-bit rows (2-bit plane, 4 bytes per vector) take the one-vector path.
+    if (BITS != 3 && (k_half & 15) == 0 && (row_bytes & 15) == 0) {
         for (int v = lane; v < nvec / 2; v += kWave) {
             const uint4 packed = *reinterpret_cast<const uint4*>(wrow + v * 16);
             uint2 hi = make_uint2(0u, 0u);
             if constexpr (BITS == 6) {
                 hi = *reinterpret_cast<const uint2*>(wrow + k_half + v * 8);
+            } else if constexpr (BITS == 5) {
+                const unsigned both = *reinterpret_cast<const unsigned*>(wrow + k_half + v * 4);
+                hi = make_uint2(both & 0xffffu, both >> 16);
             }
             const int k0 = v * 32;
             const float s0 = load_group_scale<uint8_t>(srow[k0 / group_size]);
@@ -99,10 +108,19 @@ __global__ __launch_bounds__(kWave* kW4a8GemvWaves) void w4a8_codebook_gemv_kern
         }
     } else {
         for (int v = lane; v < nvec; v += kWave) {
-            const uint2 packed = *reinterpret_cast<const uint2*>(wrow + v * 8);
+            uint2 packed;
+            if constexpr (BITS == 3) {
+                packed = make_uint2(*reinterpret_cast<const unsigned*>(wrow + v * 4), 0u);  // 2-bit plane
+            } else {
+                packed = *reinterpret_cast<const uint2*>(wrow + v * 8);
+            }
             unsigned hi = 0u;
             if constexpr (BITS == 6) {
                 hi = *reinterpret_cast<const unsigned*>(wrow + k_half + v * 4);
+            } else if constexpr (BITS == 5) {
+                hi = *reinterpret_cast<const unsigned short*>(wrow + k_half + v * 2);
+            } else if constexpr (BITS == 3) {
+                hi = *reinterpret_cast<const unsigned short*>(wrow + K / 4 + v * 2);
             }
             const int k0 = v * 16;
             const float s = load_group_scale<uint8_t>(srow[k0 / group_size]);
@@ -153,8 +171,13 @@ extern "C" bool launch_w4a8_codebook_gemv_kernel(
     if (K % 16 != 0 || group_size < 16 || group_size % 16 != 0 || K % group_size != 0) {
         return false;
     }
-    // 6-bit rows are 3K/4 bytes; K % 32 keeps them and the high plane 8-byte aligned.
-    if ((bits != 4 && bits != 6) || (bits == 6 && (K % 32 != 0 || codebook))) {
+    // Multi-plane rows (3/5/6-bit) need K % 32 (6) or K % 64 (3/5) so the planes stay
+    // aligned; 6/5-bit are uniform (no codebook), 3-bit needs its 8-entry codebook.
+    if (bits != 3 && bits != 4 && bits != 5 && bits != 6) {
+        return false;
+    }
+    if ((bits == 6 && (K % 32 != 0 || codebook)) || (bits == 5 && (K % 64 != 0 || codebook))
+            || (bits == 3 && (K % 64 != 0 || !codebook))) {
         return false;
     }
 
@@ -173,6 +196,10 @@ extern "C" bool launch_w4a8_codebook_gemv_kernel(
     do {                                                                                       \
         if (bits == 6) {                                                                       \
             CK_W4A8_GEMV_LAUNCH_BITS(OutT, 6);                                                 \
+        } else if (bits == 5) {                                                                \
+            CK_W4A8_GEMV_LAUNCH_BITS(OutT, 5);                                                 \
+        } else if (bits == 3) {                                                                \
+            CK_W4A8_GEMV_LAUNCH_BITS(OutT, 3);                                                 \
         } else {                                                                               \
             CK_W4A8_GEMV_LAUNCH_BITS(OutT, 4);                                                 \
         }                                                                                      \
