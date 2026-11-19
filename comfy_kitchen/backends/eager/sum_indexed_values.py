@@ -27,7 +27,9 @@ def sum_indexed_values(image: torch.Tensor, index_matrix: torch.Tensor) -> torch
     # rearrange(image, "c h w -> (h w) c")
     flat = image.permute(1, 2, 0).reshape(h * w, -1)
     out = torch.zeros((u, flat.shape[1]), dtype=flat.dtype, device=flat.device)
-    out.index_add_(0, index_matrix.view(-1), flat)
+    # reshape rather than the stock view(-1): the same for a contiguous index, and a strided one
+    # (which the triton call rule sends here) is copied instead of raising
+    out.index_add_(0, index_matrix.reshape(-1), flat)
     return out
 
 

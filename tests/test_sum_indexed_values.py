@@ -187,6 +187,14 @@ class TestSumIndexedValuesEager:
             got = _stock_regaussianize(noise, ck.sum_indexed_values)
         assert torch.equal(got[0], ref[0]) and torch.equal(got[1], ref[1])
 
+    def test_strided_index(self):
+        image = _image(16, 48, 168)
+        index_matrix = _index(48, 168, "runs")
+        strided = index_matrix.t().contiguous().t()
+        assert not strided.is_contiguous()
+        got = ck.sum_indexed_values(image, strided)
+        assert torch.equal(got, _stock_sum_indexed_values(image, index_matrix))
+
     def test_unused_index_gives_zero_row(self):
         image = _image(16, 4, 6)
         index_matrix = torch.zeros(4, 6, dtype=torch.int64)
@@ -402,11 +410,14 @@ class TestSumIndexedValuesTriton:
             with _ran(["eager"]), ck.use_backend("triton"):
                 got = ck.sum_indexed_values(img, idx)
             assert torch.equal(got, _stock_sum_indexed_values(img, idx))
-        # a strided index goes to eager too; like the stock view(-1), eager does not take it
-        # (unique_pixels gives a contiguous index), so only the dispatch is checked
-        kwargs = _kwargs(image, index_matrix.t().contiguous().t())
+        # a strided index goes to eager too
+        strided = index_matrix.t().contiguous().t()
+        kwargs = _kwargs(image, strided)
         assert not registry.validate_backend_for_call("triton", OP, kwargs).success
         assert registry.get_capable_backend(OP, kwargs) == "eager"
+        with _ran(["eager"]), ck.use_backend("triton"):
+            got = ck.sum_indexed_values(image, strided)
+        assert torch.equal(got, _stock_sum_indexed_values(image, index_matrix))
         # deterministic algorithms: eager, whose index_add_ is deterministic on CUDA then
         image = _image(16, 48, 168, device="cuda")
         index_matrix = _index(48, 168, "runs", device="cuda")
