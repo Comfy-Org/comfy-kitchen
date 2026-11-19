@@ -1008,3 +1008,81 @@ def test_block_len_validation():
     c = _chunked_case(seed=11, rot=64)
     with pytest.raises(ValueError, match="block_len"):
         backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], block_len=bad_dtype)
+
+
+# ---- k/v with their own length: keys the queries leave out (a conditioning prefix) ----
+
+needs_key_len = pytest.mark.skipif(backend is hip_backend, reason="the HIP kernels take one sequence length")
+
+
+# t queries against prefix + t + extra keys: a ragged prefix, a suffix, fewer keys than queries
+@needs_key_len
+@pytest.mark.parametrize("t,prefix,extra", [(1000, 100, 0), (1024, 0, 300), (1024, 0, -400)])
+@pytest.mark.parametrize("select", [{"tau": 1.0}, {"topk_ratio": 0.2}])
+def test_key_prefix_matches_eager(t, prefix, extra, select):
+    q = _qkv(1, t, 4)[0]
+    _, k, v = _qkv(1, prefix + t + extra, 4, seed=1)
+    kw = dict(sink_blocks=[0, (prefix + 63) // 64], q_offset=prefix, **select)
+    got = ck.sol_attn(q, k, v, **kw)
+    assert got.shape == q.shape
+    assert _cos(got, sol_attn_eager(q, k, v, **kw)) > 0.998
+
+
+@needs_key_len
+@pytest.mark.parametrize("select", [{"tau": 1.0}, {"topk_ratio": 0.2}])
+def test_key_prefix_rows_equal_the_full_sequence_call(select):
+    """With a block-aligned prefix a query block routes exactly as it does when the
+    prefix rows are queries too; a batch and a key_bias ride along."""
+    prefix = 128
+    q, k, v = _qkv(2, prefix + 1000, 4, seed=5)
+    part_q = q[:, prefix:].contiguous()
+    bias = torch.zeros(prefix + 1000, device="cuda")
+    bias[:64] = float("-inf")
+    kw = dict(sink_blocks=[0, prefix // 64], key_bias=bias, **select)
+    assert torch.equal(ck.sol_attn(part_q, k, v, q_offset=prefix, **kw), ck.sol_attn(q, k, v, **kw)[:, prefix:])
+    # the token stage splits its tile list by the query count, so its sums differ in order
+    kw["token_aug"] = 256
+    assert _cos(ck.sol_attn(part_q, k, v, q_offset=prefix, **kw), ck.sol_attn(q, k, v, **kw)[:, prefix:]) > 0.9999
+
+
+@needs_key_len
+def test_diagonal_band_follows_q_offset():
+    """Each query block's own keys and the 64 tokens on either side stay exact, also when
+    q_offset is off the key-block grid. Query i has one strong key, at q_offset + i + shift,
+    and every key block's mean is zero: no pooled score clears a threshold, so only the
+    band can find it."""
+    t, prefix, g = 1024, 100, torch.Generator(device="cuda").manual_seed(11)
+    for shift, in_band in ((-64, True), (64, True), (-192, False), (192, False)):
+        q = 1.25 * torch.randn(1, t, 2, HD, device="cuda", generator=g)
+        k = 0.05 * torch.randn(1, prefix + t, 2, HD, device="cuda", generator=g)
+        j = prefix + torch.arange(t, device="cuda") + shift
+        ok = (j >= 0) & (j < prefix + t)
+        k[:, j[ok]] = q[:, ok]
+        for a in range(0, prefix + t, 64):
+            k[:, a:a + 64] -= k[:, a:a + 64].mean(dim=1, keepdim=True)
+        v = torch.randn(1, prefix + t, 2, HD, device="cuda", generator=g)
+        q, k, v = (x.to(torch.bfloat16) for x in (q, k, v))
+        for fn in (ck.sol_attn, sol_attn_eager):
+            found = _cos(fn(q, k, v, tau=6.0, q_offset=prefix)[:, ok], _dense(q, k, v)[:, ok])
+            assert (found > 0.99) if in_band else (found < 0.5), (shift, fn.__module__, found)
+
+
+def test_key_length_validation():
+    """Neither side is empty, q_offset keeps the queries inside the keys, and block_len /
+    coarse_gate describe one sequence."""
+    q, k, v = _qkv(1, 512, 4)
+    longer = [torch.cat([x, x[:, :128]], dim=1) for x in (k, v)]
+    for bad in (192, 2**32 + 128):   # past the 128 spare keys; wraps to 128 as a C int
+        with pytest.raises(ValueError, match="q_offset"):
+            backend.sol_attn(q, *longer, tau=1.4, q_offset=bad)
+    for empty in ((q[:, :0], k, v), (q, k[:, :0], v[:, :0])):
+        with pytest.raises(ValueError, match="at least one token"):
+            backend.sol_attn(*empty, tau=1.4)
+    if backend is hip_backend:
+        with pytest.raises(ValueError, match="as long as q"):
+            backend.sol_attn(q, *longer, tau=1.4)
+        return
+    for bad in ({"block_len": torch.full((8,), 64, dtype=torch.int32, device="cuda")}, {"coarse_gate": torch.zeros_like(q)}):
+        for fn in (backend.sol_attn, sol_attn_eager):
+            with pytest.raises(ValueError, match="same length"):
+                fn(q, *longer, tau=1.4, **bad)

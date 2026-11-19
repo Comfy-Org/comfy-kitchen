@@ -67,17 +67,17 @@ __host__ size_t token_smem_bytes(int pass) {
 
 // per group of TOK_GROUP query blocks: centroid (quantized like prep_q's), best
 // unrouted pooled score, and the blocks unrouted by every member
-__global__ void sol_token_group_kernel(const float* __restrict__ qmean,        // [B*H, NPAD, HD]
+__global__ void sol_token_group_kernel(const float* __restrict__ qmean,        // [B*H, NQ, HD]
                                        const float* __restrict__ tok_ref,      // [B*H, NQ]
                                        const uint32_t* __restrict__ bits,      // [B*H, NQ, W] unrouted
                                        int8_t* __restrict__ gcen8, float* __restrict__ gcens,
                                        float* __restrict__ gref, uint32_t* __restrict__ gbits,
-                                       int NQ, int NPAD, int NG, int W) {
+                                       int NQ, int NG, int W) {
     __shared__ __align__(16) float sred[HD];
     const int grp = blockIdx.x, bh = blockIdx.y, d = threadIdx.x;
     const int qb0 = grp * TOK_GROUP, qb1 = min(NQ, qb0 + TOK_GROUP);
     float c = 0.f;
-    for (int qb = qb0; qb < qb1; ++qb) c += qmean[((size_t)bh * NPAD + qb) * HD + d];
+    for (int qb = qb0; qb < qb1; ++qb) c += qmean[((size_t)bh * NQ + qb) * HD + d];
     c /= (float)(qb1 - qb0);
     const float csc = fmaxf(block_max128(fabsf(c), sred) / 127.0f, 1e-8f);
     const size_t gs = (size_t)bh * NG + grp;
@@ -448,7 +448,7 @@ void launch_sol_token(
     void* tok_tiles, void* tok_tilecnt,
     void* tok_hist, void* tok_idx, void* tok_cnt, void* part_o, void* part_m, void* part_l,
     void* o_part, void* m_part, void* l_part,
-    int B, int Tp, int H, int NQ, int NPAD, int NTB, int n_tok, int tail,
+    int B, int Tp, int H, int NQ, int NTB, int n_tok, int tail,
     int sink_q_start, int sink_q_end, float scale_log2, cudaStream_t stream)
 {
     const size_t s1 = token_smem_bytes(1), s2 = token_smem_bytes(2);
@@ -458,7 +458,7 @@ void launch_sol_token(
     dim3 grid((NG + BQ - 1) / BQ, nsplit, B * H);
     sol_token_group_kernel<<<dim3(NG, B * H), HD, 0, stream>>>(
         (const float*)qmean, (const float*)tok_ref, (const uint32_t*)cand_bits,
-        (int8_t*)gcen8, (float*)gcens, (float*)gref, (uint32_t*)gbits, NQ, NPAD, NG, W);
+        (int8_t*)gcen8, (float*)gcens, (float*)gref, (uint32_t*)gbits, NQ, NG, W);
     // pass 1 has no partial state, so it may split further to keep the 16-bit bins from overflowing
     const int nsplit1 = max(nsplit, (NTB + P1_MAX_TILES * HIST_STRIDE - 1) / (P1_MAX_TILES * HIST_STRIDE));
     dim3 grid1(grid.x, nsplit1, B * H);
