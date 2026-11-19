@@ -260,13 +260,16 @@ def sol_attn_common_call_rule(kwargs):
     """Shared ``sol_attn`` validation. The fused backends size everything from
     ``q`` and ``k`` and reach the tensors as bare pointers, so a mismatch becomes
     an out-of-bounds read; head_dim 128 is baked into the kernels' layout.
-    ``k``/``v`` share one length, which may differ from ``q``'s."""
+    ``k``/``v`` share one length, at least ``q``'s."""
     q = kwargs.get("q")
     if q is not None:
         k = kwargs.get("k")
         key_len = k.shape[1] if k is not None and k.dim() == 4 else q.shape[1]
-        if q.shape[1] < 1 or key_len < 1:   # an empty side plans zero blocks
-            return ValidationResult.fail("q" if q.shape[1] < 1 else "k", "needs at least one token")
+        if q.shape[1] < 1:   # plans zero blocks
+            return ValidationResult.fail("q", "needs at least one token")
+        if key_len < q.shape[1]:   # a query block past the keys has no always-exact band
+            return ValidationResult.fail(
+                "k", f"needs at least as many rows as q ({q.shape[1]}), got shape {tuple(k.shape)}")
         want = (q.shape[0], key_len, *q.shape[2:])
         for name in ("k", "v"):
             other = kwargs.get(name)
@@ -306,7 +309,7 @@ def sol_attn_common_call_rule(kwargs):
             if coarse_gate.device != q.device:
                 return ValidationResult.fail("coarse_gate", f"must be on {q.device}, got {coarse_gate.device}")
         # query i is key q_offset + i: past this the always-exact band leaves the keys
-        q_offset, room = kwargs.get("q_offset") or 0, max(key_len - q.shape[1], 0)
+        q_offset, room = kwargs.get("q_offset") or 0, key_len - q.shape[1]
         if not 0 <= q_offset <= room:
             return ValidationResult.fail(
                 "q_offset", f"must be in [0, {room}] so the queries sit inside the keys, got {q_offset}")

@@ -206,9 +206,9 @@ def sol_attn(
 
     Args:
         q, k, v: ``(B, T, H, 128)`` tensors of one dtype. k and v share a
-            length ``Tk`` that may differ from q's (keys the queries leave
-            out, such as clean conditioning frames: see ``q_offset``). The
-            fused backends take bfloat16 or float16; head_dim is fixed at 128.
+            length ``Tk >= T``: they may carry keys the queries leave out,
+            such as clean conditioning frames (see ``q_offset``). The fused
+            backends take bfloat16 or float16; head_dim is fixed at 128.
         tau: Routing threshold in sigmas of the proxy row. Higher routes fewer
             blocks exactly: cheaper and less accurate.
         scale: Score scale; None means ``head_dim ** -0.5``.

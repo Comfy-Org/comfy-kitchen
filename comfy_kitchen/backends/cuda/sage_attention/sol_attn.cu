@@ -23,9 +23,9 @@
 // Entry paths: `launch_sol_attn` (post-rope q/k/v) or the chunked producer
 // (`sol_producer_begin/chunk`, then `launch_sol_attn_core`). sm_80+, tuned
 // for sm_120; tensors are (B, T, H, 128) bf16 or fp16 (the chunked producer
-// takes bf16 only). On the q/k/v path k and v may differ from q in length
-// (seq_len queries, key_len keys): the query-side stages take one, the
-// key-side stages the other.
+// takes bf16 only). On the q/k/v path k and v may be longer than q (seq_len
+// queries, key_len keys): the query-side stages take one, the key-side
+// stages the other.
 
 #include <cuda_runtime.h>
 #include <cstdint>

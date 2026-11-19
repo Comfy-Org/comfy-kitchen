@@ -1015,9 +1015,9 @@ def test_block_len_validation():
 needs_key_len = pytest.mark.skipif(backend is hip_backend, reason="the HIP kernels take one sequence length")
 
 
-# t queries against prefix + t + extra keys: a ragged prefix, a suffix, fewer keys than queries
+# t queries against prefix + t + extra keys: a ragged prefix, a suffix
 @needs_key_len
-@pytest.mark.parametrize("t,prefix,extra", [(1000, 100, 0), (1024, 0, 300), (1024, 0, -400)])
+@pytest.mark.parametrize("t,prefix,extra", [(1000, 100, 0), (1024, 0, 300)])
 @pytest.mark.parametrize("select", [{"tau": 1.0}, {"topk_ratio": 0.2}])
 def test_key_prefix_matches_eager(t, prefix, extra, select):
     q = _qkv(1, t, 4)[0]
@@ -1068,16 +1068,17 @@ def test_diagonal_band_follows_q_offset():
 
 
 def test_key_length_validation():
-    """Neither side is empty, q_offset keeps the queries inside the keys, and block_len /
-    coarse_gate describe one sequence."""
+    """q is not empty, the keys are at least as long, q_offset keeps the queries inside
+    them, and block_len / coarse_gate describe one sequence."""
     q, k, v = _qkv(1, 512, 4)
     longer = [torch.cat([x, x[:, :128]], dim=1) for x in (k, v)]
     for bad in (192, 2**32 + 128):   # past the 128 spare keys; wraps to 128 as a C int
         with pytest.raises(ValueError, match="q_offset"):
             backend.sol_attn(q, *longer, tau=1.4, q_offset=bad)
-    for empty in ((q[:, :0], k, v), (q, k[:, :0], v[:, :0])):
-        with pytest.raises(ValueError, match="at least one token"):
-            backend.sol_attn(*empty, tau=1.4)
+    # fewer keys than queries: the last query blocks would have no always-exact band
+    for bad, why in (((q[:, :0], k, v), "at least one token"), ((q, k[:, :256], v[:, :256]), "as many rows as q")):
+        with pytest.raises(ValueError, match=why):
+            backend.sol_attn(*bad, tau=1.4)
     if backend is hip_backend:
         with pytest.raises(ValueError, match="as long as q"):
             backend.sol_attn(q, *longer, tau=1.4)

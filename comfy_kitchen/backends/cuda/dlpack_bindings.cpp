@@ -1788,7 +1788,7 @@ void sol_attn(
     bool tail = true, int64_t token_aug = 0, int64_t q_offset = 0)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    // k and v may be longer or shorter than q (seq_len is q's length)
+    // k and v may be longer than q (seq_len is q's length)
     const int64_t key_len = k.ndim() == 4 ? (int64_t)k.shape(1) : seq_len;
     // first: the plan rejects non-positive extents, which would size nothing below
     need_workspace(workspace, batch, seq_len, key_len, num_heads, token_aug, "sol_attn");
@@ -1797,7 +1797,7 @@ void sol_attn(
     if (block_len && key_len != seq_len)
         throw std::runtime_error("sol_attn: block_len needs q and k of the same length");
     if (block_len) check_block_len(*block_len, seq_len, "sol_attn");
-    if (q_offset < 0 || q_offset > (key_len > seq_len ? key_len - seq_len : 0))
+    if (q_offset < 0 || q_offset > key_len - seq_len)   // also k shorter than q
         throw std::runtime_error("sol_attn: q_offset must leave the queries inside the keys");
     const int elem = sol_elem_code(q);
     if (elem < 0) throw std::runtime_error("sol_attn: q must be bfloat16 or float16");

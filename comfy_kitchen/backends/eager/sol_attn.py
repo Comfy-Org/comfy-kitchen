@@ -136,7 +136,7 @@ def sol_attn(
 ) -> torch.Tensor:
     """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring.
 
-    k and v may have their own length ``Tk``: query ``i`` is key ``q_offset + i``,
+    k and v may be longer than q (``Tk`` rows): query ``i`` is key ``q_offset + i``,
     which places the always-exact band (the key blocks holding a query block's
     own tokens and the 64 tokens on either side).
 

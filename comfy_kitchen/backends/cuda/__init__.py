@@ -3109,7 +3109,7 @@ def sol_attn(
     q_offset: int = 0,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors;
-    k and v may have their own length. See sage_attention/sol_attn.cu and the
+    k and v may be longer than q. See sage_attention/sol_attn.cu and the
     public docstring for ``tail``, ``block_len``, ``coarse_gate`` and ``q_offset``.
 
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
