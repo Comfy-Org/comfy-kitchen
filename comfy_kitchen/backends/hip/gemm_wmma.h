@@ -115,6 +115,22 @@ struct TileStager {
             *reinterpret_cast<uint2*>(dst + 8) = make_uint2(regs[i].z, regs[i].w);
         }
     }
+
+    // BK128 XOR layout used by the gfx1151 Qwen INT8 path.
+    __forceinline__ __device__ void store_xor_swizzled(uint8_t* __restrict__ lds) const {
+        static_assert(BKB == 128, "the XOR LDS layout is defined for BK128");
+        const int tid = threadIdx.x;
+        #pragma unroll
+        for (int i = 0; i < kPerThread; ++i) {
+            const int c = COALESCED_STAGING ? tid + i * THREADS
+                                             : tid * kPerThread + i;
+            const int row = c / kChunksPerRow;
+            const int chunk = c % kChunksPerRow;
+            const int swizzled_chunk = chunk ^ (row & 7);
+            uint8_t* dst = lds + row * BKB + swizzled_chunk * 16;
+            *reinterpret_cast<uint4*>(dst) = regs[i];
+        }
+    }
 };
 
 // A is the raw operand rows, or a TileStager source that gathers them. Only the

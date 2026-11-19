@@ -3,6 +3,8 @@
 //
 // INT8 GEMM on WMMA (v_wmma_i32_16x16x16_iu8), gfx11 and gfx12. See mma.h.
 // C[M, N] = (A[M, K] @ B[N, K]^T) * scale_a[row] * scale_b[col] + bias
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -12,6 +14,38 @@
 #include "../launchers.h"
 
 namespace comfy::hip_backend {
+
+// The dual-M schedule is measured on Strix Halo, not a universal gfx11 policy.
+inline bool select_gfx1151(int device) {
+    hipDeviceProp_t p{};
+    return hipGetDeviceProperties(&p, device) == hipSuccess &&
+           std::strncmp(p.gcnArchName, "gfx1151", 7) == 0;
+}
+
+inline bool use_gfx1151_int8_variant17() {
+    const char* disabled = std::getenv("COMFY_HIP_GFX1151_VARIANT17_DISABLE");
+    return !(disabled && disabled[0] == '1') &&
+           cached_device_query<select_gfx1151>();
+}
+
+inline bool use_gfx1151_int8_xor_swizzle() {
+    const char* enabled = std::getenv("COMFY_HIP_GFX1151_INT8_LDS_XOR_SWIZZLE");
+    return !enabled || enabled[0] != '0';
+}
+
+static void launch_int8_raw_gfx1151(const uint8_t*, const uint8_t*, __bf16*,
+                                    int, int, int, int, EpiRowwise, hipStream_t);
+
+template <bool LDS_XOR_SWIZZLE>
+__forceinline__ __device__ MmaInt8::Frag load_int8_dual_m_fragment(
+    const void* lds, int row, int kbyte, int stride, int lane) {
+    if constexpr (LDS_XOR_SWIZZLE) {
+        return MmaInt8::load_aligned(lds, row,
+                                     kbyte ^ ((row & 7) << 4), stride, lane);
+    } else {
+        return MmaInt8::load(lds, row, kbyte, stride, lane);
+    }
+}
 
 // Small-M path: reduce K across the wave, one wave per output column.
 template <typename OutT>
@@ -55,6 +89,15 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
         dim3 grid((N + 7) / 8, M);
         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         return;
+    }
+    if constexpr (std::is_same_v<OutT, __bf16>) {
+        // Do not trade the stock small-grid schedule for half-empty dual-M CTAs.
+        const int blocks = ((M + 255) / 256) * ((N + 127) / 128);
+        if (M >= 1024 && N >= 128 && K >= 128 &&
+            use_gfx1151_int8_variant17() && blocks >= device_wgp_count()) {
+            launch_int8_raw_gfx1151(Au, Bu, C, M, N, K, ldc, epi, stream);
+            return;
+        }
     }
     launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
 }
@@ -106,14 +149,16 @@ namespace comfy::hip_backend {
 
 // Two 128-row activation tiles share one weight tile. Each half of the block
 // retains the single-M accumulator shape and K order; only B staging is shared.
-// The producer still writes 128x128 tiles, including a padded final M tile.
-template <typename Epi>
+// TILED_A keeps the existing physical tile layout; raw A uses row-major loads.
+template <typename Epi, bool TILED_A = true, bool FULL_TILE = false,
+          bool LDS_XOR_SWIZZLE = false>
 __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
     __bf16* __restrict__ C, int M, int N, int K, int ldc, Epi epi) {
     #pragma clang fp contract(off)
     #pragma clang fp reassociate(off)
-    constexpr int BM = 128, BN = 128, BK = 128, stride = BK + kLdsPad;
+    constexpr int BM = 128, BN = 128, BK = 128;
+    constexpr int stride = BK + (LDS_XOR_SWIZZLE ? 0 : kLdsPad);
     constexpr int TM = 2, TN = 4, steps = BK / MmaInt8::kStepBytes;
     __shared__ __align__(16) uint8_t As[2][BM * stride];
     __shared__ __align__(16) uint8_t Bs[BN * stride];
@@ -134,7 +179,7 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
     const int n0 = (within / group_rows) * BN;
     const int m_pair = pair * 2 * BM;
     const int m0 = m_pair + half * BM;
-    const bool second_tile = m_pair + BM < M;
+    const bool second_tile = FULL_TILE || m_pair + BM < M;
 
     MmaInt8::Acc acc[TM][TN];
     #pragma unroll
@@ -146,12 +191,23 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
     TileStager<BN, BK, 512> sb;
     const int64_t tile0 = static_cast<int64_t>(pair * 2) * (K / BK);
     const int64_t tile1 = tile0 + K / BK;
-    sa0.load_contiguous(A + tile0 * BM * BK);
-    if (second_tile) sa1.load_contiguous(A + tile1 * BM * BK);
+    if constexpr (TILED_A) {
+        sa0.load_contiguous(A + tile0 * BM * BK);
+        if (second_tile) sa1.load_contiguous(A + tile1 * BM * BK);
+    } else {
+        sa0.load(A, m_pair, M, 0, K);
+        if (second_tile) sa1.load(A, m_pair + BM, M, 0, K);
+    }
     sb.load(B, n0, N, 0, K);
-    sa0.store(As[0]);
-    if (second_tile) sa1.store(As[1]);
-    sb.store(Bs);
+    if constexpr (LDS_XOR_SWIZZLE) {
+        sa0.store_xor_swizzled(As[0]);
+        if (second_tile) sa1.store_xor_swizzled(As[1]);
+        sb.store_xor_swizzled(Bs);
+    } else {
+        sa0.store(As[0]);
+        if (second_tile) sa1.store(As[1]);
+        sb.store(Bs);
+    }
     __syncthreads();
 
     const int row = frag_row(lane);
@@ -159,22 +215,27 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
         const int next = kb + BK;
         const bool has_next = next < K;
         if (has_next) {
-            sa0.load_contiguous(A + (tile0 + next / BK) * BM * BK);
-            if (second_tile)
-                sa1.load_contiguous(A + (tile1 + next / BK) * BM * BK);
+            if constexpr (TILED_A) {
+                sa0.load_contiguous(A + (tile0 + next / BK) * BM * BK);
+                if (second_tile)
+                    sa1.load_contiguous(A + (tile1 + next / BK) * BM * BK);
+            } else {
+                sa0.load(A, m_pair, M, next, K);
+                if (second_tile) sa1.load(A, m_pair + BM, M, next, K);
+            }
             sb.load(B, n0, N, next, K);
         }
         // An absent second tile must participate in barriers, but not read LDS.
-        if (m0 < M) {
+        if (FULL_TILE || m0 < M) {
             MmaInt8::Frag af[2][TM], bf[2][TN];
             #pragma unroll
             for (int i = 0; i < TM; ++i)
-                af[0][i] = MmaInt8::load(As[half], wm * TM * 16 + i * 16 + row,
-                                        0, stride, lane);
+                af[0][i] = load_int8_dual_m_fragment<LDS_XOR_SWIZZLE>(
+                    As[half], wm * TM * 16 + i * 16 + row, 0, stride, lane);
             #pragma unroll
             for (int j = 0; j < TN; ++j)
-                bf[0][j] = MmaInt8::load(Bs, wn * TN * 16 + j * 16 + row,
-                                        0, stride, lane);
+                bf[0][j] = load_int8_dual_m_fragment<LDS_XOR_SWIZZLE>(
+                    Bs, wn * TN * 16 + j * 16 + row, 0, stride, lane);
             #pragma unroll
             for (int kk = 0; kk < steps; ++kk) {
                 const int cur = kk & 1, nxt = cur ^ 1;
@@ -182,11 +243,11 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
                     const int kbyte = (kk + 1) * MmaInt8::kStepBytes;
                     #pragma unroll
                     for (int i = 0; i < TM; ++i)
-                        af[nxt][i] = MmaInt8::load(
+                        af[nxt][i] = load_int8_dual_m_fragment<LDS_XOR_SWIZZLE>(
                             As[half], wm * TM * 16 + i * 16 + row, kbyte, stride, lane);
                     #pragma unroll
                     for (int j = 0; j < TN; ++j)
-                        bf[nxt][j] = MmaInt8::load(
+                        bf[nxt][j] = load_int8_dual_m_fragment<LDS_XOR_SWIZZLE>(
                             Bs, wn * TN * 16 + j * 16 + row, kbyte, stride, lane);
                 }
                 #pragma unroll
@@ -198,9 +259,15 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
         }
         if (has_next) {
             __syncthreads();
-            sa0.store(As[0]);
-            if (second_tile) sa1.store(As[1]);
-            sb.store(Bs);
+            if constexpr (LDS_XOR_SWIZZLE) {
+                sa0.store_xor_swizzled(As[0]);
+                if (second_tile) sa1.store_xor_swizzled(As[1]);
+                sb.store_xor_swizzled(Bs);
+            } else {
+                sa0.store(As[0]);
+                if (second_tile) sa1.store(As[1]);
+                sb.store(Bs);
+            }
             __syncthreads();
         }
     }
@@ -213,10 +280,10 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
     for (int j = 0; j < TN; ++j) {
         const int col = n0 + wn * TN * 16 + j * 16 + col_lane;
         if constexpr (std::is_same_v<Epi, EpiRowwiseNoBias>) {
-            col_scale[j] = col < N ? epi.scale_b[col] : 0.0f;
+            col_scale[j] = (FULL_TILE || col < N) ? epi.scale_b[col] : 0.0f;
         } else {
-            col_scale[j] = col < N ? epi.scale_b[col * epi.scale_b_stride] : 0.0f;
-            col_bias[j] = col < N && epi.bias
+            col_scale[j] = (FULL_TILE || col < N) ? epi.scale_b[col * epi.scale_b_stride] : 0.0f;
+            col_bias[j] = (FULL_TILE || col < N) && epi.bias
                 ? load_scalar(epi.bias, epi.bias_code, col) : 0.0f;
         }
     }
@@ -225,12 +292,12 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
         #pragma unroll
         for (int e = 0; e < 8; ++e) {
             const int r = m0 + wm * TM * 16 + i * 16 + acc_row(lane, e);
-            if (r >= M) continue;
+            if (!FULL_TILE && r >= M) continue;
             const float row_scale = epi.scale_a[r];
             #pragma unroll
             for (int j = 0; j < TN; ++j) {
                 const int col = n0 + wn * TN * 16 + j * 16 + col_lane;
-                if (col >= N) continue;
+                if (!FULL_TILE && col >= N) continue;
                 float value = MmaInt8::get(acc[i][j], e) * row_scale;
                 value *= col_scale[j];
                 if constexpr (!std::is_same_v<Epi, EpiRowwiseNoBias>)
@@ -238,6 +305,28 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
                 C[static_cast<int64_t>(r) * ldc + col] = static_cast<__bf16>(value);
             }
         }
+    }
+}
+
+static void launch_int8_raw_gfx1151(const uint8_t* A, const uint8_t* B,
+                                    __bf16* C, int M, int N, int K, int ldc,
+                                    EpiRowwise epi, hipStream_t stream) {
+    constexpr int BM = 128, BN = 128;
+    dim3 grid((N + BN - 1) / BN, (M + 2 * BM - 1) / (2 * BM));
+    const bool full_tile = M % (2 * BM) == 0 && N % BN == 0 && K % 128 == 0;
+    const bool xor_swizzle = use_gfx1151_int8_xor_swizzle();
+    if (full_tile && xor_swizzle) {
+        gemm_int8_dual_m_tiled_kernel<EpiRowwise, false, true, true>
+            <<<grid, 512, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
+    } else if (full_tile) {
+        gemm_int8_dual_m_tiled_kernel<EpiRowwise, false, true, false>
+            <<<grid, 512, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
+    } else if (xor_swizzle) {
+        gemm_int8_dual_m_tiled_kernel<EpiRowwise, false, false, true>
+            <<<grid, 512, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
+    } else {
+        gemm_int8_dual_m_tiled_kernel<EpiRowwise, false, false, false>
+            <<<grid, 512, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
     }
 }
 
