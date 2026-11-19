@@ -288,6 +288,8 @@ class TestW4A8PackedMMA:
         ) for lut in (shared, other))
         dst.copy_from(src)
         assert dst.decode_lut is other and not shared.any()
+        dst.copy_from(dst)
+        assert dst.decode_lut is other
 
     @pytest.mark.parametrize(("n", "k"), [(16, 256), (272, 1280), (17408, 5120), (5120, 17408)])
     @pytest.mark.parametrize("bits", [3, 4, 5, 6])
