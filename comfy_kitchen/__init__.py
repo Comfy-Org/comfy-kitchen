@@ -221,6 +221,7 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    q_offset: int = 0,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -230,7 +231,9 @@ def sol_attn(
     below roughly 12k tokens dense or a fused attention is usually faster.
 
     Args:
-        q, k, v: ``(B, T, H, 128)`` tensors, same shape and dtype. The fused
+        q, k, v: ``(B, T, H, 128)`` tensors of one dtype. k and v share a
+            length ``Tk >= T``: they may carry keys the queries leave out,
+            such as clean conditioning frames (see ``q_offset``). The fused
             backends take bfloat16 or float16; head_dim is fixed at 128.
         tau: Routing threshold in sigmas of the proxy row. Higher routes fewer
             blocks exactly: cheaper and less accurate.
@@ -238,8 +241,8 @@ def sol_attn(
         sink_blocks: ``[start, end)`` key blocks always attended exactly by every
             query -- conditioning rows, typically.
         sink_q: ``[start, end)`` query blocks that attend everything exactly.
-        key_bias: Per-key additive logit bias in natural log, ``(T,)``,
-            ``(B, T)`` or an SDPA-style ``(B|1, 1, 1, T)`` float or bool mask.
+        key_bias: Per-key additive logit bias in natural log, ``(Tk,)``,
+            ``(B, Tk)`` or an SDPA-style ``(B|1, 1, 1, Tk)`` float or bool mask.
             Honoured by the exact branch only, so biased blocks must be
             covered by ``sink_blocks``.
         topk_ratio: > 0 selects SLA-style top-k instead of the tau threshold:
@@ -257,9 +260,14 @@ def sol_attn(
             query block are routed individually, the highest-scoring ones outside
             the routed blocks, and attended exactly. The eager reference ignores
             it.
+        q_offset: Index in the key sequence of q's first token, when k and v
+            are longer than q: query ``i`` is key ``q_offset + i``, so the
+            keys before it are a prefix (cover them with ``sink_blocks`` to
+            keep them exact). It only places the band of always-exact key
+            blocks around each query block. At most ``Tk - T``.
 
     Returns:
-        ``(B, T, H, 128)`` attention output.
+        ``(B, T, H, 128)`` attention output, one row per query.
     """
     return torch.ops.comfy_kitchen.sol_attn(
         q, k, v, tau, scale,
@@ -271,6 +279,7 @@ def sol_attn(
         block_len,
         coarse_gate,
         int(token_aug),
+        int(q_offset),
     )
 
 
@@ -1352,6 +1361,7 @@ def int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    weight_tiled: bool = False,
 ) -> torch.Tensor:
     """INT8 linear layer dynamically quantized.
 
@@ -1375,6 +1385,8 @@ def int8_linear(
             ``residual + residual_scale * linear(x)`` (a pre-norm block's
             addcmul), fused into the GEMM epilogue where supported.
         residual_scale: Per-channel [N] scale for the residual form.
+        weight_tiled: ``weight`` uses the resident tiled layout produced by
+            ``TensorWiseINT8Layout.optimize_for_gemm``.
 
     Returns:
         Result tensor.
@@ -1395,7 +1407,8 @@ def int8_linear(
         "residual": residual,
         "residual_scale": residual_scale,
     }
-    impl = registry.get_implementation("int8_linear", kwargs=kwargs)
+    operation = "int8_linear_tiled_weight" if weight_tiled else "int8_linear"
+    impl = registry.get_implementation(operation, kwargs=kwargs)
     return impl(**kwargs)
 
 

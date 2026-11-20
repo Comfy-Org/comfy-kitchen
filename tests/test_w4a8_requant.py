@@ -22,20 +22,23 @@ def weight(seed):
     return torch.randn(384, 1024, device="cuda", dtype=torch.bfloat16) * 0.02
 
 
-def test_fused_requant_matches_eager(weight, monkeypatch):
-    """The default 4-bit quantize runs the fused kernel and lands on the eager quantizer's
-    result up to fp32 rounding differences."""
+@pytest.mark.parametrize("bits, group_size", [(3, 16), (4, 16), (5, 16), (5, 32), (5, 64), (6, 16), (6, 32), (6, 64)])
+def test_fused_requant_matches_eager(weight, bits, group_size, monkeypatch):
+    """The default quantize (codebook g16 at 4/3 bits; uniform without scale search at 6/5,
+    every fused group size) runs the fused kernel and lands on the eager quantizer's result up
+    to fp32 rounding."""
     if not cuda_backend._WXA8_FUSED_QUANT:
         pytest.skip("fused requant not built")
-    q, s, c, _, cb = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=4)
+    kw = {"scale_search": False, "group_size": group_size} if bits in (5, 6) else {}
+    q, s, c, _, cb = eager_w4a8.quantize_w4a8_int8_weight(weight, bits=bits, **kw)
     monkeypatch.setattr(cuda_backend, "_quantize_w4a8_chunked", lambda *a, **k: pytest.fail("eager path used"))
-    qf, sf, cf, _, cbf = cuda_backend.quantize_w4a8_int8_weight(weight, bits=4, codebook_tensor=cb)
+    qf, sf, cf, _, cbf = cuda_backend.quantize_w4a8_int8_weight(weight, bits=bits, codebook_tensor=cb, **kw)
     assert torch.allclose(cf, c, rtol=1e-5, atol=0)
-    e = rel_l2(eager_w4a8.dequantize_w4a8_int8_weight(q, s, c, codebook=cb, output_dtype=torch.float32), weight)
-    ef = rel_l2(eager_w4a8.dequantize_w4a8_int8_weight(qf, sf, cf, codebook=cbf, output_dtype=torch.float32), weight)
+    e = rel_l2(eager_w4a8.dequantize_w4a8_int8_weight(q, s, c, codebook=cb, group_size=group_size, output_dtype=torch.float32), weight)
+    ef = rel_l2(eager_w4a8.dequantize_w4a8_int8_weight(qf, sf, cf, codebook=cbf, group_size=group_size, output_dtype=torch.float32), weight)
     assert abs(ef - e) < 1e-3 * e
-    grid = eager_w4a8._dequant_int4_grouped_to_int8(q, s, cb, 16)
-    grid_f = eager_w4a8._dequant_int4_grouped_to_int8(qf, sf, cbf, 16)
+    grid = eager_w4a8._dequant_int4_grouped_to_int8(q, s, cb, group_size)
+    grid_f = eager_w4a8._dequant_int4_grouped_to_int8(qf, sf, cbf, group_size)
     assert (grid_f != grid).float().mean().item() < 1e-3
 
 
@@ -49,7 +52,7 @@ def test_fused_requant_stochastic_rounding(weight):
 
 
 def fixed_codebook():
-    return torch.tensor(eager_w4a8._FIXED_LUT, device="cuda", dtype=torch.float32)
+    return eager_w4a8.default_w4a8_codebook(16).cuda()
 
 
 def assert_quantization_matches_reference(weight, got, codebook):
@@ -150,11 +153,11 @@ def test_staged_requant_is_deterministic_and_graph_capturable(dtype, k, stochast
     assert rel_l2(reconstructed, weight) < 0.12
 
 
-@pytest.mark.parametrize("bits,codebook", [(4, False), (4, True), (6, False)])
+@pytest.mark.parametrize("bits,codebook", [(3, True), (4, False), (4, True), (5, False), (6, False)])
 def test_decode_grid_all_codes_and_finite_fp8_scales(bits, codebook):
     # Inspect the dequant workspace, not the GEMM output: sums could hide wrong rounding.
     n, k = 128, 256
-    cb = fixed_codebook() if codebook else None
+    cb = (fixed_codebook() if bits == 4 else eager_w4a8.default_w4a8_codebook(8).cuda()) if codebook else None
     codes = (torch.arange(k, device="cuda", dtype=torch.int32) % (1 << bits)).expand(n, k)
     packed = eager_w4a8._pack_codes(codes, bits)
     scale_bits = torch.arange(n, device="cuda", dtype=torch.uint8).clamp(max=126)
