@@ -106,3 +106,11 @@ commit d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5.
 
 For full license texts of these dependencies, please refer to their respective
 project repositories or installation directories.
+
+Indexed RMSNorm + modulation + ConvRot reduction
+------------------------------------------------
+The reduction in ops/indexed_norm_convrot.cu is derived from PyTorch commit
+7661cd9c6b841b62b7f411aa52ec51f05457263b. Its complete copyright and BSD terms
+are distributed in comfy_kitchen/licenses/PYTORCH_LICENSE.txt.
+ConvRot register layout derives from SGLang commit
+3299804f81b686d3752287e19d9c9d2987d1afc1 (Apache-2.0).
