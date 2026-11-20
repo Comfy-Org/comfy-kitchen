@@ -57,6 +57,104 @@ def cmake_path(path: str | os.PathLike[str]) -> str:
     return os.fspath(path).replace("\\", "/")
 
 
+def reset_cuda_cmake_cache_on_toolchain_switch(
+    build_dir: pathlib.Path,
+    nvcc_bin: pathlib.Path,
+    python_executable: pathlib.Path,
+    python_include: pathlib.Path,
+) -> bool:
+    """Invalidate generated CUDA CMake state if compiler or Python artifacts changed.
+
+    CMake caches FindPython's internal _Python_EXECUTABLE/_Python_INCLUDE_DIR
+    separately from the public -DPython_EXECUTABLE override. A failed compiler
+    reconfigure can leave those internal artifacts pointing at system Python
+    even while setup.py passes its selected Conda interpreter. Reset before
+    configuration: an internal compiler-change retry loses COMFY_CUDA_ARCHS.
+    """
+    cache = build_dir / "CMakeCache.txt"
+    if not cache.exists():
+        if (build_dir / "CMakeFiles").is_dir():
+            shutil.rmtree(build_dir / "CMakeFiles")
+        return False
+
+    cached = {}
+    keys = {
+        "CMAKE_CUDA_COMPILER",
+        "Python_EXECUTABLE",
+        "_Python_EXECUTABLE",
+        "Python_INCLUDE_DIR",
+        "_Python_INCLUDE_DIR",
+        "CUDAToolkit_ROOT",
+        "CUDA_cudart_LIBRARY",
+        "CUDA_cudart_static_LIBRARY",
+    }
+    for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
+        if ":" not in line or "=" not in line:
+            continue
+        name = line.split(":", 1)[0]
+        if name in keys:
+            cached[name] = line.split("=", 1)[1].strip()
+
+    targets = {
+        "CMAKE_CUDA_COMPILER": nvcc_bin,
+        "Python_EXECUTABLE": python_executable,
+        "_Python_EXECUTABLE": python_executable,
+        "Python_INCLUDE_DIR": python_include,
+        "_Python_INCLUDE_DIR": python_include,
+    }
+
+    def canonical(path: str | pathlib.Path) -> str:
+        return os.path.normcase(os.path.realpath(os.fspath(path)))
+
+    # FindCUDAToolkit caches imported library locations independently of
+    # CMAKE_CUDA_COMPILER. A correct NVCC can still link Ubuntu's CUDA 11
+    # runtime through an old CUDA_cudart_LIBRARY entry. Do not retain that
+    # mixed-toolkit cache just because the compiler and Python match.
+    cuda_root = canonical(nvcc_bin.parent.parent)
+    changed = [
+        (name, previous, targets[name])
+        for name, previous in cached.items()
+        if name in targets and previous and not previous.endswith("-NOTFOUND")
+        and canonical(previous) != canonical(targets[name])
+    ]
+    if "CUDAToolkit_ROOT" in cached:
+        previous = cached["CUDAToolkit_ROOT"]
+        if previous and not previous.endswith("-NOTFOUND") and canonical(previous) != cuda_root:
+            changed.append(("CUDAToolkit_ROOT", previous, cuda_root))
+    for name in ("CUDA_cudart_LIBRARY", "CUDA_cudart_static_LIBRARY"):
+        previous = cached.get(name, "")
+        if previous and not previous.endswith("-NOTFOUND"):
+            lib = canonical(previous)
+            # On Windows, stale and selected CUDA installs may use different
+            # drive letters; commonpath raises ValueError across drives.
+            try:
+                belongs_to_toolkit = os.path.commonpath((lib, cuda_root)) == cuda_root
+            except ValueError:
+                belongs_to_toolkit = False
+            if not belongs_to_toolkit:
+                changed.append((name, previous, cuda_root))
+    if not changed:
+        return False
+    reasons = ", ".join(f"{name}: {previous} -> {wanted}" for name, previous, wanted in changed)
+    print(f"CUDA CMake toolchain changed ({reasons}); resetting generated backend build cache")
+    shutil.rmtree(build_dir)
+    build_dir.mkdir(parents=True, exist_ok=True)
+    return True
+
+
+def selected_python_include() -> pathlib.Path:
+    """Use development headers matching the Python interpreter running setup.py."""
+    import sysconfig
+
+    header_dir = pathlib.Path(sysconfig.get_path("include")).resolve()
+    if not (header_dir / "Python.h").is_file():
+        raise RuntimeError(
+            f"Python {sys.version_info.major}.{sys.version_info.minor} development headers "
+            f"not found for {sys.executable}: expected {header_dir / 'Python.h'}"
+        )
+    return header_dir
+
+
 class CMakeExtension(Extension):
     def __init__(self, name: str, source_dir: str = "", backend: str = "cuda",
                  hip_archs: str = ""):
@@ -143,6 +241,8 @@ class CMakeBuildExt(build_ext):
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={cmake_path(ext_dir)}",
             f"-DCMAKE_BUILD_TYPE={config}",
             f"-DPython_EXECUTABLE={cmake_path(sys.executable)}",
+            f"-DPython_INCLUDE_DIR={cmake_path(selected_python_include())}",
+            f"-DPython_ROOT_DIR={cmake_path(sys.prefix)}",
             f"-DCOMFY_ENABLE_LINEINFO={'ON' if enable_lineinfo else 'OFF'}",
         ]
 
@@ -230,6 +330,9 @@ class CMakeBuildExt(build_ext):
             cuda_home, nvcc_bin = cuda_paths
             cmake_args.append(f"-DCUDAToolkit_ROOT={cmake_path(cuda_home)}")
             cmake_args.append(f"-DCMAKE_CUDA_COMPILER={cmake_path(nvcc_bin)}")
+            reset_cuda_cmake_cache_on_toolchain_switch(
+                build_temp, nvcc_bin, pathlib.Path(sys.executable), selected_python_include()
+            )
 
             # FindCUDAToolkit only learned the Windows ARM64 library layout in
             # CMake 4.4. Help older CMake releases find cudart under lib/arm64;
