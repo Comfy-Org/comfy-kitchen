@@ -15,7 +15,11 @@ from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
 from comfy_kitchen.tensor.w4a8_packed import default_w4a8_codebook, unpack_w4a8_mma_weight
 from tests.conftest import requires_cuda_backend
 
-pytestmark = requires_cuda_backend
+pytestmark = [
+    requires_cuda_backend,
+    pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+                       reason="packed W4A8 MMA requires sm_80+"),
+]
 
 
 def _packed_weight(n, k, seed=0, bits=4):
@@ -26,6 +30,72 @@ def _packed_weight(n, k, seed=0, bits=4):
     packed = torch.cat((qdata.flatten(), s_rel.view(torch.int8).flatten()))
     cuda_backend.pack_w4a8_mma_weight_(packed, s_rel)
     return qdata, s_rel, s_channel, cb, packed
+
+
+@pytest.mark.parametrize("bits", [3, 4])
+@pytest.mark.parametrize("custom", [False, True])
+def test_raw_packed_codebook_matches_canonical_across_backends(bits, custom):
+    q, s, c, cb, packed = _packed_weight(64, 1024, bits=bits)
+    table = cb * 0.5 if custom else None
+    params = AsymW4A8Int8Layout.Params(scale=s.new_empty(0), s_channel=c, orig_shape=(64, 1024),
+                                       orig_dtype=torch.bfloat16, mma_packed=True, codebook=table)
+    weight = QuantizedTensor(packed, "AsymW4A8Int8Layout", params)
+    ref_weight = ck.dequantize_w4a8_int8_weight(q, s, c, table if custom else cb)
+    assert torch.equal(weight.dequantize(), ref_weight)
+    x = torch.randn(9, 1024, device="cuda", dtype=torch.bfloat16)
+    for backend in ("eager", "cuda"):
+        with ck.use_backend(backend):
+            for m in (1, 9):
+                ref = ck.w4a8_int8_linear(x[:m], q, s, c, table if custom else cb, out_dtype=torch.float32)
+                got = ck.w4a8_int8_linear(x[:m], packed, s.new_empty(0), c, table,
+                                          mma_packed=True, out_dtype=torch.float32)
+                torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_raw_packed_decode_graph_with_cuda_default_device(custom):
+    q, s, c, cb, packed = _packed_weight(64, 1024)
+    x = torch.randn(1, 1024, device="cuda", dtype=torch.bfloat16)
+    empty = s.new_empty(0)
+    with torch.device("cuda"):
+        def linear():
+            return ck.w4a8_int8_linear(x, packed, empty, c, cb if custom else None,
+                                       mma_packed=True, out_dtype=torch.float32)
+
+        linear()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            got = linear()
+        if custom:
+            cb.mul_(0.5)
+        graph.replay()
+        ref = ck.w4a8_int8_linear(x, q, s, c, cb, out_dtype=torch.float32)
+        torch.testing.assert_close(got, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_repack_preserves_custom_codebook_in_resident_storage():
+    q, s, c, cb, _ = _packed_weight(64, 1024)
+    storage = torch.cat((q.flatten().view(torch.uint8), (cb * 0.5).view(torch.uint8), s.flatten().view(torch.uint8)))
+    params = AsymW4A8Int8Layout.Params(
+        scale=storage[-s.nbytes:].view(s.dtype).view_as(s), s_channel=c,
+        codebook=storage[q.nbytes:q.nbytes + cb.nbytes].view(cb.dtype),
+        orig_dtype=torch.bfloat16, orig_shape=(64, 1024),
+    )
+    weight = QuantizedTensor(storage[:q.nbytes].view(q.dtype).view_as(q), "AsymW4A8Int8Layout", params)
+    before = storage.clone()
+    assert weight.optimize_for_gemv(storage) is weight
+    assert torch.equal(storage, before)
+
+
+def test_six_bit_unpack_workspace():
+    n, k = 1024, 2048
+    packed = torch.zeros(n * k * 13 // 16, device="cuda", dtype=torch.int8)
+    torch.cuda.reset_peak_memory_stats()
+    allocated = torch.cuda.memory_allocated()
+    unpack_w4a8_mma_weight(packed, n, k)
+    # Allow five int32 temporaries per weight. Expanding byte gathers to int64
+    # previously more than doubled the peak on this path.
+    assert torch.cuda.max_memory_allocated() - allocated <= 5 * 4 * n * k
 
 
 @pytest.mark.skipif(
@@ -236,6 +306,7 @@ class TestW4A8PackedMMA:
         custom = (cb * torch.linspace(0.85, 1.0, cb.numel(), device="cuda")).contiguous()
         xs = {m: torch.randn(m, k, device="cuda", dtype=torch.bfloat16) for m in (1, 8, 9)}
         first = []
+        weights = []
         for table in (cb, custom):
             params = AsymW4A8Int8Layout.Params(
                 scale=s_rel, s_channel=s_channel, codebook=table,
@@ -249,6 +320,7 @@ class TestW4A8PackedMMA:
             resident = QuantizedTensor(resident_q, "AsymW4A8Int8Layout", dataclasses.replace(params, scale=resident_s))
             weight = resident.optimize_for_gemv(storage)
             assert weight.params.mma_packed and tuple(weight.params.decode_lut.shape) == (256, table.numel())
+            weights.append(weight)
             reference = QuantizedTensor(qdata, "AsymW4A8Int8Layout", params)
             for m, x in xs.items():
                 got = torch.nn.functional.linear(x, weight)
@@ -258,6 +330,14 @@ class TestW4A8PackedMMA:
                     first.append(got)
             assert torch.equal(weight.dequantize(), reference.dequantize())
         assert not torch.equal(first[0], first[1])
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = torch.nn.functional.linear(xs[1], weights[0])
+        original_codebook = cb.clone()
+        weights[0].copy_(weights[1])
+        graph.replay()
+        assert torch.equal(output, first[1])
+        assert torch.equal(cb, original_codebook)
 
     @pytest.mark.parametrize(("bits", "levels"), [(4, 8), (3, 16), (5, 16), (6, 8)])
     def test_repack_leaves_a_codebook_of_the_wrong_width_alone(self, bits, levels, seed):
@@ -332,11 +412,6 @@ class TestW4A8PackedMMA:
             assert torch.all(storage[:64] == 73) and torch.all(storage[-128:] == 73)
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
-    reason="CUDA W4A8 linear needs sm_80+",
-)
-@requires_cuda_backend
 @pytest.mark.parametrize("act", ["rms_norm", "swiglu", "situ"])
 @pytest.mark.parametrize("bits", [3, 4, 5, 6])
 def test_prefill_fused_activation_matches_eager(act, bits, seed):

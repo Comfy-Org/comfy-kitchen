@@ -1519,7 +1519,8 @@ def quantize_w4a8_int8_weight(
     default configs (4/3-bit symmetric codebook g16, or 6/5-bit without the quantize-time
     scale search; fp8 scales). W4A8 the fused kernel declines takes the staged HIP
     requantize; everything else the chunked eager path."""
-    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
+    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits,
+                              codebook_tensor if symmetric and (bits == 3 or codebook) else None)
     layout_ok = (
         scale_dtype == torch.float8_e4m3fn
         and symmetric

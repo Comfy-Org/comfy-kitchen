@@ -20,7 +20,14 @@ from __future__ import annotations
 import torch
 
 from comfy_kitchen.backends._activations import apply_input_act, apply_residual
-from comfy_kitchen.tensor.w4a8_packed import _pack_codes, _unpack_codes, default_w4a8_codebook, unpack_w4a8_mma_weight
+from comfy_kitchen.tensor.w4a8_packed import _FIXED_LUT as _FIXED_LUT
+from comfy_kitchen.tensor.w4a8_packed import (
+    _pack_codes,
+    _unpack_codes,
+    default_w4a8_codebook,
+    resolve_mma_codebook,
+    unpack_w4a8_mma_weight,
+)
 
 from .quantization import int8_linear, rotate_int8_convrot_weight
 
@@ -91,7 +98,7 @@ def _codebook_for(normalized: torch.Tensor, levels: int = 16) -> torch.Tensor:
     x = x.float()
     excess_kurtosis = ((x - x.mean()) / (x.std() + 1e-9)).pow(4).mean() - 3.0
     if excess_kurtosis.item() <= _W4A8_GATE_KURTOSIS:
-        return default_w4a8_codebook(levels).to(normalized.device)
+        return default_w4a8_codebook(levels, device=normalized.device)
     return _fit_codebook(normalized, levels=levels)
 
 
@@ -209,12 +216,15 @@ def validate_w4a8_weight_shape(
     group_size: int,
     convrot_groupsize: int,
     bits: int = 4,
+    codebook_tensor: torch.Tensor | None = None,
 ) -> None:
     """Validate a floating weight (and the requested layout) before W4A8/W6A8 preparation."""
     if weight.dim() != 2:
         raise ValueError(f"W4A8 weight must be 2D, got shape {tuple(weight.shape)}")
     if bits not in _SUPPORTED_BITS:
         raise ValueError(f"bits must be 3, 4, 5 or 6, got {bits}")
+    if bits in _CODEBOOK_LEVELS and codebook_tensor is not None and codebook_tensor.shape != (1 << bits,):
+        raise ValueError(f"{bits}-bit codebook must have shape ({1 << bits},), got {tuple(codebook_tensor.shape)}")
     k = weight.shape[1]
     if bits != 4:
         _check_plane_layout(k, group_size, bits)
@@ -529,7 +539,8 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
 ]:
     """Rotate and prepare a floating weight for grouped W3A8 / W4A8 / W5A8 / W6A8 storage."""
-    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
+    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits,
+                              codebook_tensor if symmetric and (bits == 3 or codebook) else None)
     return _quantize_w4a8_chunked(
         weight,
         rotate_int8_convrot_weight,
@@ -745,6 +756,7 @@ def w4a8_packed_linear(
     """Portable fallback for resident packed weights."""
     x = apply_input_act(x, input_act, input_act_weight, input_act_eps)
     qdata, s_rel = unpack_w4a8_mma_weight(qdata, s_channel.numel(), x.shape[-1])
+    codebook = resolve_mma_codebook(qdata, x.shape[-1], codebook)
     return w4a8_int8_linear(
         x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
         convrot_groupsize, out_dtype, residual=residual, residual_scale=residual_scale,

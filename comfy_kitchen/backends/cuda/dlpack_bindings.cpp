@@ -2540,6 +2540,7 @@ extern "C" {
         const void* xq,
         const void* weight,
         const void* decode_lut,
+        const float* codebook,
         const void* s_channel,
         const void* xs,
         const void* bias,
@@ -3730,7 +3731,8 @@ bool w4a8_codebook_mma_linear(
     nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> workspace,
     nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> counters,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> out,
-    int64_t convrot_group_size, int64_t G, int out_dtype_code, uintptr_t stream_ptr) {
+    int64_t convrot_group_size, int64_t G, int out_dtype_code, uintptr_t stream_ptr,
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> codebook) {
     const int64_t M = xq.shape(0);
     const int64_t K = xq.shape(1);
     const int64_t in_width = comfy::input_act_width(static_cast<int>(act_code));
@@ -3761,10 +3763,17 @@ bool w4a8_codebook_mma_linear(
                     || partial_absmax->stride(1) != 1
                     || partial_absmax->stride(0) != K / convrot_group_size)))
         throw std::runtime_error("w4a8_codebook_mma_linear staged scratch mismatch");
-    if ((bits == 4 || bits == 3) && (!decode_lut.has_value()
-            || decode_lut->shape(0) != 256 || decode_lut->shape(1) != w4a8_codebook_entries(bits)
-            || decode_lut->stride(1) != 1 || decode_lut->stride(0) != w4a8_codebook_entries(bits)))
-        throw std::runtime_error("w4a8_codebook_mma_linear decode LUT must be contiguous [256, 16] (4-bit) or [256, 8] (3-bit)");
+    if (bits == 3 || bits == 4) {
+        const int levels = 1 << bits;
+        if (decode_lut) {
+            if (decode_lut->shape(0) != 256 || decode_lut->shape(1) != levels
+                    || decode_lut->stride(1) != 1 || decode_lut->stride(0) != levels)
+                throw std::runtime_error("w4a8_codebook_mma_linear invalid decode LUT");
+        } else if (!codebook || codebook->size() != levels || codebook->stride(0) != 1
+                   || codebook->device_id() != weight.device_id()) {
+            throw std::runtime_error("w4a8_codebook_mma_linear requires a matching codebook or decode LUT");
+        }
+    }
     if ((bias.has_value() && bias->size() != N)
             || workspace.shape(0) != M || workspace.shape(1) != N
             || counters.size() != N / 16 || counters.stride(0) != 1
@@ -3804,7 +3813,8 @@ bool w4a8_codebook_mma_linear(
             false, 0, stream);
     }
     return launch_w4a8_codebook_mma(
-        xq.data(), weight.data(), decode_lut.has_value() ? decode_lut->data() : nullptr, s_channel.data(), xs.data(),
+        xq.data(), weight.data(), decode_lut ? decode_lut->data() : nullptr,
+        codebook ? codebook->data() : nullptr, s_channel.data(), xs.data(),
         bias.has_value() ? bias->data() : nullptr,
         residual.has_value() ? residual->data() : nullptr,
         residual_scale.has_value() ? residual_scale->data() : nullptr,
@@ -5069,7 +5079,7 @@ NB_MODULE(_C, m) {
           nb::arg("residual").none(), nb::arg("residual_scale").none(),
           nb::arg("workspace"), nb::arg("counters"), nb::arg("out"), nb::arg("convrot_group_size"),
           nb::arg("g"),
-          nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
+          nb::arg("out_dtype_code"), nb::arg("stream_ptr"), nb::arg("codebook").none() = nb::none());
     m.def("w4a8_codebook_linear_chunked", &w4a8_codebook_linear_chunked,
           "Fused W4A8 inference orchestration: ConvRot activation quantization followed by chunked decode/GEMM",
           nb::arg("input"), nb::arg("xq"), nb::arg("xs"), nb::arg("weight"),

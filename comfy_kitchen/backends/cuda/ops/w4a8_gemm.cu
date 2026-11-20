@@ -375,6 +375,7 @@ void w4a8_codebook_mma_stream_kernel(
     const int8_t* __restrict__ x,
     const int8_t* __restrict__ weight,
     const int8_t* __restrict__ decode_lut,
+    const float* __restrict__ codebook,
     const float* __restrict__ s_channel,
     const float* __restrict__ x_scales,
     const float* __restrict__ bias,
@@ -418,14 +419,29 @@ void w4a8_codebook_mma_stream_kernel(
         if (issuer) cp_async16(st_s + s * R, record(s));
         cp_async_commit();
     }
-    for (int i = threadIdx.x; i < 256; i += kMmaWarps * 32) {
-        if constexpr (BITS == 4) {
-            lut[i] = reinterpret_cast<const uint4*>(decode_lut)[i];
-        } else if constexpr (BITS == 3) {
-            if (i < 128) lut[i] = reinterpret_cast<const uint4*>(decode_lut)[i];
+    if constexpr (BITS == 3 || BITS == 4) {
+        constexpr int levels = 1 << BITS;
+        if (decode_lut) {
+            if (threadIdx.x < 256 * levels / sizeof(uint4))
+                lut[threadIdx.x] = reinterpret_cast<const uint4*>(decode_lut)[threadIdx.x];
         } else {
-            scale_table[i] = load_scale<uint8_t>(static_cast<uint8_t>(i));
+            // Raw packed calls have no resident LUT. Read their codebook on this stream,
+            // including changes to its contents between graph replays.
+            constexpr int groups = levels / 4;
+            const int first = (threadIdx.x % groups) * 4;
+            const float a = codebook[first], b = codebook[first + 1];
+            const float c = codebook[first + 2], d = codebook[first + 3];
+            #pragma unroll
+            for (int i = 0; i < groups; ++i) {
+                const int word = threadIdx.x + 256 * i;
+                const int scale = word / groups;
+                const float s = (scale & 127) == 127 ? 0.0f : load_scale<uint8_t>(scale);
+                reinterpret_cast<char4*>(lut)[word] = make_char4(
+                    level_to_int8(a, s), level_to_int8(b, s), level_to_int8(c, s), level_to_int8(d, s));
+            }
         }
+    } else {
+        scale_table[threadIdx.x] = load_scale<uint8_t>(static_cast<uint8_t>(threadIdx.x));
     }
     for (int i = threadIdx.x; i < 8 * rows * 2; i += kMmaWarps * 32) {
         const int token = i / (rows * 2), v = i % (rows * 2);
@@ -593,6 +609,21 @@ __global__ void pack_w4a8_slabs_kernel(uint8_t* data, const uint8_t* scales,
                 const int row = lane / 4 + 8 * (j & 1);
                 const int col = kr * 32 + (lane % 4) * 4 + (j / 2) * 16 + (b & 1) * 2;
                 value = slab[row * row_bytes + col / 2];
+            } else if constexpr (BITS == 6) {
+                // Each three-byte word holds four contiguous codes from one row.
+                const int lane = b < 256 ? b / 8 : (b - 256) / 4;
+                const int lb = b < 256 ? b % 8 : 8 + (b - 256) % 4;
+                const int j = lb / 3, row = lane / 4 + 8 * (j & 1);
+                const int col = kr * 32 + (lane % 4) * 4 + (j / 2) * 16;
+                unsigned word = 0;
+                #pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int k = col + c;
+                    const unsigned lo = (slab[row * row_bytes + k / 2] >> (4 * (k & 1))) & 15;
+                    const unsigned hi = (slab[row * row_bytes + K / 2 + k / 4] >> (2 * (k & 3))) & 3;
+                    word |= (lo | (hi << 4)) << (6 * c);
+                }
+                value = word >> (8 * (lb % 3));
             } else {
                 // byte lb of the lane's LaneCodes<BITS> string: every code q whose bits q*BITS..
                 // overlap it, read from the canonical planes
@@ -600,11 +631,13 @@ __global__ void pack_w4a8_slabs_kernel(uint8_t* data, const uint8_t* scales,
                 constexpr int a_bytes = Lane::kABytes, b_bytes = Lane::kBBytes, a_total = Lane::kBOffset;
                 const int lane = b < a_total ? b / a_bytes : (b - a_total) / b_bytes;
                 const int lb = b < a_total ? b % a_bytes : a_bytes + (b - a_total) % b_bytes;
-                unsigned v = 0;
+                const int first_code = lb * 8 / BITS;
+                constexpr int count = BITS == 5 ? 3 : 4;
+                unsigned word = 0;
                 #pragma unroll
-                for (int q = 0; q < 16; ++q) {
-                    const int shift = q * BITS - 8 * lb;
-                    if (shift <= -BITS || shift >= 8) continue;
+                for (int i = 0; i < count; ++i) {
+                    const int q = first_code + i;
+                    if (q >= 16) break;
                     const int j = q >> 2, c = q & 3;
                     const int row = lane / 4 + 8 * (j & 1);
                     const int k = kr * 32 + (lane % 4) * 4 + (j / 2) * 16 + c;
@@ -612,13 +645,11 @@ __global__ void pack_w4a8_slabs_kernel(uint8_t* data, const uint8_t* scales,
                     unsigned code;
                     if constexpr (BITS == 3)
                         code = ((srow[k / 4] >> (2 * (k & 3))) & 3u) | (((srow[K / 4 + k / 8] >> (k & 7)) & 1u) << 2);
-                    else if constexpr (BITS == 5)
-                        code = ((srow[k / 2] >> (4 * (k & 1))) & 15u) | (((srow[K / 2 + k / 8] >> (k & 7)) & 1u) << 4);
                     else
-                        code = ((srow[k / 2] >> (4 * (k & 1))) & 15u) | (((srow[K / 2 + k / 4] >> (2 * (k & 3))) & 3u) << 4);
-                    v |= shift >= 0 ? (code << shift) : (code >> -shift);
+                        code = ((srow[k / 2] >> (4 * (k & 1))) & 15u) | (((srow[K / 2 + k / 8] >> (k & 7)) & 1u) << 4);
+                    word |= code << (i * BITS);
                 }
-                value = static_cast<uint8_t>(v);
+                value = static_cast<uint8_t>(word >> (lb * 8 % BITS));
             }
             data[(int64_t)tile * k_rows * record_bytes + i] = value;
         }
@@ -776,14 +807,14 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
 // launches. residual [M, N] and residual_scale [N] are in the output dtype (both or
 // neither).
 extern "C" bool launch_w4a8_codebook_mma(
-    const void* xq, const void* weight, const void* decode_lut,
+    const void* xq, const void* weight, const void* decode_lut, const float* codebook,
     const void* s_channel, const void* xs, const void* bias, const void* residual,
     const void* residual_scale, void* workspace, void* counters, void* out,
     int64_t M, int64_t N, int64_t K, int64_t G, int64_t bits,
     int out_dtype_code, cudaStream_t stream)
 {
     if (M == 0 || N == 0 || K == 0) return true;
-    if (M > 8 || ((bits == 4 || bits == 3) && decode_lut == nullptr) || N > std::numeric_limits<int>::max()
+    if (M > 8 || ((bits == 4 || bits == 3) && !decode_lut && !codebook) || N > std::numeric_limits<int>::max()
             || (bits != 3 && bits != 4 && bits != 5 && bits != 6)
             || K > std::numeric_limits<int>::max() || N % 16 != 0
             || G != 16 || K % 256 != 0) {
@@ -810,6 +841,7 @@ extern "C" bool launch_w4a8_codebook_mma(
                 static_cast<const int8_t*>(xq),
                 static_cast<const int8_t*>(weight),
                 static_cast<const int8_t*>(decode_lut),
+                codebook,
                 static_cast<const float*>(s_channel),
                 static_cast<const float*>(xs),
                 static_cast<const float*>(bias),

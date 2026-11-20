@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import torch
 
+from comfy_kitchen._rope_utils import _tensors_overlap
 from comfy_kitchen.registry import registry
 
 from .base import (
@@ -28,10 +29,7 @@ from .base import (
     dequantize_args,
     register_layout_op,
 )
-from .w4a8_packed import (
-    _mma_bits,
-    unpack_w4a8_mma_weight,
-)
+from .w4a8_packed import _mma_bits, resolve_mma_codebook, unpack_w4a8_mma_weight
 
 
 def quantize_w4a8_int8_weight(
@@ -174,8 +172,8 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         # Packed qdata interleaves codes and group scales; scale is then empty, and
         # decode_lut holds the CUDA stream's [256, levels] int8 table of codebook.
         mma_packed: bool = False
-        decode_lut: torch.Tensor | None = None
         transposed: bool = False
+        decode_lut: torch.Tensor | None = None
 
         def _tensor_fields(self) -> list[str]:
             fields = ["scale", "s_channel"]
@@ -285,9 +283,9 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             or torch.cuda.get_device_capability(qdata.device) < (8, 0)
         ):
             return weight
-        from comfy_kitchen.backends.eager.w4a8_int8 import _CODEBOOK_LEVELS
-
         n, k = params.orig_shape
+        if n == 0 or k == 0 or params.convrot_groupsize != 256:
+            return weight
         # The codebook has to match the stored width before anything is rewritten in place:
         # 3/4-bit codes index an 8/16-entry table (the stream's decode table is built from it
         # below), 5/6-bit codes are uniform and carry none.
@@ -295,13 +293,17 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         levels = None if params.codebook is None else params.codebook.numel()
         codebook_ok = (
             bits in (3, 4, 5, 6) and qdata.shape[1] * 8 == k * bits
-            and levels == _CODEBOOK_LEVELS.get(bits)
+            and levels == (1 << bits if bits in (3, 4) else None)
         )
         if (
             n % 16 != 0 or k % 256 != 0
             or params.group_size != 16
             or params.correction is not None
             or params.scale.dtype != torch.float8_e4m3fn
+            or not params.scale.is_contiguous()
+            or not params.s_channel.is_contiguous()
+            or not qdata.is_contiguous()
+            or qdata.data_ptr() % 16 != 0
             or not codebook_ok
         ):
             return weight
@@ -316,24 +318,35 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         from comfy_kitchen.backends.cuda import _w4a8_decode_lut, pack_w4a8_mma_weight_
 
         dest = storage[start:start + qdata.nbytes + params.scale.nbytes].view(qdata.dtype)
+        if _tensors_overlap(dest, params.s_channel) or (
+            params.codebook is not None and _tensors_overlap(dest, params.codebook)
+        ):
+            return weight
+        codebook, decode_lut = params.codebook, None
+        if codebook is not None:
+            decode_lut = _w4a8_decode_lut(qdata.device, codebook)
+            # copy_ updates this buffer in place, including between graph replays.
+            # The canonical codebook may be shared by several independent weights.
+            codebook = codebook.to(device=qdata.device, dtype=torch.float32, copy=True,
+                                   memory_format=torch.contiguous_format)
         pack_w4a8_mma_weight_(dest, params.scale)
-        decode_lut = None if params.codebook is None else _w4a8_decode_lut(qdata.device, params.codebook)
         params = dataclasses.replace(
-            params, scale=params.scale.new_empty(0), mma_packed=True, decode_lut=decode_lut
+            params, scale=params.scale.new_empty(0), mma_packed=True, codebook=codebook, decode_lut=decode_lut
         )
         return QuantizedTensor(dest, weight._layout_cls, params)
 
     @classmethod
     def dequantize(cls, qdata: torch.Tensor, params: Params) -> torch.Tensor:
-        s_rel = params.scale
+        s_rel, codebook = params.scale, params.codebook
         if params.mma_packed:
             n, k = params.orig_shape[::-1] if params.transposed else params.orig_shape
             qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k)
+            codebook = resolve_mma_codebook(qdata, k, codebook)
         return dequantize_w4a8_int8_weight(
             qdata,
             s_rel,
             params.s_channel,
-            codebook=params.codebook,
+            codebook=codebook,
             correction=params.correction,
             group_size=params.group_size,
             convrot_groupsize=params.convrot_groupsize,
