@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "qkv_interleaved_qk_rms_norm",
 ]
 
 # Try to import triton and register if available
@@ -55,6 +56,7 @@ try:
 
     from .adaln import adaln, rms_adaln
     from .na import na3d
+    from .qkv_interleaved_qk_rms_norm import qkv_interleaved_qk_rms_norm
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
@@ -125,6 +127,32 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _qkv_interleaved_qk_rms_norm_call_rule(kwargs):
+        # No size threshold: every call that passes the checks below runs triton.
+        names = ("q", "k", "v", "q_weight", "k_weight")
+        tensors = [kwargs.get(n) for n in names]
+        heads = kwargs.get("heads")
+        if any(t is None for t in tensors) or heads is None:
+            return ValidationResult.ok()
+        q, k = tensors[0], tensors[1]
+        if any(t.device != q.device for t in tensors):
+            return ValidationResult.fail("q", "all tensors must be on one device")
+        batch_size, seq, channels = q.shape
+        seq_kv = k.shape[1]
+        if batch_size == 0 or seq == 0 or seq_kv == 0:
+            return ValidationResult.fail("q", "empty inputs are not supported by triton")
+        # the sum of squares follows torch's rms kernel order for head_dim 128
+        if channels != heads * 128:
+            return ValidationResult.fail("q", "head_dim must be 128")
+        # with one head the stock v (and the q / k norm inputs) are strided views, not copies
+        if heads not in (2, 4, 8, 16, 32):
+            return ValidationResult.fail("q", "heads must be a power of 2 from 2 to 32")
+        if any(not t.is_contiguous() for t in tensors):
+            return ValidationResult.fail("q", "q, k, v and the weights must be contiguous")
+        if batch_size * max(seq, seq_kv) >= 2**31:
+            return ValidationResult.fail("q", "q, k and v must have fewer than 2**31 tokens")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -336,6 +364,19 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
+    out["qkv_interleaved_qk_rms_norm"] = FunctionConstraints(
+        params={
+            name: ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(3),))
+            for name in ("q", "k", "v")
+        }
+        | {
+            name: ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(1),))
+            for name in ("q_weight", "k_weight")
+        },
+        default_devices=cuda_devices,
+        call_rules=(_qkv_interleaved_qk_rms_norm_call_rule,),
     )
     return out
 
