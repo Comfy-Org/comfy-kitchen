@@ -28,6 +28,19 @@ inline bool cached_device_query() {
     return selected == 2;
 }
 
+inline bool select_gfx1100(int device) {
+    // This schedule was tuned on gfx1100; WMMA support alone does not imply
+    // the same performance on other architectures. Accept feature suffixes.
+    hipDeviceProp_t properties{};
+    if (hipGetDeviceProperties(&properties, device) != hipSuccess) return false;
+    const char* arch = properties.gcnArchName;
+    return std::strncmp(arch, "gfx1100", 7) == 0 && (arch[7] == '\0' || arch[7] == ':');
+}
+
+inline bool use_gfx1100_schedule() {
+    return cached_device_query<select_gfx1100>();
+}
+
 inline bool select_nonduplicated_wmma(int device) {
     hipDeviceProp_t properties{};
     return hipGetDeviceProperties(&properties, device) == hipSuccess &&
