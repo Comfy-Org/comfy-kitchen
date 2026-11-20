@@ -1,5 +1,6 @@
 __all__ = [
     "adaln",
+    "input_act",
     "rms_gated_residual",
     "fp16_conv3d",
     "fp16_conv3d_out",
@@ -77,6 +78,7 @@ from comfy_kitchen.constraints import (
 from comfy_kitchen.registry import registry
 
 from .adaln import adaln, rms_adaln
+from .input_act import input_act
 from .awq import gemv_awq_w4a16
 from .conv3d import fp16_conv3d, fp16_conv3d_out
 from .convrot_w4a4 import (
@@ -144,9 +146,20 @@ from .w4a8_int8 import (
 def _build_constraints() -> dict:
     all_devices = frozenset({"cpu", "cuda", "mps", "xpu", "hpu", "meta", "*"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
+    activation_floats = standard_floats | {torch.float64}
     scale_values = frozenset({torch.float32, torch.float16, torch.bfloat16, float, str})
 
     out = {
+        "input_act": FunctionConstraints(
+            params={
+                # The differentiable path (gradcheck, float64 callers) goes
+                # through apply_input_act, so the dispatched op must accept the
+                # same dtypes instead of raising NoCapableBackendError.
+                "x": ParamConstraint(dtypes=activation_floats),
+                "act_weight": ParamConstraint(dtypes=activation_floats | {type(None)}),
+            },
+            default_devices=all_devices,
+        ),
         "adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
