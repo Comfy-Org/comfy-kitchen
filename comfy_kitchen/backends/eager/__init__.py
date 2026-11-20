@@ -37,6 +37,7 @@ __all__ = [
     "dequantize_convrot_w4a4_weight",
     "dequantize_w4a8_int8_weight",
     "gemv_awq_w4a16",
+    "linear_w8a16",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
     "quantize_mxfp8",
@@ -139,6 +140,7 @@ from .w4a8_int8 import (
     w4a8_int8_linear,
     w4a8_packed_linear,
 )
+from .w8a16 import linear_w8a16
 
 
 def _build_constraints() -> dict:
@@ -474,6 +476,20 @@ def _build_constraints() -> dict:
                 ),
                 "wscales": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
                 "wzeros": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            },
+            default_devices=all_devices,
+        ),
+        "linear_w8a16": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "bias": ParamConstraint(
+                    dtypes=standard_floats | frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+                    shape_rules=(ExactDims(1),),
+                ),
             },
             default_devices=all_devices,
         ),
