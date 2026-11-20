@@ -170,14 +170,18 @@ def int4_linear(
     bias: torch.Tensor | None,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    x_int = _unpack_int4_row_major(x_qdata).to(dtype=out_dtype)
-    w_int = _unpack_int4_row_major(weight).to(dtype=out_dtype)
+    # int4 dot products reach 7 * 7 * K (e.g. ~3.0e5 at K=6144), which overflows
+    # fp16 (65504). Accumulate in fp32 — mirroring the int32 accumulation of the
+    # fused CUDA kernels — and cast to out_dtype on return.
+    compute = torch.float32
+    x_int = _unpack_int4_row_major(x_qdata).to(dtype=compute)
+    w_int = _unpack_int4_row_major(weight).to(dtype=compute)
     out = x_int @ w_int.t()
-    out = out * x_scale.reshape(-1, 1).to(device=out.device, dtype=out_dtype)
-    out = out * weight_scale.reshape(1, -1).to(device=out.device, dtype=out_dtype)
+    out = out * x_scale.reshape(-1, 1).to(device=out.device, dtype=compute)
+    out = out * weight_scale.reshape(1, -1).to(device=out.device, dtype=compute)
     if bias is not None:
-        out = out + bias.to(device=out.device, dtype=out_dtype).reshape(1, -1)
-    return out
+        out = out + bias.to(device=out.device, dtype=compute).reshape(1, -1)
+    return out.to(out_dtype)
 
 
 def convrot_w4a4_linear(
