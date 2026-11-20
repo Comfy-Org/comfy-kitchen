@@ -199,7 +199,7 @@ def test_setup_keeps_cuda_build_cuda_only_by_default():
     cuda_extension = object()
 
     namespace["setup_cuda_extension"] = lambda: cuda_extension
-    namespace["setup_hip_extension"] = lambda: pytest.fail(
+    namespace["setup_hip_extensions"] = lambda: pytest.fail(
         "an incidental ROCm compiler must not add HIP to a CUDA source build"
     )
 
@@ -213,7 +213,7 @@ def test_setup_builds_both_backends_only_when_hip_is_requested():
 
     namespace["BUILD_HIP"] = True
     namespace["setup_cuda_extension"] = lambda: cuda_extension
-    namespace["setup_hip_extension"] = lambda: hip_extension
+    namespace["setup_hip_extensions"] = lambda: [hip_extension]
 
     assert namespace["get_extensions"]() == [cuda_extension, hip_extension]
 
@@ -228,7 +228,7 @@ def test_setup_refuses_hip_only_fallback_under_cuda_pytorch():
     namespace["setup_cuda_extension"] = raise_missing_cuda
     namespace["get_rocm_path"] = lambda: ("/opt/rocm", object())
     namespace["get_torch_gpu_runtime"] = lambda: "cuda"
-    namespace["setup_hip_extension"] = lambda: pytest.fail(
+    namespace["setup_hip_extensions"] = lambda: pytest.fail(
         "CUDA PyTorch must not silently receive a HIP-only native build"
     )
 
@@ -240,7 +240,7 @@ def test_no_cuda_means_python_only_unless_hip_is_explicit():
     namespace = _setup_namespace()
     namespace["BUILD_NO_CUDA"] = True
     namespace["setup_cuda_extension"] = lambda: pytest.fail("CUDA was not disabled")
-    namespace["setup_hip_extension"] = lambda: pytest.fail("HIP was not requested")
+    namespace["setup_hip_extensions"] = lambda: pytest.fail("HIP was not requested")
 
     assert namespace["get_extensions"]() == []
 
@@ -256,7 +256,7 @@ def test_rocm_only_build_still_auto_selects_hip():
     namespace["setup_cuda_extension"] = raise_missing_cuda
     namespace["get_rocm_path"] = lambda: ("/opt/rocm", object())
     namespace["get_torch_gpu_runtime"] = lambda: "hip"
-    namespace["setup_hip_extension"] = lambda: hip_extension
+    namespace["setup_hip_extensions"] = lambda: [hip_extension]
 
     assert namespace["get_extensions"]() == [hip_extension]
 
