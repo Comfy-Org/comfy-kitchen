@@ -187,3 +187,42 @@ class TestStridedViews:
         got = cuda_backend._cutlass_fp16_conv3d(x, weight, bias, None, [1, 1, 1])
         assert got is not None
         assert rel_err(got.float(), _ref(x, weight, bias, None, (1, 1, 1))) < fp16_accum_tol(512 * 27)
+
+
+class TestSm75CapabilityGate:
+    """The conv3d kernel is cutlass::arch::Sm80 (cp.async multistage); on sm_75 the
+    registry and the direct entry must both decline so callers fall back to torch."""
+
+    def _conv_kwargs(self):
+        x, weight, bias, residual = _inputs(8, 8, 4, 16, 16, (3, 3, 3))
+        return {"x": x, "weight": weight, "bias": bias, "residual": residual, "stride": (1, 1, 1)}
+
+    def test_registry_routes_to_eager_on_sm75(self, monkeypatch, seed, cuda_available):
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        monkeypatch.setitem(ck.registry.__dict__, "_compute_capability", (7, 5))
+        assert ck.registry.get_capable_backend("fp16_conv3d", self._conv_kwargs()) == "eager"
+
+    def test_registry_routes_to_cuda_on_sm80_plus(self, seed, cuda_available):
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        if torch.cuda.get_device_capability() < (8, 0):
+            pytest.skip("requires an sm_80+ device")
+        assert ck.registry.get_capable_backend("fp16_conv3d", self._conv_kwargs()) == "cuda"
+
+    def test_top_level_falls_back_to_torch_conv_on_sm75(self, monkeypatch, seed, cuda_available):
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        monkeypatch.setitem(ck.registry.__dict__, "_compute_capability", (7, 5))
+        x, weight, bias, _ = _inputs(8, 8, 4, 16, 16, (3, 3, 3))
+        got = ck.fp16_conv3d(x, weight, bias, stride=(1, 1, 1))
+        expected = functional.conv3d(x, weight, bias, stride=(1, 1, 1)).contiguous(memory_format=CL3D)
+        assert torch.equal(got, expected)
+
+    def test_cutlass_entry_declines_sm75(self, monkeypatch, seed, cuda_available):
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        from comfy_kitchen.backends import cuda as cuda_backend
+        monkeypatch.setitem(cuda_backend._device_capability_cache, 0, (7, 5))
+        x, weight, bias, residual = _inputs(8, 8, 4, 16, 16, (3, 3, 3))
+        assert cuda_backend._cutlass_fp16_conv3d(x, weight, bias, residual, [1, 1, 1]) is None
