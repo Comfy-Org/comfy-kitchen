@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "qk_layernorm_rope_partial",
 ]
 
 # Try to import triton and register if available
@@ -55,6 +56,7 @@ try:
 
     from .adaln import adaln, rms_adaln
     from .na import na3d
+    from .qk_layernorm_rope_partial import qk_layernorm_rope_partial
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
@@ -125,6 +127,30 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _qk_layernorm_rope_partial_call_rule(kwargs):
+        # No size threshold (the shapes measured are in the PR that added this op).
+        names = ("q", "k", "q_weight", "q_bias", "k_weight", "k_bias", "cos", "sin")
+        tensors = [kwargs.get(n) for n in names]
+        heads, text_len = kwargs.get("heads"), kwargs.get("text_len")
+        if any(t is None for t in tensors) or heads is None or text_len is None:
+            return ValidationResult.ok()
+        q, k = tensors[0], tensors[1]
+        if any(t.device != q.device for t in tensors):
+            return ValidationResult.fail("q", "all tensors must be on one device")
+        batch_size, seq, channels = q.shape
+        if batch_size == 0 or seq == 0:
+            return ValidationResult.fail("q", "empty inputs are not supported by triton")
+        head_dim = channels // heads
+        if head_dim not in (16, 32, 64, 128):
+            return ValidationResult.fail("q", "head_dim must be 16, 32, 64 or 128")
+        if not q.is_contiguous() or not k.is_contiguous():
+            return ValidationResult.fail("q", "q and k must be contiguous")
+        if any(not t.is_contiguous() for t in tensors[2:]):
+            return ValidationResult.fail("cos", "weights, biases and tables must be contiguous")
+        if batch_size * seq * heads >= 2**31:
+            return ValidationResult.fail("q", "q must have fewer than 2**31 rows")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -336,6 +362,23 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    # cuda covers ROCm builds of PyTorch (device type "cuda"); measured on both
+    out["qk_layernorm_rope_partial"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=frozenset({torch.bfloat16}), shape_rules=(ExactDims(3),)),
+            "k": ParamConstraint(dtypes=frozenset({torch.bfloat16}), shape_rules=(ExactDims(3),)),
+            **{
+                name: ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}), shape_rules=(ExactDims(1),)
+                )
+                for name in ("q_weight", "q_bias", "k_weight", "k_bias")
+            },
+            "cos": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),)),
+            "sin": ParamConstraint(dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(2),)),
+        },
+        default_devices=cuda_devices,
+        call_rules=(_qk_layernorm_rope_partial_call_rule,),
     )
     return out
 
