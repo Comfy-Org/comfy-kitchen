@@ -65,9 +65,13 @@ def apply_input_act(
         return torch.nn.functional.silu(gate).mul_(up)
     if input_act == "situ":
         # 4*tanh(gate/4)*sigmoid(gate) * 25*tanh(hidden/25), evaluated in the
-        # same order and dtype as MOSS-Image's module; in place to avoid a
-        # fresh M x K temporary per op.
+        # same order and dtype as MOSS-Image's module. Keep the in-place path
+        # for inference; tanh's backward needs the pre-multiply output, so a
+        # gradient-tracked call uses the out-of-place form.
         hidden, gate = x.chunk(2, dim=-1)
+        if x.requires_grad and torch.is_grad_enabled():
+            gated = gate.div(4.0).tanh().mul(4.0).mul(torch.sigmoid(gate))
+            return hidden.div(25.0).tanh().mul(25.0).mul(gated)
         gated = gate.div(4.0).tanh_().mul_(4.0).mul_(torch.sigmoid(gate))
         return hidden.div(25.0).tanh_().mul_(25.0).mul_(gated)
     if input_act == "rms_norm":
