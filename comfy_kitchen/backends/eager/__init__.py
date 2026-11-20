@@ -1,5 +1,7 @@
 __all__ = [
     "adaln",
+    "gated_residual_segmented",
+    "gated_residual_segmented_",
     "rms_gated_residual",
     "fp16_conv3d",
     "fp16_conv3d_out",
@@ -85,6 +87,7 @@ from .convrot_w4a4 import (
     prepare_int4_weight_for_int8_linear,
     quantize_convrot_w4a4_weight,
 )
+from .gated_residual_segmented import gated_residual_segmented, gated_residual_segmented_
 from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out, group_norm_stats3d
 from .na import na3d, window_attention
 from .quantization import (
@@ -704,6 +707,15 @@ def _build_constraints() -> dict:
         default_devices=all_devices,
         call_rules=(window_attention_common_call_rule,),
     )
+    out["gated_residual_segmented"] = FunctionConstraints(
+        params={
+            "residual": ParamConstraint(dtypes=standard_floats),
+            "x": ParamConstraint(dtypes=standard_floats),
+            "gate": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["gated_residual_segmented_"] = out["gated_residual_segmented"]
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
             out[name + "_out"] = with_out_param(out[name])
