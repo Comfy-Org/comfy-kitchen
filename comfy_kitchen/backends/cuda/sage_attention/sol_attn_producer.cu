@@ -48,7 +48,7 @@ __global__ void sol_producer_kernel(
     int8_t* __restrict__ vTi, int8_t* __restrict__ vRow, __nv_bfloat16* __restrict__ vcT,
     float* __restrict__ ksumP,               // [H, NPAD, HD] block K sums (post-rope)
     int8_t* __restrict__ cen8, float* __restrict__ cens,
-    float* __restrict__ qmean,               // [H, NPAD, HD] f32 block means (post-rope)
+    float* __restrict__ qmean,               // [H, NQ, HD] f32 block means (post-rope)
     float* __restrict__ vamax_next,          // [H, HD] atomicMax accumulator
     const int32_t* __restrict__ blen,        // [NTB] valid tokens per block, or null
     float rope_eps, int rot, bool split_half,
@@ -76,7 +76,7 @@ __global__ void sol_producer_kernel(
     __syncthreads();
     const size_t qrow = (size_t)h * NQ + nblk;
     const float c = centroid_quant(sT, len, sred, cen8 + qrow * HD, cens + qrow);
-    qmean[((size_t)h * NPAD + nblk) * HD + tid] = c;
+    qmean[qrow * HD + tid] = c;
     __syncthreads();
 
     // ---------------- K phase ----------------

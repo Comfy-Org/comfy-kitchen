@@ -2972,8 +2972,8 @@ def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
     kk = _topk_count(n - _sink_count(n, s0, s1), topk_ratio)
     if kk == 0:   # nothing beyond the forced blocks: a threshold no finite score clears
         return torch.full(c8.shape[:-1], float("inf"), device=c8.device, dtype=c8.dtype)
-    # Head slices, scaled in place: the whole [BH, N, N] scores spilled a 10 GB card at 109k tokens
-    step = max(1, _SOL_TOPK_SLICE_BYTES // (n * n * c8.element_size()))
+    # Head slices, scaled in place: the whole [BH, NQ, N] scores spilled a 10 GB card at 109k tokens
+    step = max(1, _SOL_TOPK_SLICE_BYTES // (c8.shape[1] * n * c8.element_size()))
     row_scale = (csc * log2s).unsqueeze(-1)
     col_scale = ksc.squeeze(-1).unsqueeze(-2)
     kth = torch.empty(c8.shape[:-1], device=c8.device, dtype=c8.dtype)
@@ -3106,10 +3106,11 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    q_offset: int = 0,
 ) -> torch.Tensor:
-    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
-    See sage_attention/sol_attn.cu and the public docstring for ``tail``,
-    ``block_len`` and ``coarse_gate``.
+    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors;
+    k and v may be longer than q. See sage_attention/sol_attn.cu and the
+    public docstring for ``tail``, ``block_len``, ``coarse_gate`` and ``q_offset``.
 
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block
@@ -3126,14 +3127,15 @@ def sol_attn(
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
     _check_sol_args(q.device, sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
-                    block_len=block_len, coarse_gate=coarse_gate)
+                    block_len=block_len, coarse_gate=coarse_gate, q_offset=q_offset)
+    tk = k.shape[1]
     if scale is None:
         scale = d ** -0.5
+    lengths = valid = None   # zero-padded tiles only; None keeps the default arithmetic exact
     if block_len is not None:
         block_len = block_len.contiguous()
-    lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
-    valid = _valid_rows(t, lengths) if block_len is not None else None
-    mean_lengths = lengths if block_len is not None else None   # exact default arithmetic
+        lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
+        valid = _valid_rows(t, lengths)
     # Only the last dim must be contiguous (16 B staging loads), so a BHND
     # view goes in as-is. A misaligned load faults asynchronously and poisons
     # the context, so base pointer and leading strides are checked here.
@@ -3155,13 +3157,13 @@ def sol_attn(
     kb = None
     if key_bias is not None:
         # exact branch only, in log2 units; biased blocks must be sink-covered
-        kb = _normalize_key_bias(key_bias, batch, t, q.device)
-        kb = (kb * _LOG2E).expand(batch, t).contiguous()
+        kb = _normalize_key_bias(key_bias, batch, tk, q.device)
+        kb = (kb * _LOG2E).expand(batch, tk).contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
+    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug), key_len=tk)
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
     # after the large buffers so its temporaries don't fragment the cache they reuse
-    thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
+    thr = (_topk_threshold(q, k, topk_ratio, scale, lengths, valid, sb)
            if topk_ratio else None)
     _C.sol_attn(
         _wrap_for_dlpack(q),
@@ -3176,9 +3178,11 @@ def sol_attn(
         key_bias=None if kb is None else _wrap_for_dlpack(kb),
         threshold=None if thr is None else _wrap_for_dlpack(thr),
         block_len=None if block_len is None else _wrap_for_dlpack(block_len),
-        tail=bool(tail), token_aug=int(token_aug),
+        tail=bool(tail), token_aug=int(token_aug), q_offset=int(q_offset),
     )
     if coarse_gate is not None:
+        if lengths is None:
+            lengths = _block_lengths(t, (t + 63) // 64, q.device)
         add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
                     coarse_gate)
     return out
@@ -3318,8 +3322,8 @@ def _ws_block_means(ws, p, bh, lengths):
     """(qm, km, vm) ``[BH, NTB, 128]`` fp32 block means over live rows, read
     from what the kernels already left in the workspace: the qmean slot, K
     means in scratch, V sums in vcT (bf16)."""
-    ntb, npad, d = p["NTB"], p["NPAD"], _SOL_HD
-    qm = ws[p["qmean"]:p["qmean"] + bh * npad * d * 4].view(torch.float32).view(bh, npad, d)[:, :ntb]
+    ntb, npad, nq, d = p["NTB"], p["NPAD"], p["NQ"], _SOL_HD
+    qm = ws[p["qmean"]:p["qmean"] + bh * nq * d * 4].view(torch.float32).view(bh, nq, d)
     vm = ws[p["vcT"]:p["vcT"] + bh * d * npad * 2].view(torch.bfloat16).view(bh, d, npad)[:, :, :ntb]
     return qm, _ws_ksums(ws, p, bh), vm.transpose(1, 2).float() / lengths.view(1, -1, 1)
 

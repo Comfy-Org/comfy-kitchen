@@ -3107,15 +3107,16 @@ def _check_sol_args(sink_blocks, sink_q, topk_ratio, **tensors):
     test. has_wmma() is the intersection over every visible device, so it is
     already the conservative answer for whichever one the tensors are on.
     """
-    from comfy_kitchen.constraints import sol_attn_common_call_rule
+    from comfy_kitchen.constraints import sol_attn_common_call_rule, sol_attn_same_length_call_rule
 
     if not has_wmma():
         raise RuntimeError(
             "sol_attn: requires RDNA3 or newer matrix cores (WMMA); this device has none")
-    check = sol_attn_common_call_rule(
-        {"sink_blocks": sink_blocks, "sink_q": sink_q, "topk_ratio": topk_ratio, **tensors})
-    if not check.success:
-        raise ValueError(f"sol_attn: {check.failed_param}: {check.failure_reason}")
+    kwargs = {"sink_blocks": sink_blocks, "sink_q": sink_q, "topk_ratio": topk_ratio, **tensors}
+    for rule in (sol_attn_common_call_rule, sol_attn_same_length_call_rule):
+        check = rule(kwargs)
+        if not check.success:
+            raise ValueError(f"sol_attn: {check.failed_param}: {check.failure_reason}")
 
 
 def sol_attn(
@@ -3132,6 +3133,7 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    q_offset: int = 0,   # CUDA only so far: these kernels take one length
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
     See sage_attention/sol_attn.hip and the public docstring for ``tail``,
@@ -3150,7 +3152,7 @@ def sol_attn(
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
     _check_sol_args(sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
-                    block_len=block_len, coarse_gate=coarse_gate)
+                    block_len=block_len, coarse_gate=coarse_gate, q_offset=q_offset)
     if scale is None:
         scale = d ** -0.5
     if block_len is not None:
@@ -3359,6 +3361,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ValidationResult,
         na3d_common_call_rule,
         sol_attn_common_call_rule,
+        sol_attn_same_length_call_rule,
         window_attention_common_call_rule,
         with_out_param,
     )
@@ -3426,7 +3429,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 ),
             },
             default_devices=dev,
-            call_rules=(sol_attn_common_call_rule,),
+            call_rules=(sol_attn_common_call_rule, sol_attn_same_length_call_rule),
         ),
         # fp32 has no 16-bit matrix path, so it goes to triton/eager.
         "na3d": FunctionConstraints(
