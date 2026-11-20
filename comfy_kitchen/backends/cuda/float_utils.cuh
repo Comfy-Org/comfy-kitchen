@@ -177,21 +177,70 @@ namespace quantization {
 template <typename T, int N> union Group {
   float4 vectors[(N * sizeof(T) + 15) / 16];
   uint64_t words[(N * sizeof(T) + 7) / 8];
+  uint32_t words32[(N * sizeof(T) + 3) / 4];
   T values[N];
 };
+
+// With reciprocal = UINT64_MAX / columns, the quotient is at most one low.
+__device__ __forceinline__ uint64_t row_index(uint64_t element, uint64_t columns,
+                                            uint64_t reciprocal, uint64_t *remainder = nullptr) {
+  const uint64_t row = __umul64hi(element, reciprocal);
+  const uint64_t col = element - row * columns;
+  const bool correction = col >= columns;
+  if (remainder)
+    *remainder = col - (correction ? columns : 0);
+  return row + correction;
+}
 
 template <typename T, int N, bool Masked>
 __device__ __forceinline__ Group<T, N>
 load_group(const T *input, uint64_t group, uint64_t columns,
-           uint64_t original_rows, uint64_t original_columns) {
+           uint64_t original_rows, uint64_t original_columns,
+           uint64_t row, uint64_t col) {
   Group<T, N> result;
   if constexpr (Masked) {
+    constexpr int alignment = N * sizeof(T) < 16 ? N * sizeof(T) : 16;
+    if (original_columns == columns && group * N < original_rows * columns &&
+        (reinterpret_cast<uintptr_t>(input) & (alignment - 1)) == 0)
+      return load_group<T, N, false>(input, group, columns, original_rows,
+                                     original_columns, row, col);
+    if constexpr (N == 16 && sizeof(T) == 2) {
+      const uintptr_t begin = reinterpret_cast<uintptr_t>(input);
+      const uintptr_t address =
+          begin + (row * original_columns + col) * sizeof(T);
+      const uintptr_t aligned = address & ~uintptr_t(15);
+      // Reassemble an unaligned group from three aligned loads. Boundary
+      // groups fall through so every load stays inside the input allocation.
+      if (row < original_rows && col + N <= original_columns &&
+          aligned >= begin &&
+          aligned + 48 <= begin + original_rows * original_columns * sizeof(T)) {
+        union {
+          float4 vectors[3];
+          uint32_t words[12];
+        } source;
+#pragma unroll
+        for (int i = 0; i < 3; ++i)
+          source.vectors[i] = reinterpret_cast<const float4 *>(aligned)[i];
+        const int offset = (address & 15) / 4;
+        uint32_t shifted[10];
+#pragma unroll
+        for (int i = 0; i < 10; ++i)
+          shifted[i] = offset & 2 ? source.words[i + 2] : source.words[i];
+        uint32_t window[9];
+#pragma unroll
+        for (int i = 0; i < 9; ++i)
+          window[i] = offset & 1 ? shifted[i + 1] : shifted[i];
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          result.words32[i] =
+              __funnelshift_r(window[i], window[i + 1], (address & 3) * 8);
+        return result;
+      }
+    }
 #pragma unroll
     for (int i = 0; i < N; ++i) {
-      const uint64_t element = group * N + i;
-      const uint64_t row = element / columns, col = element % columns;
-      result.values[i] = row < original_rows && col < original_columns
-                             ? input[row * original_columns + col]
+      result.values[i] = row < original_rows && col + i < original_columns
+                             ? input[row * original_columns + col + i]
                              : T(0.0f);
     }
   } else if constexpr (N * sizeof(T) == 8) {
