@@ -20,6 +20,8 @@
 #include <stdexcept>
 
 namespace comfy {
+constexpr unsigned int kMXFP8ValsPerThread = 8;
+constexpr unsigned int kMXFP8BlockSize = 32; // Always 32 for MXFP8
 namespace {
 template <typename Input, int V, bool Masked>
 __global__ void
