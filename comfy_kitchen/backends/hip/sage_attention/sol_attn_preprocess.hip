@@ -130,9 +130,9 @@ __global__ __launch_bounds__(HD) void prep_q(const E* __restrict__ q,
                                              int8_t* __restrict__ qi, float* __restrict__ qs,
                                              float* __restrict__ thr, int8_t* __restrict__ cen8,
                                              float* __restrict__ cens,
-                                             float* __restrict__ qmean,  // [B*H, NPAD, HD] f32
+                                             float* __restrict__ qmean,  // [B*H, NQ, HD] f32
                                              const int32_t* __restrict__ blen, int T, int H,
-                                             int NQ, int NPAD, float tau, float log2s, int64_t sb,
+                                             int NQ, float tau, float log2s, int64_t sb,
                                              int64_t st, int64_t sh) {
     __shared__ __attribute__((aligned(16))) E sQ[BLK * kLdTile];
     __shared__ __attribute__((aligned(16))) float sred[HD];
@@ -147,7 +147,7 @@ __global__ __launch_bounds__(HD) void prep_q(const E* __restrict__ q,
     __syncthreads();
     const size_t qrow = static_cast<size_t>(bh) * NQ + qb;
     const float c = centroid_quant(sQ, len, sred, cen8 + qrow * HD, cens + qrow);
-    qmean[(static_cast<size_t>(bh) * NPAD + qb) * HD + threadIdx.x] = c;
+    qmean[qrow * HD + threadIdx.x] = c;
     __syncthreads();  // sred held the centroid bytes
     const float var = block_sum128(c * c * kcvar[static_cast<size_t>(bh) * HD + threadIdx.x], sred);
     if (threadIdx.x == 0) thr[qrow] = thr_of(var, tau, log2s);
@@ -235,9 +235,11 @@ static void preprocess_launch(const void* q, const void* k, const void* v, void*
                            void* ki, void* ksb, void* kci, void* kcs, void* vcT, void* threshold,
                            void* cen8, void* cens, void* vsc, void* qmean,
                            void* scratch,          // sol_preprocess_scratch_bytes
-                           const void* key_bias,   // [B, T] f32 in log2 units, or nullptr
-                           const void* blen,       // [NTB] int32 valid tokens per block, or nullptr
-                           int B, int T, int Tp, int H, int NTB, int NPAD, int NQ, int64_t qs_b,
+                           const void* key_bias,   // [B, Tk] f32 in log2 units, or nullptr
+                           const void* blen,       // [NTB] int32 per block, or nullptr; T == Tk then
+                           // T queries, Tk keys
+                           int B, int T, int Tk, int Tp, int H, int NTB, int NPAD, int NQ,
+                           int64_t qs_b,
                            int64_t qs_t, int64_t qs_h, int64_t ks_b, int64_t ks_t, int64_t ks_h,
                            int64_t vs_b, int64_t vs_t, int64_t vs_h, float tau, float scale_log2,
                            hipStream_t stream) {
@@ -248,7 +250,7 @@ static void preprocess_launch(const void* q, const void* k, const void* v, void*
               "clearing the V absmax accumulator");
     prep_reduce_kv<E><<<dim3(NPAD, B * H), HD, 0, stream>>>(
         static_cast<const E*>(k), static_cast<const E*>(v), s.kc,
-        static_cast<__bf16*>(vcT), static_cast<float*>(vsc), static_cast<const int32_t*>(blen), T,
+        static_cast<__bf16*>(vcT), static_cast<float*>(vsc), static_cast<const int32_t*>(blen), Tk,
         H, NTB, NPAD, ks_b, ks_t, ks_h, vs_b, vs_t, vs_h);
     prep_pooled_stats<<<B * H, HD, 0, stream>>>(s.kc, s.kmean, static_cast<const float*>(vsc),
                                                 static_cast<float*>(vsc), s.kcvar, NTB, NPAD);
@@ -257,25 +259,26 @@ static void preprocess_launch(const void* q, const void* k, const void* v, void*
     prep_q<E><<<dim3(NQ, B * H), HD, 0, stream>>>(
         static_cast<const E*>(q), s.kcvar, static_cast<int8_t*>(qi), static_cast<float*>(qs),
         static_cast<float*>(threshold), static_cast<int8_t*>(cen8), static_cast<float*>(cens),
-        static_cast<float*>(qmean), static_cast<const int32_t*>(blen), T, H, NQ, NPAD, tau,
+        static_cast<float*>(qmean), static_cast<const int32_t*>(blen), T, H, NQ, tau,
         scale_log2, qs_b, qs_t, qs_h);
     prep_k<E><<<dim3(NTB, B * H), HD, 0, stream>>>(
         static_cast<const E*>(k), s.kmean, static_cast<int8_t*>(ki),
         static_cast<float2*>(ksb), static_cast<const float*>(key_bias),
-        static_cast<const int32_t*>(blen), T, Tp, H, ks_b, ks_t, ks_h);
+        static_cast<const int32_t*>(blen), Tk, Tp, H, ks_b, ks_t, ks_h);
 }
 
 void launch_sol_preprocess(const void* q, const void* k, const void* v, void* qi, void* qs,
                            void* ki, void* ksb, void* kci, void* kcs, void* vcT, void* threshold,
                            void* cen8, void* cens, void* vsc, void* qmean, void* scratch,
-                           const void* key_bias, const void* blen, int B, int T, int Tp, int H,
-                           int NTB, int NPAD, int NQ, int64_t qs_b, int64_t qs_t, int64_t qs_h,
+                           const void* key_bias, const void* blen, int B, int T, int Tk, int Tp,
+                           int H, int NTB, int NPAD, int NQ, int64_t qs_b, int64_t qs_t,
+                           int64_t qs_h,
                            int64_t ks_b, int64_t ks_t, int64_t ks_h, int64_t vs_b, int64_t vs_t,
                            int64_t vs_h, float tau, float scale_log2, int elem,
                            hipStream_t stream) {
     auto fn = elem == kSolFp16 ? preprocess_launch<_Float16> : preprocess_launch<__bf16>;
     fn(q, k, v, qi, qs, ki, ksb, kci, kcs, vcT, threshold, cen8, cens, vsc, qmean, scratch,
-       key_bias, blen, B, T, Tp, H, NTB, NPAD, NQ, qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b,
+       key_bias, blen, B, T, Tk, Tp, H, NTB, NPAD, NQ, qs_b, qs_t, qs_h, ks_b, ks_t, ks_h, vs_b,
        vs_t, vs_h, tau, scale_log2, stream);
 }
 

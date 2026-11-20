@@ -80,7 +80,7 @@ class CMakeBuildExt(build_ext):
     # Native cubins cover every named GPU. Keep compute_89 as the generic PTX
     # fallback and the two Blackwell family PTX images for future family members.
     # Older generic PTX and compute_90a are redundant when their cubins are present.
-    DEFAULT_CUDA_ARCHS_WINDOWS = "75-real;80-real;89;120f"
+    DEFAULT_CUDA_ARCHS_WINDOWS = "75-real;80-real;89;100f;120f"
     DEFAULT_CUDA_ARCHS_LINUX = "75-real;80-real;89;90a-real;100f;120f"
 
     def initialize_options(self):

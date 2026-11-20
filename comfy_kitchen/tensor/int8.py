@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import torch
 
+import comfy_kitchen as ck
+from comfy_kitchen.exceptions import NoCapableBackendError
 from comfy_kitchen.registry import registry
 
 from .base import (
@@ -34,13 +36,33 @@ _INT8_DEQUANT_DTYPE_TO_CODE = {
 
 
 def _dtype_code(dtype: torch.dtype) -> int:
-    if dtype == torch.float32:
-        return 0
-    if dtype == torch.float16:
-        return 1
-    if dtype == torch.bfloat16:
-        return 2
-    raise ValueError(f"Unsupported INT8 output dtype: {dtype}")
+    try:
+        return _INT8_DEQUANT_DTYPE_TO_CODE[dtype]
+    except KeyError:
+        raise ValueError(f"Unsupported INT8 output dtype: {dtype}") from None
+
+
+def _row_major(qdata: torch.Tensor, params) -> torch.Tensor:
+    """Row-major (N, K) codes; a copy when the resident weight is in the tiled B order."""
+    if not params.tiled:
+        return qdata
+    n, k = qdata.shape
+    return qdata.view(n // 256, k // 64, 256, 64).transpose(1, 2).reshape(n, k)
+
+
+def _has_native_fusion(func_name: str, kwargs: dict) -> bool:
+    """Whether ``func_name`` would dispatch to a native kernel for ``kwargs``.
+
+    The eager fused ops only re-compose the unfused ops, so without a native
+    kernel the caller's unfused path is at least as fast. An explicit backend
+    override (e.g. ``use_backend("eager")`` in tests) is honored.
+    """
+    if getattr(registry._thread_local, "backend_override", None) is not None:
+        return True
+    try:
+        return registry.get_capable_backend(func_name, kwargs) != "eager"
+    except NoCapableBackendError:
+        return False
 
 
 class TensorWiseINT8Layout(QuantizedLayout):
@@ -75,12 +97,12 @@ class TensorWiseINT8Layout(QuantizedLayout):
         convrot: bool = False
         convrot_groupsize: int = 256
         transposed: bool = False
+        # qdata bytes are in the HIP big-tile GEMM's B order ([N/256][K/64][256][64])
+        # instead of row-major; the tensor keeps its logical (N, K) shape.
+        tiled: bool = False
 
         def _tensor_fields(self) -> list[str]:
             return ["scale"]
-
-        def _validate_tensor_fields(self):
-            pass
 
     @classmethod
     def quantize(
@@ -168,6 +190,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
             Dequantized tensor.
         """
         output_dtype_code = _INT8_DEQUANT_DTYPE_TO_CODE.get(params.orig_dtype, 0)
+        qdata = _row_major(qdata, params)
         if getattr(params, "convrot", False):
             result = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype(
                 qdata, params.scale, params.convrot_groupsize, output_dtype_code
@@ -186,7 +209,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
         output_dtype_code = _INT8_DEQUANT_DTYPE_TO_CODE.get(params.orig_dtype, 0)
         group_size = params.convrot_groupsize if getattr(params, "convrot", False) else 0
         result = torch.ops.comfy_kitchen.dequantize_int8_embedding(
-            qdata, params.scale, indices, group_size, output_dtype_code
+            qdata, params.scale, indices, group_size, output_dtype_code, params.tiled
         )
         return result.to(params.orig_dtype)
 
@@ -198,9 +221,115 @@ class TensorWiseINT8Layout(QuantizedLayout):
             qtensor: Quantized tensor.
 
         Returns:
-            Tuple of (quantized_data, scale).
+            Tuple of (row-major quantized_data, scale).
         """
-        return qtensor._qdata, qtensor._params.scale
+        return _row_major(qtensor._qdata, qtensor._params), qtensor._params.scale
+
+    @classmethod
+    def optimize_for_gemm(cls, weight: QuantizedTensor, storage: torch.Tensor) -> QuantizedTensor:
+        """Reorder a resident per-channel weight into the HIP big-tile GEMM's B layout.
+
+        The relayout is in place: every 256-row group occupies the same bytes before
+        and after, so the caller's buffer and neighbours are untouched. The tiled
+        weight uses small-M or large-M kernels at execution time; other callers
+        can obtain a row-major copy from get_plain_tensors."""
+        qdata, params = weight._qdata, weight._params
+        if (
+            params.tiled
+            or params.transposed
+            or not params.is_weight
+            or params.orig_dtype != torch.bfloat16
+            or qdata.ndim != 2
+            or qdata.numel() == 0
+            or not qdata.is_cuda
+            or torch.version.hip is None
+            or not registry.is_available("hip")
+        ):
+            return weight
+        n, k = qdata.shape
+        if (
+            n % 256 != 0 or k % 128 != 0
+            or (params.convrot and params.convrot_groupsize != 256)
+            or not qdata.is_contiguous()
+        ):
+            return weight
+        from comfy_kitchen.backends.hip import _has_nonduplicated_wmma
+
+        if not _has_nonduplicated_wmma(qdata.device):
+            return weight
+        if storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous() or storage.device != qdata.device:
+            raise ValueError("resident storage must be a contiguous byte buffer on the weight's device")
+        start = qdata.data_ptr() - storage.data_ptr()
+        if start < 0 or start + qdata.nbytes > storage.nbytes:
+            return weight
+        rows = qdata.view(n // 256, 256, k // 64, 64)
+        groups = max(1, (16 << 20) // (256 * k))
+        for g in range(0, n // 256, groups):
+            src = rows[g:g + groups].clone()
+            rows[g:g + groups].view(-1, k // 64, 256, 64).copy_(src.transpose(1, 2))
+        return QuantizedTensor(qdata, weight._layout_cls, dataclasses.replace(params, tiled=True))
+
+    @classmethod
+    def _fusion_operand(cls, weight: QuantizedTensor):
+        """Resolve row-major storage needed by compound INT8 operations."""
+        if not isinstance(weight, QuantizedTensor) or weight._layout_cls != cls.__name__:
+            return None
+        params = weight._params
+        if params.transposed or params.tiled:
+            return None
+        return (
+            cls.get_plain_tensors(weight)[0].contiguous(),
+            params.scale,
+            bool(getattr(params, "convrot", False)),
+            int(getattr(params, "convrot_groupsize", 256)),
+        )
+
+    @classmethod
+    def fused_rms_modulated(
+        cls,
+        x: torch.Tensor,
+        weight: QuantizedTensor,
+        bias: torch.Tensor | None,
+        norm_weight: torch.Tensor,
+        norm_eps: float,
+        modulation_scale: torch.Tensor,
+    ):
+        # The fused kernels apply one modulation row to every token; a batched
+        # (e.g. CFG, B > 1) modulation falls back to the unfused composition.
+        width = x.shape[-1]
+        if modulation_scale.numel() != width or norm_weight.numel() != width:
+            return NotImplemented
+        operand = cls._fusion_operand(weight)
+        if operand is None:
+            return NotImplemented
+        qdata, scale, convrot, group_size = operand
+        if not _has_native_fusion("int8_linear_rms_modulated", {
+            "x": x, "norm_weight": norm_weight,
+            "modulation_scale": modulation_scale, "weight": qdata,
+            "out_dtype": x.dtype,
+        }):
+            return NotImplemented
+        from comfy_kitchen import int8_linear_rms_modulated
+
+        return int8_linear_rms_modulated(
+            x, norm_weight, norm_eps, modulation_scale, qdata, scale,
+            bias, x.dtype, convrot=convrot,
+            convrot_groupsize=group_size,
+        )
+
+    @classmethod
+    def linear_input_act(cls, weight: QuantizedTensor, x: torch.Tensor, bias=None,
+                         input_act=None, input_act_weight=None, input_act_eps=0.0,
+                         residual=None, residual_scale=None):
+        params = weight._params
+        if params.transposed:
+            return NotImplemented
+        return ck.int8_linear(
+            x, weight._qdata, params.scale, bias, x.dtype,
+            convrot=params.convrot, convrot_groupsize=params.convrot_groupsize,
+            input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
+            residual=residual, residual_scale=residual_scale, weight_tiled=params.tiled,
+        )
 
     @classmethod
     def state_dict_tensors(cls, qdata: torch.Tensor, params: Params) -> dict[str, torch.Tensor]:
@@ -213,6 +342,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
         Returns:
             Dictionary mapping suffix to tensor.
         """
+        if params.tiled:
+            raise ValueError("GEMM-optimized weights are resident-only; save the canonical layout")
         return {
             "": qdata,
             "_scale": params.scale,
@@ -278,20 +409,18 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    params = weight._params
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
-
-    convrot = getattr(weight._params, "convrot", False)
-    convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
 
     return torch.ops.comfy_kitchen.int8_linear(
         input_tensor.contiguous(),
-        weight_qdata.contiguous(),
-        weight_scale,
+        weight._qdata.contiguous(),
+        params.scale,
         bias,
         _dtype_code(out_dtype),
-        convrot,
-        convrot_groupsize,
+        params.convrot,
+        params.convrot_groupsize,
+        weight_tiled=params.tiled,
     )
 
 
@@ -308,20 +437,21 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    params = weight._params
+    weight_scale = params.scale
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
     convrot = getattr(weight._params, "convrot", False)
     convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
 
-    if getattr(weight._params, "transposed", False):
+    if params.transposed:
         # Common decomposition: linear(x, W) -> mm(x, W.t()). Storage is still
         # W [N, K], and logical RHS is W.T [K, N].
-        int8_weight = weight_qdata.contiguous()
+        int8_weight = weight._qdata.contiguous()
     elif weight_scale.numel() == 1 and not convrot:
         # A directly quantized RHS [K, N] with a scalar scale can be represented
         # as the [N, K] weight expected by int8_linear.
-        int8_weight = weight_qdata.t().contiguous()
+        int8_weight = TensorWiseINT8Layout.get_plain_tensors(weight)[0].t().contiguous()
     else:
         # Per-row scales belong to the rows of the logical RHS, not output
         # columns, so transposing qdata alone would apply the wrong scales.
@@ -335,6 +465,7 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
         _dtype_code(out_dtype),
         convrot,
         convrot_groupsize,
+        weight_tiled=params.tiled and params.transposed,
     )
 
 
@@ -351,16 +482,17 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    params = weight._params
+    weight_scale = params.scale
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
     convrot = getattr(weight._params, "convrot", False)
     convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
 
-    if getattr(weight._params, "transposed", False):
-        int8_weight = weight_qdata.contiguous()
+    if params.transposed:
+        int8_weight = weight._qdata.contiguous()
     elif weight_scale.numel() == 1 and not convrot:
-        int8_weight = weight_qdata.t().contiguous()
+        int8_weight = TensorWiseINT8Layout.get_plain_tensors(weight)[0].t().contiguous()
     else:
         return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
 
@@ -372,4 +504,5 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
         _dtype_code(out_dtype),
         convrot,
         convrot_groupsize,
+        weight_tiled=params.tiled and params.transposed,
     )

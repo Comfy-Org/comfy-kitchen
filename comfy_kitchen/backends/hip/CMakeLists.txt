@@ -155,12 +155,14 @@ set(HIP_SOURCES
     ops/per_tensor_fp8.hip
     ops/stochastic_round_fp8.hip
     ops/quantize_int8.hip
+    ops/rms_gated_residual.hip
     ops/gemm_fp8.hip
     ops/gemm_int8.hip
     ops/gemm_fp16.hip
     ops/conv3d_fp16.hip
     ops/convrot_w4a4.hip
     ops/adaln.hip
+    ops/rms_convrot_quant.hip
     ops/group_norm_pad3d.hip
     ops/na3d.hip
     sage_attention/quant_qk_int8.hip
@@ -182,10 +184,34 @@ set(HIP_SOURCES
     ops/w4a8_gemv.hip
     ops/w4a8_requant.hip
     ops/gated_delta.hip
+    ops/memmove.hip
+    ops/delaunay3d.hip
+    ops/mesh_bvh.hip
+    ops/connected_components.hip
+    ops/edge_collapse.hip
+    ops/min_cut.hip
 )
+
+# The geometry predicates rely on IEEE semantics: the double-double sums need exact
+# rounding that reassociation cancels away, and an infinite cutoff must stay infinite.
+# Source options follow the target's, so this overrides -ffast-math for these files.
+set_source_files_properties(
+    ops/delaunay3d.hip
+    ops/mesh_bvh.hip
+    ops/connected_components.hip
+    ops/edge_collapse.hip
+    ops/min_cut.hip
+    PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
+)
+
+# All INT8 GEMM schedules round (acc * row_scale) * column_scale before
+# adding bias. Fast math can fuse the add or reassociate the scales.
+set_source_files_properties(ops/gemm_int8.hip PROPERTIES
+    COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
 
 set(CPP_SOURCES
     dlpack_bindings.cpp
+    int8_decode_bindings.cpp
 )
 
 # Keep HIP compilation independent of the Python extension target. The kernels

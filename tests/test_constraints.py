@@ -59,6 +59,46 @@ class TestShapeRules:
         assert "2" in ExactDims(ndim=2).describe()
 
 
+@pytest.mark.parametrize(
+    ("mma_packed", "qdata_shape", "scale_shape", "expected"),
+    [
+        (False, (16, 128), (16, 16), True),
+        (True, (2304,), (0,), True),
+        (False, (2304,), (0,), False),
+        (True, (16, 128), (16, 16), False),
+    ],
+)
+def test_w4a8_storage_constraints(mma_packed, qdata_shape, scale_shape, expected):
+    result = ck.registry.validate_backend_for_call(
+        "eager", "w4a8_packed_linear" if mma_packed else "w4a8_int8_linear",
+        {
+            "qdata": torch.empty(qdata_shape, dtype=torch.int8),
+            "s_rel": torch.empty(scale_shape, dtype=torch.float8_e4m3fn),
+        },
+    )
+    assert result.success is expected
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_w4a8_packed_storage_is_linear_only(packed):
+    # Only the linear accepts MMA-packed storage; dequantization takes canonical 2D
+    # tensors (the layout unpacks first), with no packed flag to opt in.
+    n, k = 16, 256
+    qdata = torch.empty((n * k * 9 // 16,) if packed else (n, k // 2), dtype=torch.int8)
+    s_rel = torch.empty((0,) if packed else (n, k // 16), dtype=torch.float8_e4m3fn)
+    s_channel = torch.ones(n)
+    linear = ck.registry.validate_backend_for_call(
+        "eager", "w4a8_packed_linear" if packed else "w4a8_int8_linear",
+        {"x": torch.randn(1, k), "qdata": qdata, "s_rel": s_rel, "s_channel": s_channel},
+    )
+    dequant = ck.registry.validate_backend_for_call(
+        "eager", "dequantize_w4a8_int8_weight",
+        {"qdata": qdata, "s_rel": s_rel, "s_channel": s_channel},
+    )
+    assert linear.success is True
+    assert dequant.success is not packed
+
+
 class TestParamConstraint:
     """Tests for parameter constraint validation."""
 

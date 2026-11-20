@@ -46,10 +46,11 @@ __forceinline__ __device__ void load8(const T* p, float* out) {
     }
 }
 
-template <typename T, int Threads>
+template <typename T, int Threads, bool Paged = false>
 __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
     const T* __restrict__ v, int8_t* __restrict__ out, float* __restrict__ scale_out, int N,
-    int padded_N, int H, int D, int64_t stride_b, int64_t stride_h, int64_t stride_n) {
+    int padded_N, int H, int D, int64_t stride_b, int64_t stride_h, int64_t stride_n,
+    int pages = 0, const int64_t* position = nullptr, bool initialize = false) {
 
     constexpr int kWaves = Threads / 32;
 
@@ -60,6 +61,17 @@ __global__ __launch_bounds__(Threads) void quant_v_int8_kernel(
     const int b = bh / H;
     const int d0 = d_tile * kDTile;
 
+    if constexpr (Paged) {
+        const int length = static_cast<int>(position[0]);
+        const int page = initialize ? blockIdx.y : max(0, (length - 1) / padded_N - 1) + blockIdx.y;
+        if (page >= pages || page * padded_N >= length) return;
+        N = min(padded_N, length - page * padded_N);
+        const int source_row = initialize ? page * padded_N : page * padded_N % (stride_h / stride_n);
+        v += static_cast<int64_t>(source_row) * stride_n;
+        const int64_t offset = (static_cast<int64_t>(b) * (pages - 1) + page) * H * D;
+        out += offset * padded_N;
+        scale_out += offset;
+    }
     const T* base = v + static_cast<int64_t>(b) * stride_b + static_cast<int64_t>(h) * stride_h +
                     d0;
 
@@ -210,4 +222,13 @@ extern "C" void launch_sage_quant_v_int8(const void* v, void* out, void* scale, 
         throw std::runtime_error(std::string("sage int8 V quantize kernel launch failed: ") +
                                  hipGetErrorString(error));
     }
+}
+
+extern "C" void launch_int8_decode_quant_v(
+    const void* v, int8_t* out, float* scales, const int64_t* position,
+    int B, int H, int capacity, int pages, int page_size, bool initialize, hipStream_t stream) {
+    quant_v_int8_kernel<__bf16, 128, true><<<dim3(B * H * 32, initialize ? pages : 2), 128, 0, stream>>>(
+        static_cast<const __bf16*>(v), out, scales, page_size, page_size, H, 256,
+        static_cast<int64_t>(H) * capacity * 256, static_cast<int64_t>(capacity) * 256, 256,
+        pages, position, initialize);
 }

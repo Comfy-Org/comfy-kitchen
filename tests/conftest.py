@@ -62,6 +62,32 @@ requires_cuda_backend = pytest.mark.skipif(
 )
 
 
+def skip_unless_gfx12_wmma() -> None:
+    if not getattr(torch.version, "hip", None):
+        pytest.skip("requires HIP")
+    if not ck.list_backends().get("hip", {}).get("available", False):
+        pytest.skip("compiled HIP backend required")
+    from comfy_kitchen.backends import hip
+
+    if not hip._has_nonduplicated_wmma():
+        pytest.skip("requires non-duplicated WMMA (gfx12 or gfx117)")
+
+
+def gpu_backend_available() -> bool:
+    """Whether the compiled CUDA or HIP backend is loadable, for ops both implement."""
+    backends = ck.list_backends()
+    return any(backends.get(name, {}).get("available", False) for name in ("cuda", "hip"))
+
+
+requires_hip_backend = pytest.mark.skipif(
+    not ck.list_backends().get("hip", {}).get("available", False), reason="compiled HIP backend required"
+)
+
+requires_gpu_backend = pytest.mark.skipif(
+    not gpu_backend_available(), reason="compiled CUDA or HIP backend required"
+)
+
+
 @pytest.fixture(scope="session")
 def cuda_available():
     return torch.cuda.is_available()
@@ -104,7 +130,7 @@ def get_capable_backends(func_name: str, device: str | None = None) -> list[str]
     capable = []
     backends = ck.list_backends()
 
-    for backend_name in ["cuda", "hip", "triton", "eager"]:
+    for backend_name in ["ascend", "cuda", "hip", "triton", "eager"]:
         if not backends.get(backend_name, {}).get("available", False):
             continue
 
@@ -126,7 +152,7 @@ def get_supported_devices(func_name: str) -> set[str]:
     devices = set()
     backends = ck.list_backends()
 
-    for backend_name in ["cuda", "hip", "triton", "eager"]:
+    for backend_name in ["ascend", "cuda", "hip", "triton", "eager"]:
         if not backends.get(backend_name, {}).get("available", False):
             continue
 

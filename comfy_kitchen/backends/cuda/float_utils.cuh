@@ -18,6 +18,7 @@
 #define COMFY_FLOAT_UTILS_CUH_
 
 #include <cstdint>
+#include <type_traits>
 
 #include <cuda.h>
 #include <cuda_fp8.h>
@@ -170,6 +171,64 @@ scale_factor_swizzled_offset(size_t row_idx, size_t col_idx, uint32_t col_length
 }
 
 #endif // CUDA_VERSION >= 12080
+
+namespace quantization {
+// Vector and masked loads share one register representation on every GPU.
+template <typename T, int N> union Group {
+  float4 vectors[(N * sizeof(T) + 15) / 16];
+  uint64_t words[(N * sizeof(T) + 7) / 8];
+  T values[N];
+};
+
+template <typename T, int N, bool Masked>
+__device__ __forceinline__ Group<T, N>
+load_group(const T *input, uint64_t group, uint64_t columns,
+           uint64_t original_rows, uint64_t original_columns) {
+  Group<T, N> result;
+  if constexpr (Masked) {
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+      const uint64_t element = group * N + i;
+      const uint64_t row = element / columns, col = element % columns;
+      result.values[i] = row < original_rows && col < original_columns
+                             ? input[row * original_columns + col]
+                             : T(0.0f);
+    }
+  } else if constexpr (N * sizeof(T) == 8) {
+    result.words[0] = *reinterpret_cast<const uint64_t *>(input + group * N);
+  } else {
+#pragma unroll
+    for (int i = 0; i < N / 8; ++i)
+      result.vectors[i] =
+          reinterpret_cast<const float4 *>(input + group * N)[i];
+  }
+  return result;
+}
+
+template <typename T, int N>
+__device__ __forceinline__ float group_absmax(const Group<T, N> &group) {
+  using Pair =
+      std::conditional_t<std::is_same_v<T, __half>, __half2, __nv_bfloat162>;
+  const auto *pairs = reinterpret_cast<const Pair *>(group.values);
+  Pair maximum = __habs2(pairs[0]);
+#pragma unroll
+  for (int i = 1; i < N / 2; ++i)
+    maximum = __hmax2(maximum, __habs2(pairs[i]));
+  if constexpr (std::is_same_v<T, __half>)
+    return __half2float(__hmax(__low2half(maximum), __high2half(maximum)));
+  else
+    return __bfloat162float(
+        __hmax(__low2bfloat16(maximum), __high2bfloat16(maximum)));
+}
+
+// Every API dimension is a multiple of 16 or 32. Adjust the block size to
+// divide the work exactly, including tiny shapes, so kernels need no tail loop.
+inline int block_size(int64_t chunks, int preferred) {
+  while (chunks % preferred)
+    preferred /= 2;
+  return preferred;
+}
+} // namespace quantization
 
 } // namespace comfy
 

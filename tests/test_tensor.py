@@ -4,6 +4,7 @@ import torch
 
 import comfy_kitchen
 from comfy_kitchen.tensor import (
+    AsymW4A8Int8Layout,
     BaseLayoutParams,
     QuantizedTensor,
     TensorCoreFP8Layout,
@@ -12,6 +13,63 @@ from comfy_kitchen.tensor import (
     TensorWiseINT8Layout,
     get_cuda_capability,
 )
+
+
+def test_w4a8_positional_transpose_flag():
+    params = AsymW4A8Int8Layout.Params(
+        torch.ones(32, 16), torch.float32, (256, 32), torch.ones(32), None, None, 16, 256, False, True,
+    )
+    assert params.transposed and params.decode_lut is None
+
+
+@pytest.mark.parametrize(("bits", "levels"), [(3, 16), (4, 8)])
+def test_w4a8_quantize_rejects_mismatched_codebook(bits, levels, device):
+    weight = torch.ones(16, 256, dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="codebook must have shape"):
+        QuantizedTensor.from_float(weight, "AsymW4A8Int8Layout", bits=bits,
+                                   codebook_tensor=torch.linspace(-1, 1, levels, device=device))
+
+
+@pytest.mark.parametrize("bits", [4, 6, 8])
+@pytest.mark.parametrize("activation", ["rms_norm", "swiglu"])
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
+def test_linear_input_act(bits, activation, input_dtype):
+    torch.manual_seed(7)
+    w = torch.randn(32, 256, dtype=torch.bfloat16)
+    weight = (QuantizedTensor.from_float(w, "TensorWiseINT8Layout", convrot=True, per_channel=True)
+              if bits == 8 else QuantizedTensor.from_float(w, "AsymW4A8Int8Layout", bits=bits))
+    x = torch.randn(3, 512 if activation == "swiglu" else 256, dtype=input_dtype)
+    norm = torch.randn(256, dtype=input_dtype)
+    bias = torch.randn(32, dtype=input_dtype)
+    out_dtype = input_dtype if bits == 8 else w.dtype
+    residual = torch.randn(3, 32, dtype=out_dtype)
+    scale = torch.linspace(-1, 2, 32, dtype=out_dtype)
+    activated = (torch.nn.functional.rms_norm(x, (256,), norm, 1e-6) if activation == "rms_norm"
+                 else torch.nn.functional.silu(x[:, :256]) * x[:, 256:])
+    expected = torch.addcmul(residual, torch.nn.functional.linear(activated, weight, bias), scale)
+    got = weight.linear_input_act(x, bias, activation, norm, 1e-6, residual, scale)
+    assert got.dtype == out_dtype
+    assert torch.equal(got, expected)
+
+
+@pytest.mark.parametrize("layout", ["TensorCoreFP8Layout", "TensorWiseINT8Layout", "AsymW4A8Int8Layout"])
+def test_linear_input_act_not_implemented(layout):
+    weight = QuantizedTensor.from_float(torch.randn(32, 256, dtype=torch.bfloat16), layout)
+    if layout != "TensorCoreFP8Layout":
+        weight = weight.t()
+    x = torch.randn(3, weight.shape[1] * 2, dtype=torch.bfloat16)
+    original = x.clone()
+    assert weight.linear_input_act(x, input_act="swiglu") is NotImplemented
+    assert torch.equal(x, original)
+
+
+@pytest.mark.parametrize("layout", ["TensorCoreFP8Layout", "TensorWiseINT8Layout", "AsymW4A8Int8Layout"])
+def test_gemv_optimization_unsupported(layout):
+    weight = QuantizedTensor.from_float(torch.randn(32, 256, dtype=torch.bfloat16), layout)
+    storage = torch.full((64,), 73, dtype=torch.uint8)
+    assert weight.optimize_for_gemv(storage) is weight
+    assert weight.optimize_for_gemm(storage) is weight
+    assert torch.all(storage == 73)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

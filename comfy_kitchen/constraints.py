@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
 __all__ = [
+    "with_out_param",
     "DivisibleBy",
     "ExactDims",
     "FunctionConstraints",
@@ -16,6 +17,7 @@ __all__ = [
     "ValidationResult",
     "validate_function_call",
     "validate_param",
+    "with_w4a8_packed_storage",
 ]
 
 
@@ -256,17 +258,27 @@ def validate_function_call(
 
 def sol_attn_common_call_rule(kwargs):
     """Shared ``sol_attn`` validation. The fused backends size everything from
-    ``q`` and reach ``k``/``v`` as bare pointers, so a mismatch becomes an
-    out-of-bounds read; head_dim 128 is baked into the kernels' layout."""
+    ``q`` and ``k`` and reach the tensors as bare pointers, so a mismatch becomes
+    an out-of-bounds read; head_dim 128 is baked into the kernels' layout.
+    ``k``/``v`` share one length, at least ``q``'s."""
     q = kwargs.get("q")
     if q is not None:
+        k = kwargs.get("k")
+        key_len = k.shape[1] if k is not None and k.dim() == 4 else q.shape[1]
+        if q.shape[1] < 1:   # plans zero blocks
+            return ValidationResult.fail("q", "needs at least one token")
+        if key_len < q.shape[1]:   # a query block past the keys has no always-exact band
+            return ValidationResult.fail(
+                "k", f"needs at least as many rows as q ({q.shape[1]}), got shape {tuple(k.shape)}")
+        want = (q.shape[0], key_len, *q.shape[2:])
         for name in ("k", "v"):
             other = kwargs.get(name)
             if other is None:
                 continue
-            if tuple(other.shape) != tuple(q.shape):
+            if tuple(other.shape) != want:
                 return ValidationResult.fail(
-                    name, f"must have the same shape as q {tuple(q.shape)}, got {tuple(other.shape)}"
+                    name, f"must have shape {want} (q's, at the length k and v share), "
+                          f"got {tuple(other.shape)}"
                 )
             if other.dtype != q.dtype:
                 return ValidationResult.fail(
@@ -278,6 +290,9 @@ def sol_attn_common_call_rule(kwargs):
                 )
         if q.shape[-1] != 128:
             return ValidationResult.fail("q", "head_dim must be 128")
+        for name in ("block_len", "coarse_gate"):   # they describe query and key blocks alike
+            if key_len != q.shape[1] and kwargs.get(name) is not None:
+                return ValidationResult.fail(name, "needs q and k of the same length")
         block_len = kwargs.get("block_len")
         if block_len is not None:
             n = (q.shape[1] + 63) // 64
@@ -293,6 +308,11 @@ def sol_attn_common_call_rule(kwargs):
                     "coarse_gate", f"must have q's shape {tuple(q.shape)}, got {tuple(coarse_gate.shape)}")
             if coarse_gate.device != q.device:
                 return ValidationResult.fail("coarse_gate", f"must be on {q.device}, got {coarse_gate.device}")
+        # query i is key q_offset + i: past this the always-exact band leaves the keys
+        q_offset, room = kwargs.get("q_offset") or 0, key_len - q.shape[1]
+        if not 0 <= q_offset <= room:
+            return ValidationResult.fail(
+                "q_offset", f"must be in [0, {room}] so the queries sit inside the keys, got {q_offset}")
     # Both sinks are half-open [start, end) block ranges.
     for name in ("sink_blocks", "sink_q"):
         value = kwargs.get(name)
@@ -350,3 +370,58 @@ def na3d_common_call_rule(kwargs):
             "kernel_size", f"entries must be positive, got {list(kernel_size)}"
         )
     return ValidationResult.ok()
+
+
+def window_attention_common_call_rule(kwargs):
+    """Shared ``window_attention`` validation (used by every backend's entry).
+
+    The fused backend sizes q from ``q`` and k/v from ``k`` and passes them as
+    bare pointers, so a mismatch becomes an out-of-bounds read.
+    """
+    q, k, v = kwargs.get("q"), kwargs.get("k"), kwargs.get("v")
+    if k is not None and v is not None and tuple(v.shape) != tuple(k.shape):
+        return ValidationResult.fail("v", f"must have the same shape as k {tuple(k.shape)}, got {tuple(v.shape)}")
+    if q is not None:
+        for name, other in (("k", k), ("v", v)):
+            if other is None:
+                continue
+            if other.dtype != q.dtype:
+                return ValidationResult.fail(name, f"must have the same dtype as q ({q.dtype}), got {other.dtype}")
+            if other.device != q.device:
+                return ValidationResult.fail(name, f"must be on the same device as q ({q.device}), got {other.device}")
+        if k is not None:
+            b, tq, h, w, nh, hd = q.shape
+            if (k.shape[0], k.shape[2], k.shape[3], k.shape[5]) != (b, h, w, hd):
+                return ValidationResult.fail(
+                    "k", f"must match q in batch, height, width and head_dim, got {tuple(k.shape)} for q {tuple(q.shape)}"
+                )
+            if tq > k.shape[1]:
+                return ValidationResult.fail("q", f"has {tq} planes, more than the {k.shape[1]} key planes")
+            if k.shape[4] < 1 or nh % k.shape[4] != 0:
+                return ValidationResult.fail("k", f"{k.shape[4]} heads do not divide the {nh} query heads")
+    kh, kw = kwargs.get("kh"), kwargs.get("kw")
+    if kh is not None and kw is not None:
+        if len(kh) != len(kw) or len(kh) == 0:
+            return ValidationResult.fail("kh", f"kh and kw must be non-empty and the same length, got {len(kh)} and {len(kw)}")
+        if k is not None and len(kh) not in (1, k.shape[1]):
+            return ValidationResult.fail("kh", f"needs one window for every key plane or one for all, got {len(kh)} for {k.shape[1]} planes")
+        if any(x < 1 for x in (*kh, *kw)):
+            return ValidationResult.fail("kh", f"windows must be positive, got {list(kh)} x {list(kw)}")
+    temporal_window = kwargs.get("temporal_window")
+    if temporal_window is not None and temporal_window < 1:
+        return ValidationResult.fail("temporal_window", f"must be positive, got {temporal_window}")
+    return ValidationResult.ok()
+
+
+def with_out_param(base: FunctionConstraints) -> FunctionConstraints:
+    """The ``_out`` form of an op: base constraints plus a 5-D ``out`` in x's dtypes."""
+    out = ParamConstraint(dtypes=base.params["x"].dtypes, shape_rules=(ExactDims(5),))
+    return replace(base, params={**base.params, "out": out})
+
+
+def with_w4a8_packed_storage(base: FunctionConstraints) -> FunctionConstraints:
+    """Packed linear uses 1D records and empty scales instead of canonical 2D storage."""
+    params = dict(base.params)
+    for name in ("qdata", "s_rel"):
+        params[name] = replace(params[name], shape_rules=(ExactDims(1),))
+    return replace(base, params=params)

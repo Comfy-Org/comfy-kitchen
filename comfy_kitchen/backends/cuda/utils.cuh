@@ -25,6 +25,7 @@
 #include <cuda_fp4.h>
 #endif
 
+#include <cstdint>
 #include <type_traits>
 #include <mutex>
 #include <stdexcept>
@@ -106,6 +107,12 @@ inline float* GetScalarZero() {
   CUDA_CHECK(cudaGetSymbolAddress((void**)&dev_ptr, zero_device));
   return dev_ptr;
 }
+
+namespace optimized {
+inline bool aligned_to(const void *ptr, uintptr_t bytes) {
+  return reinterpret_cast<uintptr_t>(ptr) % bytes == 0;
+}
+} // namespace optimized
 
 } // namespace comfy
 

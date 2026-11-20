@@ -44,6 +44,12 @@ __forceinline__ __device__ bool fp8_is_nan(float v) {
     return (__float_as_uint(v) & 0x7fffffffu) > 0x7f800000u;
 }
 
+// -ffinite-math-only drops a branch returning a constant NaN; the asm hides the bits.
+__forceinline__ __device__ float opaque_bits_as_float(uint32_t bits) {
+    asm("" : "+v"(bits));
+    return __uint_as_float(bits);
+}
+
 // Round to nearest, ties to even. OCP FP8 and torch's cast both round this way, so
 // the packed code has to agree at the exact midpoints that floorf(x + 0.5f) would
 // otherwise push up (e.g. e4m3 1.0625 must land on 1.0, not 1.125). x is finite and
@@ -138,14 +144,12 @@ __forceinline__ __device__ float unpack_fp8(uint8_t value, int dtype_code = kFp8
     // e4m3fn has no infinities: an all-ones exponent with an all-ones mantissa is
     // its only NaN. e5m2 follows IEEE: all-ones exponent is inf, or NaN when the
     // mantissa is non-zero. pack_fp8 emits only the NaN code, since it saturates
-    // infinities, but a tensor from any other producer can carry either. The
-    // result is assembled from bits, not float literals: -ffast-math assumes no
-    // NaN and would fold a branch that only ever returns one.
+    // infinities, but a tensor from any other producer can carry either.
     if (exponent == exponent_mask && (!e4m3 || mantissa == mantissa_mask)) {
         const uint32_t sign_bits = (value & 0x80) ? 0x80000000u : 0u;
         const uint32_t payload = (!e4m3 && mantissa == 0) ? 0x7f800000u   // e5m2 inf
                                                           : 0x7fc00000u;  // quiet NaN
-        return __uint_as_float(sign_bits | payload);
+        return opaque_bits_as_float(sign_bits | payload);
     }
 
     if (exponent == 0) {
