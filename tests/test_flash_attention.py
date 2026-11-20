@@ -390,6 +390,38 @@ def test_flash_attention_decode_gqa_matches_reference(query_length, causal, dtyp
     torch.testing.assert_close(lse, scores.logsumexp(-1), atol=1e-3, rtol=1e-4)
 
 
+@requires_flash_decode
+def test_flash_attention_decode_gqa_accepts_dlpack_normalized_size1_strides():
+    # PyTorch's DLPack export (2.9-era NGC builds) normalizes the strides of
+    # size-1 dimensions to 1, so the single-token decode output [B, 1, H*D]
+    # reaches the binding with stride 1 in its size-1 dimensions. Those strides
+    # never participate in addressing and must be accepted.
+    if flash_attention_module._cuda_backend is None:
+        pytest.skip("CUDA backend required")
+    torch.manual_seed(0)
+    batch, kv_heads, groups, capacity = 1, 4, 4, 300
+    heads = kv_heads * groups
+    head_dim = 256
+    q = torch.randn(batch, heads, 1, head_dim, device=GQA_DEVICE, dtype=torch.bfloat16)
+    k = torch.randn(batch, kv_heads, capacity, head_dim, device=GQA_DEVICE, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    lengths = torch.full((batch,), capacity, device=GQA_DEVICE, dtype=torch.int32)
+    out = torch.empty(heads * head_dim, device=GQA_DEVICE, dtype=torch.bfloat16).as_strided(
+        (batch, 1, heads * head_dim), (1, 1, 1))
+    lse = torch.empty(batch * heads, device=GQA_DEVICE, dtype=torch.float32)
+    backend = flash_attention_module._cuda_backend
+    backend._C.flash_attention_decode_gqa(
+        *map(backend._wrap_for_dlpack, (q, k, v, lengths, out, lse, lse[:0], lse[:0])),
+        1, False, torch.cuda.current_stream(GQA_DEVICE).cuda_stream)
+    torch.cuda.synchronize()
+
+    kf = k.repeat_interleave(groups, dim=1).float()
+    vf = v.repeat_interleave(groups, dim=1).float()
+    scores = torch.einsum("bhsd,bhcd->bhsc", q.float(), kf) * head_dim ** -0.5
+    expected = torch.einsum("bhsc,bhcd->bshd", scores.softmax(-1), vf).reshape(batch, 1, heads * head_dim)
+    torch.testing.assert_close(out.float(), expected, atol=3e-3, rtol=1e-2)
+
+
 def test_flash_attention_decode_gqa_native_is_bf16_only():
     assert not ck.flash_attention_decode_gqa_is_available(dtype=torch.float16)
     assert not ck.flash_attention_decode_gqa_is_available(dtype=torch.float32)
