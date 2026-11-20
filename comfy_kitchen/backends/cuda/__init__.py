@@ -1903,10 +1903,10 @@ def dequantize_mxfp8(
     block_scales: torch.Tensor,
     output_type: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
+    qx = qx.contiguous()
+    block_scales = block_scales.contiguous()
 
-    assert qx.is_contiguous(), "Input tensor must be contiguous"
     assert qx.dtype == torch.float8_e4m3fn, "Input must use float8_e4m3fn"
-    assert block_scales.is_contiguous(), "Block scales must be contiguous"
     assert block_scales.device == qx.device, "Block scales must be on the same device as input"
     assert block_scales.dtype == torch.float8_e8m0fnu, "Block scales must use float8_e8m0fnu"
 
