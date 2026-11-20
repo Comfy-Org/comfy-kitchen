@@ -33,7 +33,7 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
     __bf16* __restrict__ vcT,
     float* __restrict__ ksum,  // [H, NPAD, HD] block K sums (post-rope)
     int8_t* __restrict__ cen8, float* __restrict__ cens,
-    float* __restrict__ qmean,       // [H, NPAD, HD] f32 block means (post-rope)
+    float* __restrict__ qmean,       // [H, NQ, HD] f32 block means (post-rope)
     float* __restrict__ vamax_next,  // [H, HD] atomicMax accumulator
     const int32_t* __restrict__ blen, float rope_eps, int rot, bool split_half, int t0, int M,
     int T, int Tp, int H, int NPAD, int NQ) {
@@ -60,7 +60,7 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
     __syncthreads();
     const size_t qrow = static_cast<size_t>(h) * NQ + nblk;
     const float c = centroid_quant(sT, len, sred, cen8 + qrow * HD, cens + qrow);
-    qmean[(static_cast<size_t>(h) * NPAD + nblk) * HD + tid] = c;
+    qmean[qrow * HD + tid] = c;
     __syncthreads();
 
     // ---------------- K phase ----------------

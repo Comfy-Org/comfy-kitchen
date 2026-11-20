@@ -1012,11 +1012,7 @@ def test_block_len_validation():
 
 # ---- k/v with their own length: keys the queries leave out (a conditioning prefix) ----
 
-needs_key_len = pytest.mark.skipif(backend is hip_backend, reason="the HIP kernels take one sequence length")
-
-
 # t queries against prefix + t + extra keys: a ragged prefix, a suffix
-@needs_key_len
 @pytest.mark.parametrize("t,prefix,extra", [(1000, 100, 0), (1024, 0, 300)])
 @pytest.mark.parametrize("select", [{"tau": 1.0}, {"topk_ratio": 0.2}])
 def test_key_prefix_matches_eager(t, prefix, extra, select):
@@ -1028,7 +1024,6 @@ def test_key_prefix_matches_eager(t, prefix, extra, select):
     assert _cos(got, sol_attn_eager(q, k, v, **kw)) > 0.998
 
 
-@needs_key_len
 @pytest.mark.parametrize("select", [{"tau": 1.0}, {"topk_ratio": 0.2}])
 def test_key_prefix_rows_equal_the_full_sequence_call(select):
     """With a block-aligned prefix a query block routes exactly as it does when the
@@ -1045,7 +1040,6 @@ def test_key_prefix_rows_equal_the_full_sequence_call(select):
     assert _cos(ck.sol_attn(part_q, k, v, q_offset=prefix, **kw), ck.sol_attn(q, k, v, **kw)[:, prefix:]) > 0.9999
 
 
-@needs_key_len
 def test_diagonal_band_follows_q_offset():
     """Each query block's own keys and the 64 tokens on either side stay exact, also when
     q_offset is off the key-block grid. Query i has one strong key, at q_offset + i + shift,
@@ -1079,10 +1073,6 @@ def test_key_length_validation():
     for bad, why in (((q[:, :0], k, v), "at least one token"), ((q, k[:, :256], v[:, :256]), "as many rows as q")):
         with pytest.raises(ValueError, match=why):
             backend.sol_attn(*bad, tau=1.4)
-    if backend is hip_backend:
-        with pytest.raises(ValueError, match="as long as q"):
-            backend.sol_attn(q, *longer, tau=1.4)
-        return
     for bad in ({"block_len": torch.full((8,), 64, dtype=torch.int32, device="cuda")}, {"coarse_gate": torch.zeros_like(q)}):
         for fn in (backend.sol_attn, sol_attn_eager):
             with pytest.raises(ValueError, match="same length"):

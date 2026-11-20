@@ -3108,16 +3108,15 @@ def _check_sol_args(sink_blocks, sink_q, topk_ratio, **tensors):
     test. has_wmma() is the intersection over every visible device, so it is
     already the conservative answer for whichever one the tensors are on.
     """
-    from comfy_kitchen.constraints import sol_attn_common_call_rule, sol_attn_same_length_call_rule
+    from comfy_kitchen.constraints import sol_attn_common_call_rule
 
     if not has_wmma():
         raise RuntimeError(
             "sol_attn: requires RDNA3 or newer matrix cores (WMMA); this device has none")
-    kwargs = {"sink_blocks": sink_blocks, "sink_q": sink_q, "topk_ratio": topk_ratio, **tensors}
-    for rule in (sol_attn_common_call_rule, sol_attn_same_length_call_rule):
-        check = rule(kwargs)
-        if not check.success:
-            raise ValueError(f"sol_attn: {check.failed_param}: {check.failure_reason}")
+    check = sol_attn_common_call_rule(
+        {"sink_blocks": sink_blocks, "sink_q": sink_q, "topk_ratio": topk_ratio, **tensors})
+    if not check.success:
+        raise ValueError(f"sol_attn: {check.failed_param}: {check.failure_reason}")
 
 
 def sol_attn(
@@ -3134,11 +3133,11 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
-    q_offset: int = 0,   # CUDA only so far: these kernels take one length
+    q_offset: int = 0,
 ) -> torch.Tensor:
-    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
-    See sage_attention/sol_attn.hip and the public docstring for ``tail``,
-    ``block_len`` and ``coarse_gate``.
+    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors;
+    k and v may be longer than q. See sage_attention/sol_attn.hip and the
+    public docstring for ``tail``, ``block_len``, ``coarse_gate`` and ``q_offset``.
 
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block (sinks
@@ -3154,13 +3153,14 @@ def sol_attn(
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
     _check_sol_args(sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
                     block_len=block_len, coarse_gate=coarse_gate, q_offset=q_offset)
+    tk = k.shape[1]
     if scale is None:
         scale = d ** -0.5
+    lengths = valid = None   # zero-padded tiles only; None keeps the default arithmetic exact
     if block_len is not None:
         block_len = block_len.contiguous()
-    lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
-    valid = _valid_rows(t, lengths) if block_len is not None else None
-    mean_lengths = lengths if block_len is not None else None   # exact default arithmetic
+        lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
+        valid = _valid_rows(t, lengths)
     # Only the last dim must be contiguous (16-byte staging loads), so a BHND view
     # goes in as-is. A misaligned load faults asynchronously and poisons the
     # context, so base pointer and leading strides are checked here.
@@ -3179,15 +3179,15 @@ def sol_attn(
                     f"is not a multiple of 8, so the 16-byte staging loads would "
                     f"be misaligned; call .contiguous() on it")
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
-    thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
+    thr = (_topk_threshold(q, k, topk_ratio, scale, lengths, valid, sb)
            if topk_ratio else None)
     kb = None
     if key_bias is not None:
         # exact branch only, in log2 units; biased blocks must be sink-covered
-        kb = _normalize_key_bias(key_bias, batch, t, q.device)
-        kb = (kb * _LOG2E).expand(batch, t).contiguous()
+        kb = _normalize_key_bias(key_bias, batch, tk, q.device)
+        kb = (kb * _LOG2E).expand(batch, tk).contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
+    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug), key_len=tk)
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
     _C.sol_attn(
         _dl(q), _dl(k), _dl(v), _dl(out), _dl(workspace),
@@ -3198,9 +3198,11 @@ def sol_attn(
         key_bias=None if kb is None else _dl(kb),
         threshold=None if thr is None else _dl(thr),
         block_len=None if block_len is None else _dl(block_len),
-        tail=bool(tail), token_aug=int(token_aug),
+        tail=bool(tail), token_aug=int(token_aug), q_offset=int(q_offset),
     )
     if coarse_gate is not None:
+        if lengths is None:
+            lengths = _block_lengths(t, (t + 63) // 64, q.device)
         add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
                     coarse_gate)
     return out
@@ -3330,8 +3332,8 @@ def _ws_block_means(ws, p, bh, lengths):
     """(qm, km, vm) ``[BH, NTB, 128]`` fp32 block means over live rows, read from
     what the kernels already left in the workspace: the qmean slot, K means in
     scratch, V sums in vcT (bf16)."""
-    ntb, npad, d = p["NTB"], p["NPAD"], _SOL_HD
-    qm = ws[p["qmean"]:p["qmean"] + bh * npad * d * 4].view(torch.float32).view(bh, npad, d)[:, :ntb]
+    ntb, npad, nq, d = p["NTB"], p["NPAD"], p["NQ"], _SOL_HD
+    qm = ws[p["qmean"]:p["qmean"] + bh * nq * d * 4].view(torch.float32).view(bh, nq, d)
     vm = ws[p["vcT"]:p["vcT"] + bh * d * npad * 2].view(torch.bfloat16).view(bh, d, npad)[:, :, :ntb]
     return qm, _ws_ksums(ws, p, bh), vm.transpose(1, 2).float() / lengths.view(1, -1, 1)
 
@@ -3362,7 +3364,6 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ValidationResult,
         na3d_common_call_rule,
         sol_attn_common_call_rule,
-        sol_attn_same_length_call_rule,
         window_attention_common_call_rule,
         with_out_param,
     )
@@ -3430,7 +3431,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 ),
             },
             default_devices=dev,
-            call_rules=(sol_attn_common_call_rule, sol_attn_same_length_call_rule),
+            call_rules=(sol_attn_common_call_rule,),
         ),
         # fp32 has no 16-bit matrix path, so it goes to triton/eager.
         "na3d": FunctionConstraints(
