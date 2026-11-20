@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "moe_top2_dispatch",
 ]
 
 # Try to import triton and register if available
@@ -54,6 +55,7 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .moe_top2_dispatch import moe_top2_dispatch
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -125,6 +127,28 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _moe_top2_dispatch_call_rule(kwargs):
+        x, logits = kwargs.get("x"), kwargs.get("logits")
+        if x is None or logits is None:
+            return ValidationResult.ok()
+        if logits.shape[-1] != 4:
+            return ValidationResult.fail("logits", "triton moe_top2_dispatch takes 4 experts")
+        if x.numel() == 0:
+            return ValidationResult.fail(
+                "x", "empty tensors are not supported by triton moe_top2_dispatch"
+            )
+        if logits.device != x.device:
+            return ValidationResult.fail("logits", "must be on x's device")
+        if x.stride(-1) != 1 or logits.stride(-1) != 1:
+            return ValidationResult.fail("x", "x and logits need a unit stride in the last dim")
+        # at most 2**14 tokens (HiDream-I1 calls have up to 8960), more go to eager: the gather
+        # kernel's count tile is [next_pow2(ceil(tokens / 32)), 4], a constexpr, so the kernel
+        # compiles once per power-of-two block count and that first compile takes longer as
+        # the tile grows
+        if x.shape[0] > 2**14:
+            return ValidationResult.fail("x", "more than 2**14 tokens")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -326,6 +350,16 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    # cuda covers ROCm builds of PyTorch (device type "cuda"); bf16 only
+    bf16_only = frozenset({torch.bfloat16})
+    out["moe_top2_dispatch"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=bf16_only, shape_rules=(ExactDims(2),)),
+            "logits": ParamConstraint(dtypes=bf16_only, shape_rules=(ExactDims(2),)),
+        },
+        default_devices=cuda_devices,
+        call_rules=(_moe_top2_dispatch_call_rule,),
+    )
     out["na3d"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
