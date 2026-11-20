@@ -194,6 +194,11 @@ jobs:
                   raise SystemExit(f"{wheel.name} does not contain both CUDA and HIP extensions")
           PY
 
+      - name: Verify shipped CUDA ELF linkage and relocatable RPATH
+        shell: bash
+        run: |
+          python tests/check_cuda_wheel_elf.py wheelhouse/*manylinux*.whl
+
       - name: Build CPU-only wheel (py3-none-any)
         shell: bash
         run: |
@@ -341,6 +346,11 @@ jobs:
           ls -lh wheelhouse/
           echo "Built wheels:"
           ls -1 wheelhouse/*.whl
+
+      - name: Verify ARM64 CUDA ELF linkage and relocatable RPATH
+        shell: bash
+        run: |
+          python tests/check_cuda_wheel_elf.py wheelhouse/*manylinux*.whl
 
       - name: Upload Linux ARM64 CUDA wheel
         uses: actions/upload-artifact@v4
