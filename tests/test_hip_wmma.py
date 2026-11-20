@@ -4,6 +4,8 @@ Skipped unless the backend registered, which requires an RDNA2/3/4 device and th
 compiled extension. The GEMM tests need matrix cores on top of that, so they are
 skipped on RDNA2, which has none; see needs_wmma.
 """
+import dataclasses
+
 import pytest
 import torch
 
@@ -405,16 +407,20 @@ def test_gfx12_int8_gemm_is_exact(hip, m, n):
 
 
 @needs_wmma
-def test_int8_generic_tiled_a_is_exact(hip):
+# 257 rows: single-M kernel. The other two reach the gfx12 large-M kernel on a
+# 32-WGP device (200 and 288 blocks of 256x256): a 76-row M tail, a 16-column N
+# tail and the minimum two K-blocks, then full tiles only with 16 K-blocks, so
+# the per-block K-walk rotation wraps.
+@pytest.mark.parametrize(("m", "n", "k"), [(257, 256, 1024), (1100, 10000, 128), (2304, 8192, 1024)])
+def test_int8_generic_tiled_a_is_exact(hip, m, n, k):
     """Physical A tiling is a dimensional contract, not a model shape."""
     torch.manual_seed(211)
-    m, n, k = 257, 256, 1024
     x = torch.randn((m, k), device=DEV, dtype=torch.bfloat16)
     b = torch.randint(-127, 128, (n, k), device=DEV, dtype=torch.int8)
     scale_b = torch.rand(n, device=DEV, dtype=torch.float32) + 0.25
     padded_m = (m + 127) // 128 * 128
     padded_x = torch.nn.functional.pad(x, (0, 0, 0, padded_m - m))
-    row_a, padded_scale_a = hip._rotate_quant_int8(padded_x, 256)
+    row_a, padded_scale_a = hip._rotate_quant_int8(padded_x, 64 if k < 256 else 256)
     tiled_scale_a = padded_scale_a[:m]
     tiled_a = (
         row_a.reshape(padded_m // 128, 128, k // 128, 128)
@@ -444,6 +450,65 @@ def test_int8_generic_tiled_a_is_exact(hip):
     torch.cuda.synchronize()
 
     assert torch.equal(row_major, reference)
+
+    if n % 256 == 0 and hip._has_nonduplicated_wmma():
+        # B in the large-M kernel's [N/256][K/64][256][64] order, taken by every M,
+        # with and without a bias column.
+        tiled_b = b.reshape(n // 256, 256, k // 64, 64).permute(0, 2, 1, 3).contiguous()
+        bias = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+        for bias_arg in (None, bias):
+            hip._C.int8_gemm(
+                hip._dl(row_a), hip._dl(b), hip._dl(reference), hip._dl(tiled_scale_a),
+                hip._dl(scale_b), 1, None if bias_arg is None else hip._dl(bias_arg), m, n, k,
+                hip.DTYPE_TO_CODE[torch.bfloat16], stream,
+            )
+            hip._C.int8_gemm_a_tiled128(
+                hip._dl(tiled_a), hip._dl(tiled_b), hip._dl(row_major),
+                hip._dl(tiled_scale_a), hip._dl(scale_b), 1, None if bias_arg is None else hip._dl(bias_arg), m, n, k,
+                hip.DTYPE_TO_CODE[torch.bfloat16], stream, 1,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(row_major, reference)
+
+
+def test_int8_gemm_optimization_roundtrip():
+    # A resident per-channel INT8 weight is reordered in place inside its byte buffer;
+    # the layout computes the same linear for every M (the big-tile kernel takes the
+    # GEMV rows too), dequantizes to the same values, refuses to serialize the
+    # tiled form, and leaves ineligible shapes alone.
+    skip_unless_gfx12_wmma()
+    torch.manual_seed(5)
+    n, k = 1024, 1792
+    weight = QuantizedTensor.from_float(
+        torch.randn(n, k, device=DEV, dtype=torch.bfloat16), "TensorWiseINT8Layout",
+        per_channel=True, convrot=True)
+    qdata, params = weight._qdata, weight._params
+    prefix, suffix = 64, 128
+    storage = torch.full((prefix + qdata.nbytes + suffix,), 73, dtype=torch.uint8, device=DEV)
+    resident_q = storage[prefix:prefix + qdata.nbytes].view(torch.int8).view_as(qdata)
+    resident_q.copy_(qdata)
+    resident = QuantizedTensor(resident_q, "TensorWiseINT8Layout", params)
+    tiled = resident.optimize_for_gemm(storage)
+    assert tiled.data_ptr() == resident_q.data_ptr() and tiled.params.tiled
+    assert tiled.optimize_for_gemm(storage) is tiled
+    assert torch.all(storage[:prefix] == 73) and torch.all(storage[-suffix:] == 73)
+    assert not torch.equal(tiled._qdata, qdata)
+    assert torch.equal(tiled.dequantize(), weight.dequantize())
+    with pytest.raises(ValueError):
+        tiled.state_dict()
+    bias = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    for m in (1, 8, 300, 1024):
+        x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+        assert torch.equal(torch.nn.functional.linear(x, tiled), torch.nn.functional.linear(x, weight))
+        assert torch.equal(torch.nn.functional.linear(x, tiled, bias), torch.nn.functional.linear(x, weight, bias))
+        assert torch.equal(tiled.linear_input_act(x), weight.linear_input_act(x))
+    # A dtype mismatch decomposes linear into t()+mm, which untiles a copy and
+    # takes the row-major kernel: slower, same result.
+    assert torch.equal(torch.nn.functional.linear(x.half(), tiled), torch.nn.functional.linear(x.half(), weight))
+
+    odd = QuantizedTensor(resident_q[:n - 256 + 16], "TensorWiseINT8Layout",
+                          dataclasses.replace(params, scale=params.scale[:n - 256 + 16], orig_shape=(n - 256 + 16, k)))
+    assert odd.optimize_for_gemm(storage) is odd
 
 
 def _offset_copy(t: torch.Tensor) -> torch.Tensor:

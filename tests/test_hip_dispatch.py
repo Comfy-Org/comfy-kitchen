@@ -237,6 +237,8 @@ def test_hip_drops_gemms_without_matrix_cores():
     # the VALU v_dot8_i32_i4 tile and every other part still reaches MmaInt4.
     # The gate only stopped the whole op being withheld from RDNA2.
     assert "convrot_w4a4_linear" in without
+    # int8_linear_tiled_weight is the exception: its tiled-B kernels are gfx12
+    # only, so RDNA2 has nothing to reach.
     # ...and nothing may be added to the set without a GEMM that traps on RDNA2.
     # The only gfx10 fallbacks in the kernel tree are in gemm_int8.hip and
     # gemm_fp16.hip; if one of these names gains a path there, remove it here.
@@ -245,7 +247,7 @@ def test_hip_drops_gemms_without_matrix_cores():
     # would be silenced by a future refactor anyway, so the suggestion is taken
     # once here instead of carrying a suppression.
     expected_wmma_only = frozenset({
-        "fp16_conv3d", "fp16_conv3d_out", "na3d", "sol_attn",
+        "fp16_conv3d", "fp16_conv3d_out", "int8_linear_tiled_weight", "na3d", "sol_attn",
         "window_attention",
         "scaled_mm_svdquant_w4a4", "scaled_mm_nvfp4",
     })

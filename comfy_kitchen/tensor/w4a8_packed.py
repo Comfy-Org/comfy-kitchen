@@ -18,12 +18,12 @@ _FIXED_LUT = (
 _FIXED_LUT8 = (-0.923975, -0.594572, -0.336347, -0.109145, 0.109145, 0.336347, 0.594572, 0.923975)
 
 
-def default_w4a8_codebook(levels: int = 16) -> torch.Tensor:
+def default_w4a8_codebook(levels: int = 16, *, device=None) -> torch.Tensor:
     """The frozen Lloyd-Max codebook (the CUDA streamed decode kernel's built-in LUT):
     16 levels for 4-bit codes, 8 for 3-bit."""
     if levels not in (8, 16):
         raise ValueError(f"codebook levels must be 8 or 16, got {levels}")
-    return torch.tensor(_FIXED_LUT if levels == 16 else _FIXED_LUT8, dtype=torch.float32)
+    return torch.tensor(_FIXED_LUT if levels == 16 else _FIXED_LUT8, dtype=torch.float32, device=device)
 
 
 def _plane(unsigned: torch.Tensor, shift: int, width: int) -> torch.Tensor:
@@ -40,7 +40,7 @@ def _plane(unsigned: torch.Tensor, shift: int, width: int) -> torch.Tensor:
 def _unplane(packed: torch.Tensor, n: int, k: int, width: int) -> torch.Tensor:
     """Inverse of _plane: int32 bytes [N, K*width/8] -> int32 field [N, K]."""
     shifts = torch.arange(0, 8, width, device=packed.device, dtype=torch.int32)
-    return ((packed.unsqueeze(-1) >> shifts) & ((1 << width) - 1)).reshape(n, k)
+    return (packed.unsqueeze(-1) >> shifts).bitwise_and_((1 << width) - 1).reshape(n, k)
 
 
 def _pack_codes(unsigned: torch.Tensor, bits: int) -> torch.Tensor:
@@ -50,7 +50,7 @@ def _pack_codes(unsigned: torch.Tensor, bits: int) -> torch.Tensor:
     3: 2-bit plane of the low 2 bits (K/4 bytes) + 1-bit plane of the top bit (K/8 bytes)."""
     if bits == 3:
         return torch.cat([_plane(unsigned, 0, 2), _plane(unsigned, 2, 1)], dim=1).contiguous()
-    low = _plane(unsigned, 0, 4)
+    low = ((unsigned[:, 0::2] & 15) | ((unsigned[:, 1::2] & 15) << 4)).to(torch.int8)
     if bits == 4:
         return low.contiguous()
     if bits == 5:
@@ -121,15 +121,21 @@ def unpack_w4a8_mma_weight(
         # lane's 16 codes at bit q*bits of a 6/10/12-byte string (LaneCodes in w4a8_gemm.cu):
         # plane A has 4 (3-bit) or 8 bytes per lane, plane B 2 or 4 (6-bit) more
         a_bytes, b_bytes = (4 if bits == 3 else 8), (4 if bits == 6 else 2)
+        # Decode whole little-endian words: 24 bits hold four W6 or eight W3
+        # codes, and 40 bits hold eight W5 codes. Each byte is read once.
+        bytes_per_word = 5 if bits == 5 else 3
+        dtype = torch.int64 if bits == 5 else torch.int32
         lane_bytes = torch.cat(
             (records[:, :, :32 * a_bytes].reshape(tiles, k_rows, 32, a_bytes),
-             records[:, :, 32 * a_bytes:code_bytes].reshape(tiles, k_rows, 32, b_bytes),
-             torch.zeros((tiles, k_rows, 32, 1), dtype=torch.uint8, device=packed.device)),
+             records[:, :, 32 * a_bytes:code_bytes].reshape(tiles, k_rows, 32, b_bytes)),
             dim=3,
-        ).to(torch.int32)
-        q = torch.arange(16, device=packed.device) * bits
-        lo, hi = lane_bytes[..., q // 8], lane_bytes[..., q // 8 + 1]
-        fragments = (((lo | hi << 8) >> (q % 8)) & ((1 << bits) - 1)).view(tiles, k_rows, 8, 4, 4, 4)
+        ).view(tiles, k_rows, 32, (a_bytes + b_bytes) // bytes_per_word, bytes_per_word)
+        words = lane_bytes[..., -1].to(dtype)
+        for byte in reversed(range(bytes_per_word - 1)):
+            words.bitwise_left_shift_(8).bitwise_or_(lane_bytes[..., byte])
+        shifts = torch.arange(0, 8 * bytes_per_word, bits, device=packed.device, dtype=dtype)
+        fields = (words.unsqueeze(-1) >> shifts).bitwise_and_((1 << bits) - 1)
+        fragments = fields.to(torch.int32).view(tiles, k_rows, 8, 4, 4, 4)
         codes = _fragment_major_inverse(fragments, 32).permute(0, 2, 1, 3).reshape(n, k)
         qdata = _pack_codes(codes, bits).view(torch.uint8)
 
@@ -141,3 +147,12 @@ def unpack_w4a8_mma_weight(
     scale_tiles[:, :, 8:, 1] = scale_fragments[:, :, :, 3]
     scales = scale_tiles.permute(0, 2, 1, 3).reshape(n, k // 16)
     return qdata.view(torch.int8), scales.view(scale_dtype)
+
+
+def resolve_mma_codebook(qdata: torch.Tensor, k: int, codebook: torch.Tensor | None) -> torch.Tensor | None:
+    """Restore a packed stream's implicit codebook after unpacking its rows."""
+    if codebook is None and k:
+        bits = qdata.shape[1] * 8 // k
+        if bits in (3, 4):
+            return default_w4a8_codebook(1 << bits, device=qdata.device)
+    return codebook

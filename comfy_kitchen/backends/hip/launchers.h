@@ -192,12 +192,13 @@ void launch_int4_gemm_kernel(const void* a, const void* b, void* c, const void* 
                              int bias_code, int M, int N, int K, int ldc, int out_code,
                              hipStream_t stream);
 
-// A is physically [M_tile, K_tile, 128, 128]; B is row-major.
+// A is physically [M_tile, K_tile, 128, 128]; B is row-major, or when
+// b_tiled is set, [N/256, K/64, 256, 64] (bf16 output, per-channel scale, no bias).
 void launch_int8_gemm_a_tiled128_kernel(
     const void* a, const void* b, void* c, const void* scale_a,
     const void* scale_b, int scale_b_stride, const void* bias,
     int bias_code, int M, int N, int K, int ldc, int out_code,
-    hipStream_t stream);
+    int b_tiled, hipStream_t stream);
 
 // Exact BF16 RMSNorm followed by gate multiplication and residual add.
 void launch_rms_gated_residual_bf16_kernel(

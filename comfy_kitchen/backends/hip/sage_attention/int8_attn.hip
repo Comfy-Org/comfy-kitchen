@@ -434,7 +434,9 @@ __global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn
     // magnitude is bounded by the static_assert above yields the FP32 value
     // 12582912 + x bit for bit, and the 12582912 * tile_scale each tile contributes
     // is cancelled by o_bias every 8 tiles, which bounds how much of the mantissa
-    // small outputs can lose. gfx12 has had this; gfx11 had kBiasPV hard false.
+    // small outputs can lose. gfx12 has had this; gfx11 had kBiasPV hard false,
+    // and every number below was measured on the 6-WGP 780M, so only that gfx11
+    // device pass turns it on -- the others keep upstream's false.
     //
     // Both directions of this have been measured on gfx1103, because the obvious
     // "make it symmetric" edits are both wrong:
@@ -463,8 +465,12 @@ __global__ __launch_bounds__((Shape<HD, kMask, Paged>::kThreads)) void int8_attn
     // performance results and not correctness ones: ck_attn_check.py shows the
     // relative error against a float32 SDPA unchanged (0.01370 at HD=64) when the
     // HD=64 arm is enabled.
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX1103)
     constexpr bool kBiasPV = (HD == 128 && (!kCustomMask || kPrepared)) ||
                              (HD == 64 && (kPreparedKey || kDirectKey || kPreparedDense16));
+#else
+    constexpr bool kBiasPV = false;
+#endif
     // Adding a signed integer x to these bits gives the exact FP32 value
     // 12582912 + x while |x| <= 2^22. A PV tile is bounded by
     // CTA_K * 128 * 255, including the most negative signed INT8 value.

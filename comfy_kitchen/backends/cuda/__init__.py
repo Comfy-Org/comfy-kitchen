@@ -18,6 +18,7 @@ import importlib.util
 import os
 import sys
 import weakref
+from functools import cache
 from typing import NamedTuple
 
 import torch
@@ -220,7 +221,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
-from comfy_kitchen.tensor.w4a8_packed import _mma_bits, default_w4a8_codebook, w4a8_mma_record_bytes  # noqa: E402
+from comfy_kitchen.tensor.w4a8_packed import _mma_bits, default_w4a8_codebook  # noqa: E402
 from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     w4a8_int8_linear as eager_w4a8_int8_linear,
 )
@@ -269,7 +270,7 @@ def _w4a8_fixed_codebook(device: torch.device, levels: int) -> torch.Tensor:
     execution-scoped allocations: the cache outlives every capture)."""
     if (codebook := _W4A8_FIXED_CODEBOOKS.get((device, levels))) is None:
         with allocation_context():
-            codebook = default_w4a8_codebook(levels).to(device)
+            codebook = default_w4a8_codebook(levels, device="cpu").to(device)
         _W4A8_FIXED_CODEBOOKS[(device, levels)] = codebook
     return codebook
 
@@ -280,8 +281,8 @@ def _w4a8_decode_lut(device: torch.device, codebook: torch.Tensor) -> torch.Tens
     build it once per weight at repack time, never per call; cached per device and table."""
     key = (device, tuple(codebook.float().cpu().tolist()))
     if (decode_lut := _W4A8_DECODE_LUTS.get(key)) is None:
-        codebook = torch.tensor(key[1], dtype=torch.float32)
-        scales = torch.arange(256, dtype=torch.uint8)
+        codebook = torch.tensor(key[1], dtype=torch.float32, device="cpu")
+        scales = torch.arange(256, dtype=torch.uint8, device="cpu")
         scales = scales.view(torch.float8_e4m3fn).float()
         table = (
             (scales[:, None] * codebook[None, :])
@@ -298,9 +299,10 @@ def _w4a8_decode_lut(device: torch.device, codebook: torch.Tensor) -> torch.Tens
     return decode_lut
 
 
+@cache
 def _w4a8_fixed_decode_lut(device: torch.device, levels: int = 16) -> torch.Tensor:
     """The decode table of the frozen codebook, for packed weights that carry none."""
-    return _w4a8_decode_lut(device, default_w4a8_codebook(levels))
+    return _w4a8_decode_lut(device, default_w4a8_codebook(levels, device="cpu"))
 
 
 _NVIDIA_16_SERIES = (
@@ -1588,7 +1590,8 @@ def quantize_w4a8_int8_weight(
     (4/3-bit symmetric codebook g16, or 6/5-bit without the quantize-time scale search; fp8
     scales). W4A8 uses staged CUDA requant when fusion is unavailable; other configs use
     chunked eager."""
-    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
+    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits,
+                              codebook_tensor if symmetric and (bits == 3 or codebook) else None)
     fused_ok = scale_dtype == torch.float8_e4m3fn and symmetric and (
         ((bits == 3 or (bits == 4 and codebook)) and group_size == 16)   # 3-bit is always codebook
         or (bits in (5, 6) and not scale_search and group_size in (16, 32, 64))
@@ -2102,16 +2105,13 @@ def _w4a8_cluster_quantizer_ok(k: int, input_act: str | None, device: torch.devi
 def _w4a8_mma_linear(
     x_2d, rotated, partial_absmax, act_weight, input_act_eps, input_act, xq, xs,
     qdata, s_channel, bias_float, resid_2d, resid_scale, out,
-    convrot_groupsize, group_size, output_dtype_code, stream_ptr, decode_lut=None,
+    convrot_groupsize, group_size, output_dtype_code, stream_ptr, decode_lut, codebook,
 ):
     """Quantize x_2d and run the streamed MMA GEMM into out."""
     m, n = out.shape
     # Call-local split-K sums and counters also isolate independently replayed graphs.
     scratch = torch.zeros(m * n + n // 16, dtype=torch.int32, device=out.device)
     workspace, counters = scratch[:m * n].view(m, n), scratch[m * n:]
-    bits = _mma_bits(qdata.numel(), n, xq.shape[1])
-    if decode_lut is None and bits in (3, 4):
-        decode_lut = _w4a8_fixed_decode_lut(qdata.device, 16 if bits == 4 else 8)
     used = _C.w4a8_codebook_mma_linear(
         _wrap_for_dlpack(x_2d),
         _wrap_for_dlpack(rotated) if rotated is not None else None,
@@ -2134,6 +2134,7 @@ def _w4a8_mma_linear(
         group_size,
         output_dtype_code,
         stream_ptr,
+        _wrap_for_dlpack(codebook) if codebook is not None else None,
     )
     if not used:
         raise RuntimeError("MMA-packed W4A8 weight is unsupported on this device")
@@ -2694,8 +2695,8 @@ def w4a8_packed_linear(
     """Resident packed W4A8/W6A8: small-M MMA or direct packed dequantization for prefill.
 
     decode_lut is the stream's [256, levels] int8 table of ``codebook`` (built once at
-    repack time by ``optimize_for_gemv``); without it the stream decodes through the
-    frozen table.
+    repack time by ``optimize_for_gemv``). A raw packed call can supply the codebook
+    directly. Omitting both uses the frozen codebook.
     """
     if input_act in (None, "none"):
         input_act = None
@@ -2719,17 +2720,14 @@ def w4a8_packed_linear(
         qdata.dim() != 1
         or qdata.dtype != torch.int8
         or n % 16
-        or qdata.numel() not in {n * k * w4a8_mma_record_bytes(b) // 512 for b in (3, 4, 5, 6)}
         or s_rel.numel() != 0
         or group_size != 16
         or correction is not None
     ):
         raise ValueError("invalid MMA-packed W4A8 operands")
     bits = _mma_bits(qdata.numel(), n, k)
-    if codebook is None and bits in (3, 4):
-        # without a table the M<=8 stream decodes through the frozen LUT; the prefill
-        # chunk decode has to read the same one
-        codebook = _w4a8_fixed_codebook(x.device, 16 if bits == 4 else 8)
+    if codebook is not None and (bits not in (3, 4) or codebook.shape != (1 << bits,)):
+        raise ValueError(f"invalid codebook for {bits}-bit packed weight")
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     if residual is not None and not (
@@ -2748,6 +2746,16 @@ def w4a8_packed_linear(
     xs = torch.empty(m, 1, dtype=torch.float32, device=x.device)
     out = torch.empty(m, n, dtype=out_dtype, device=x.device)
     if m <= 8:
+        stream_codebook = None
+        # A captured call retains tensor addresses. copy_ updates codebook in
+        # place and rebinds decode_lut, so graph replays must read codebook.
+        if decode_lut is not None and codebook is not None and torch.cuda.is_current_stream_capturing():
+            decode_lut = None
+        if decode_lut is None and bits in (3, 4):
+            if codebook is None:
+                decode_lut = _w4a8_fixed_decode_lut(x.device, 1 << bits)
+            else:
+                stream_codebook = codebook.to(device=x.device, dtype=torch.float32).contiguous()
         # Staged-pair scratch is only needed where the single cluster quantizer
         # cannot run (pre-sm_90, very wide K); a fused activation implies the cluster path.
         rotated = partial_absmax = act_weight = None
@@ -2767,9 +2775,11 @@ def w4a8_packed_linear(
             x_2d, rotated, partial_absmax, act_weight, input_act_eps, input_act, xq, xs,
             qdata, s_channel, bias_float, resid_2d, resid_scale, out,
             convrot_groupsize, group_size, DTYPE_TO_CODE[out_dtype],
-            torch.cuda.current_stream(x.device).cuda_stream, decode_lut,
+            torch.cuda.current_stream(x.device).cuda_stream, decode_lut, stream_codebook,
         )
     else:
+        if codebook is None and bits in (3, 4):
+            codebook = _w4a8_fixed_codebook(x.device, 1 << bits)
         bias_arg = _gemm_vector_arg(bias, x.device, out_dtype) if bias is not None else None
         used, _, _ = _w4a8_linear_chunked(
             x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
@@ -2972,8 +2982,8 @@ def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
     kk = _topk_count(n - _sink_count(n, s0, s1), topk_ratio)
     if kk == 0:   # nothing beyond the forced blocks: a threshold no finite score clears
         return torch.full(c8.shape[:-1], float("inf"), device=c8.device, dtype=c8.dtype)
-    # Head slices, scaled in place: the whole [BH, N, N] scores spilled a 10 GB card at 109k tokens
-    step = max(1, _SOL_TOPK_SLICE_BYTES // (n * n * c8.element_size()))
+    # Head slices, scaled in place: the whole [BH, NQ, N] scores spilled a 10 GB card at 109k tokens
+    step = max(1, _SOL_TOPK_SLICE_BYTES // (c8.shape[1] * n * c8.element_size()))
     row_scale = (csc * log2s).unsqueeze(-1)
     col_scale = ksc.squeeze(-1).unsqueeze(-2)
     kth = torch.empty(c8.shape[:-1], device=c8.device, dtype=c8.dtype)
@@ -3106,10 +3116,11 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    q_offset: int = 0,
 ) -> torch.Tensor:
-    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
-    See sage_attention/sol_attn.cu and the public docstring for ``tail``,
-    ``block_len`` and ``coarse_gate``.
+    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors;
+    k and v may be longer than q. See sage_attention/sol_attn.cu and the
+    public docstring for ``tail``, ``block_len``, ``coarse_gate`` and ``q_offset``.
 
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block
@@ -3126,14 +3137,15 @@ def sol_attn(
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
     _check_sol_args(q.device, sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
-                    block_len=block_len, coarse_gate=coarse_gate)
+                    block_len=block_len, coarse_gate=coarse_gate, q_offset=q_offset)
+    tk = k.shape[1]
     if scale is None:
         scale = d ** -0.5
+    lengths = valid = None   # zero-padded tiles only; None keeps the default arithmetic exact
     if block_len is not None:
         block_len = block_len.contiguous()
-    lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
-    valid = _valid_rows(t, lengths) if block_len is not None else None
-    mean_lengths = lengths if block_len is not None else None   # exact default arithmetic
+        lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
+        valid = _valid_rows(t, lengths)
     # Only the last dim must be contiguous (16 B staging loads), so a BHND
     # view goes in as-is. A misaligned load faults asynchronously and poisons
     # the context, so base pointer and leading strides are checked here.
@@ -3155,13 +3167,13 @@ def sol_attn(
     kb = None
     if key_bias is not None:
         # exact branch only, in log2 units; biased blocks must be sink-covered
-        kb = _normalize_key_bias(key_bias, batch, t, q.device)
-        kb = (kb * _LOG2E).expand(batch, t).contiguous()
+        kb = _normalize_key_bias(key_bias, batch, tk, q.device)
+        kb = (kb * _LOG2E).expand(batch, tk).contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
+    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug), key_len=tk)
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
     # after the large buffers so its temporaries don't fragment the cache they reuse
-    thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
+    thr = (_topk_threshold(q, k, topk_ratio, scale, lengths, valid, sb)
            if topk_ratio else None)
     _C.sol_attn(
         _wrap_for_dlpack(q),
@@ -3176,9 +3188,11 @@ def sol_attn(
         key_bias=None if kb is None else _wrap_for_dlpack(kb),
         threshold=None if thr is None else _wrap_for_dlpack(thr),
         block_len=None if block_len is None else _wrap_for_dlpack(block_len),
-        tail=bool(tail), token_aug=int(token_aug),
+        tail=bool(tail), token_aug=int(token_aug), q_offset=int(q_offset),
     )
     if coarse_gate is not None:
+        if lengths is None:
+            lengths = _block_lengths(t, (t + 63) // 64, q.device)
         add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
                     coarse_gate)
     return out
@@ -3318,8 +3332,8 @@ def _ws_block_means(ws, p, bh, lengths):
     """(qm, km, vm) ``[BH, NTB, 128]`` fp32 block means over live rows, read
     from what the kernels already left in the workspace: the qmean slot, K
     means in scratch, V sums in vcT (bf16)."""
-    ntb, npad, d = p["NTB"], p["NPAD"], _SOL_HD
-    qm = ws[p["qmean"]:p["qmean"] + bh * npad * d * 4].view(torch.float32).view(bh, npad, d)[:, :ntb]
+    ntb, npad, nq, d = p["NTB"], p["NPAD"], p["NQ"], _SOL_HD
+    qm = ws[p["qmean"]:p["qmean"] + bh * nq * d * 4].view(torch.float32).view(bh, nq, d)
     vm = ws[p["vcT"]:p["vcT"] + bh * d * npad * 2].view(torch.bfloat16).view(bh, d, npad)[:, :, :ntb]
     return qm, _ws_ksums(ws, p, bh), vm.transpose(1, 2).float() / lengths.view(1, -1, 1)
 
