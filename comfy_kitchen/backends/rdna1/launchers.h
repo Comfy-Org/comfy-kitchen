@@ -41,14 +41,14 @@ void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* 
                              hipStream_t stream);
 
 // scale_code is a DTYPE_TO_CODE value: 0 float32, 5 e4m3 (passed as raw bytes).
-// codebook is 16 floats, or null for the uniform levels. bits is 4 or 6.
+// codebook is 8 floats at 3 bits, 16 at 4, or null for uniform levels at 4/5/6 bits.
 void launch_dequant_int4_grouped_to_int8_kernel(const void* qw, const void* s_rel, int scale_code,
                                                 const void* codebook, void* out, int64_t n,
                                                 int64_t k, int group_size, int bits,
                                                 hipStream_t stream);
 
-// weight is the raw [N, K] weight, in_dtype_code 1 float16 or 2 bfloat16. bits 4 takes
-// the 16-entry codebook at g 16, bits 6 uniform levels at g 16/32/64. s_rel is written
+// weight is the raw [N, K] weight, in_dtype_code 1 float16 or 2 bfloat16. bits 3/4 take
+// the 8-/16-entry codebook at g 16, bits 5/6 uniform levels at g 16/32/64. s_rel is written
 // as raw e4m3 bytes; seed is ignored unless stochastic is set.
 void launch_quantize_wxa8_convrot_fused_kernel(const void* weight, const void* codebook,
                                                void* packed, void* s_rel, void* s_channel,
@@ -82,7 +82,7 @@ void sol_producer_begin(void* workspace, int batch, int seq_len, int num_heads, 
                         hipStream_t stream);
 void sol_producer_chunk(void* workspace, const void* qkv, const void* fab, const void* qw,
                         const void* kw, const void* kmean, const void* vscale, const void* blen,
-                        float rope_eps, int rot_dim, int t0, int M, int batch, int seq_len,
+                        float rope_eps, int rot_dim, bool split_half, int t0, int M, int batch, int seq_len,
                         int num_heads, int n_tok, hipStream_t stream);
 void launch_sol_attn_core(void* workspace, void* out, const void* vscale, void* kmean_next,
                           void* vamax_out, const void* blen, int tail, int batch, int seq_len,

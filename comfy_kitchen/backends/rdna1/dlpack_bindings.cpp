@@ -1337,10 +1337,10 @@ void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
     constexpr const char* kFn = "quantize_wxa8_convrot_fused";
     require_nonneg(N, kFn, "N");
     require_nonneg(K, kFn, "K");
-    if (!((bits == 4 && group_size == 16) ||
-          (bits == 6 && (group_size == 16 || group_size == 32 || group_size == 64)))) {
+    if (!(((bits == 3 || bits == 4) && group_size == 16) ||
+          ((bits == 5 || bits == 6) && (group_size == 16 || group_size == 32 || group_size == 64)))) {
         throw std::runtime_error(std::string(kFn) +
-                                 ": bits/group_size must be 4/16 or 6/{16,32,64}");
+                                 ": bits/group_size must be 3/16, 4/16, 5/{16,32,64} or 6/{16,32,64}");
     }
     if (K % 256 != 0 || K % group_size != 0) {
         throw std::runtime_error(std::string(kFn) +
@@ -1350,8 +1350,8 @@ void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
     require_dtype(packed, 4, 4, kFn, "packed");
     require_dtype(s_rel, 3, 3, kFn, "s_rel");
     require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
-    if (bits == 4) {
-        require_scale_len(codebook, 16, kFn, "codebook");
+    if (bits == 3 || bits == 4) {
+        require_scale_len(codebook, bits == 4 ? 16 : 8, kFn, "codebook");
     }
     require_len(weight, static_cast<int64_t>(N) * K, kFn, "weight");
     require_len(packed, static_cast<int64_t>(N) * K * bits / 8, kFn, "packed");
@@ -1361,7 +1361,7 @@ void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
     }
 
     launch_quantize_wxa8_convrot_fused_kernel(
-        weight.data(), bits == 4 ? codebook.data() : nullptr, packed.data(), s_rel.data(),
+        weight.data(), (bits == 3 || bits == 4) ? codebook.data() : nullptr, packed.data(), s_rel.data(),
         s_channel.data(), N, K, bits, group_size, map_dtype_to_code(weight.dtype()), stochastic,
         seed, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
@@ -1410,9 +1410,9 @@ static int w4a8_bits(const nb::ndarray<>& qdata, int N, int K, int group_size,
         return 4;
     }
     const int64_t bits = cols * 8 / K;
-    if ((bits != 4 && bits != 6) || cols * 8 != static_cast<int64_t>(K) * bits) {
+    if ((bits < 3 || bits > 6) || cols * 8 != static_cast<int64_t>(K) * bits) {
         throw std::runtime_error(std::string(fn) +
-                                 ": packed width must be K/2 (4-bit) or 3K/4 (6-bit)");
+                                 ": packed width must be 3K/8, K/2, 5K/8 or 3K/4 (3/4/5/6-bit)");
     }
     if (bits == 6 && (K % 32 != 0 || group_size < 16 || group_size % 16 != 0)) {
         throw std::runtime_error(std::string(fn) +
@@ -1421,6 +1421,17 @@ static int w4a8_bits(const nb::ndarray<>& qdata, int N, int K, int group_size,
     }
     if (bits == 6 && has_codebook) {
         throw std::runtime_error(std::string(fn) + ": 6-bit storage has no codebook");
+    }
+    if ((bits == 3 || bits == 5) &&
+        (K % 64 != 0 || group_size < 16 || group_size % 16 != 0)) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": 3/5-bit storage needs K % 64 == 0 and group_size a multiple of 16");
+    }
+    if (bits == 3 && !has_codebook) {
+        throw std::runtime_error(std::string(fn) + ": 3-bit storage needs its 8-entry codebook");
+    }
+    if (bits == 5 && has_codebook) {
+        throw std::runtime_error(std::string(fn) + ": 5-bit storage has no codebook");
     }
     return static_cast<int>(bits);
 }
@@ -1446,7 +1457,7 @@ void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int 
     require_len(out, static_cast<int64_t>(N) * K, kFn, "out");
     require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
     if (codebook.has_value()) {
-        require_scale_len(*codebook, 16, kFn, "codebook");
+        require_scale_len(*codebook, bits == 3 ? 8 : 16, kFn, "codebook");
     }
 
     launch_dequant_int4_grouped_to_int8_kernel(
@@ -1493,7 +1504,7 @@ void w4a8_int8_gemm_chunked(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<>
     require_scale_len(xs, static_cast<size_t>(M), kFn, "xs");
     require_bias(bias, N, kFn);
     if (codebook.has_value()) {
-        require_scale_len(*codebook, 16, kFn, "codebook");
+        require_scale_len(*codebook, bits == 3 ? 8 : 16, kFn, "codebook");
     }
 
     launch_w4a8_int8_gemm_chunked_kernel(
@@ -1535,7 +1546,7 @@ bool w4a8_codebook_gemv(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<> s_r
     require_scale_len(xs, static_cast<size_t>(M), kFn, "xs");
     require_bias(bias, N, kFn);
     if (codebook.has_value()) {
-        require_scale_len(*codebook, 16, kFn, "codebook");
+        require_scale_len(*codebook, bits == 3 ? 8 : 16, kFn, "codebook");
     }
 
     const bool used = launch_w4a8_codebook_gemv_kernel(
@@ -2863,7 +2874,7 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
                            nb::ndarray<> vscale, float rope_eps, int64_t rot_dim, int64_t t0,
                            int64_t m, int64_t batch, int64_t seq_len, int64_t num_heads,
                            uintptr_t stream_ptr, OptArray block_len = std::nullopt,
-                           int64_t token_aug = 0) {
+                           int64_t token_aug = 0, bool split_half = true) {
     constexpr const char* kFn = "sol_producer_chunk";
     sol_need_extents(batch, seq_len, num_heads, kFn);
     if (batch != 1) throw std::runtime_error(std::string(kFn) + ": the producer path is B=1 only");
@@ -2886,7 +2897,7 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
     sol_need_elems(vscale, batch * num_heads * 128, 0, kFn, "vscale");
     sol_producer_chunk(workspace.data(), qkv.data(), fab.data(), qw.data(), kw.data(),
                        kmean.data(), vscale.data(), opt_data(block_len), rope_eps,
-                       static_cast<int>(rot_dim), static_cast<int>(t0), static_cast<int>(m),
+                       static_cast<int>(rot_dim), split_half, static_cast<int>(t0), static_cast<int>(m),
                        static_cast<int>(batch), static_cast<int>(seq_len),
                        static_cast<int>(num_heads), static_cast<int>(token_aug),
                        reinterpret_cast<hipStream_t>(stream_ptr));
@@ -2948,7 +2959,7 @@ NB_MODULE(_C, m) {
           nb::arg("kmean"), nb::arg("vscale"), nb::arg("rope_eps"), nb::arg("rot_dim"),
           nb::arg("t0"), nb::arg("m"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(),
-          nb::arg("token_aug") = 0);
+          nb::arg("token_aug") = 0, nb::arg("split_half") = true);
     m.def("sol_attn_core", &sol_attn_core_py,
           nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"), nb::arg("kmean_next"),
           nb::arg("vamax_out"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),

@@ -1673,13 +1673,15 @@ def test_wxa8_fused_quantize_realigns_an_offset_weight(hip):
     )
 
 
-@pytest.mark.parametrize(("bits", "group_size"), [(4, 16), (6, 32)])
+@pytest.mark.parametrize(("bits", "group_size"), [(3, 16), (4, 16), (5, 32), (6, 32)])
 def test_wxa8_fused_quantize_stochastic_rounding_is_seeded(hip, bits, group_size):
     """A seed has to reproduce, and two seeds have to disagree, or the draw is not
     doing the job it was added for."""
     w, cb = _requant_inputs(128, 512)
     _requires_fused_requant(hip, w, group_size)
-    kwargs = {"codebook_tensor": cb} if bits == 4 else _W6_KWARGS
+    kwargs = {"bits": bits, "codebook": False, "scale_search": False}
+    if bits in (3, 4):
+        kwargs["codebook_tensor"] = cb if bits == 4 else torch.linspace(-1, 1, 8, device=DEV)
     a = hip.quantize_w4a8_int8_weight(w, group_size, stochastic_rounding=7, **kwargs)[0]
     b = hip.quantize_w4a8_int8_weight(w, group_size, stochastic_rounding=7, **kwargs)[0]
     c = hip.quantize_w4a8_int8_weight(w, group_size, stochastic_rounding=8, **kwargs)[0]
@@ -1863,7 +1865,7 @@ def test_w6a8_linear_matches_int8_linear_on_the_decoded_weight(hip, monkeypatch,
 
 @pytest.mark.parametrize(
     ("cols", "group_size", "codebook", "match"),
-    [(3 * 512 // 8, 16, False, "packed width"),
+    [(512 // 4, 16, False, "packed width"),
      (3 * 512 // 4, 8, False, "6-bit storage needs"),
      (3 * 512 // 4, 16, True, "no codebook")],
     ids=["width", "group", "codebook"],
@@ -1881,6 +1883,73 @@ def test_w6a8_bindings_reject_what_the_layout_cannot_hold(hip, cols, group_size,
             hip._dl(qdata), hip._dl(s_rel), 0, None if cb is None else hip._dl(cb),
             hip._dl(out), n, k, group_size, hip._stream(qdata),
         )
+
+
+@pytest.mark.parametrize(("bits", "group_size"), [(3, 16), (5, 16), (5, 32), (5, 64)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_w3_w5_fused_quantize_matches_eager(hip, monkeypatch, bits, group_size, dtype):
+    w, _ = _requant_inputs(33, 1024, dtype)
+    _requires_fused_requant(hip, w, group_size)
+    kwargs = {"bits": bits, "codebook": False, "scale_search": False}
+    if bits == 3:
+        kwargs["codebook_tensor"] = torch.linspace(-1, 1, 8, device=DEV)
+    ref = eager_w4a8.quantize_w4a8_int8_weight(w, group_size, **kwargs)
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("native W3/W5 quantization fell back to eager")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(hip._eager, "rotate_int8_convrot_weight", refuse)
+        mp.setattr(hip, "_quantize_w4a8_chunked", refuse)
+        out = hip.quantize_w4a8_int8_weight(w, group_size, **kwargs)
+    assert out[0].shape == (33, 1024 * bits // 8)
+    _assert_requant_close(out, ref, w, group_size)
+
+
+@pytest.mark.parametrize(("bits", "group_size"), [(3, 16), (5, 16), (5, 32), (5, 64)])
+@pytest.mark.parametrize("scale_dtype", [torch.float8_e4m3fn, torch.float32])
+@pytest.mark.parametrize("m", [1, 8, 17])
+def test_w3_w5_decode_and_linear_match_int8(hip, monkeypatch, bits, group_size, scale_dtype, m):
+    torch.manual_seed(5)
+    n, k = 193, 512
+    qdata = torch.randint(-128, 128, (n, k * bits // 8), dtype=torch.int8, device=DEV)
+    s_rel = (torch.rand(n, k // group_size, device=DEV) * 3 + 0.25).to(scale_dtype)
+    cb = torch.linspace(-1, 1, 8, device=DEV) if bits == 3 else None
+    decoded = eager_w4a8._dequant_int4_grouped_to_int8(qdata, s_rel, cb, group_size)
+    assert torch.equal(hip._dequant_int4_grouped_to_int8(qdata, s_rel, cb, group_size), decoded)
+
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    scales = torch.rand(n, device=DEV) * 0.02
+    bias = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+    monkeypatch.setattr(hip, "_w4a8_chunk_cols", lambda *_: 128)
+    monkeypatch.setattr(hip, "_int8_convrot_packed_linear", lambda *_: None)
+    taken = []
+    launch = hip._C.w4a8_codebook_gemv
+
+    def record(*args):
+        taken.append(launch(*args))
+        return taken[-1]
+
+    monkeypatch.setattr(hip._C, "w4a8_codebook_gemv", record)
+    got = hip.w4a8_int8_linear(
+        x, qdata, s_rel, scales, codebook=cb, bias=bias, group_size=group_size)
+    ref = hip.int8_linear(x, decoded, scales, bias, convrot=True)
+    assert torch.equal(got, ref)
+    gemv = m <= 8 and scale_dtype == torch.float8_e4m3fn
+    assert taken == ([True] if gemv else [])
+
+
+@pytest.mark.parametrize("levels", [0, 7])
+def test_w3_decode_rejects_missing_or_short_codebook(hip, levels):
+    n, k = 8, 512
+    packed = torch.zeros(n, k * 3 // 8, dtype=torch.int8, device=DEV)
+    scales = torch.ones(n, k // 16, device=DEV)
+    cb = torch.zeros(levels, device=DEV) if levels else None
+    out = torch.empty(n, k, dtype=torch.int8, device=DEV)
+    with pytest.raises(RuntimeError, match="codebook"):
+        hip._C.dequant_int4_grouped_to_int8(
+            hip._dl(packed), hip._dl(scales), 0, None if cb is None else hip._dl(cb),
+            hip._dl(out), n, k, 16, hip._stream(packed))
 
 
 def test_w6a8_layout_linear_dispatches_to_hip():
