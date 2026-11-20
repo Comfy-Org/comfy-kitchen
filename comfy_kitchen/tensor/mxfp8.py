@@ -14,6 +14,7 @@ from .base import (
     QuantizedLayout,
     QuantizedTensor,
     dequantize_args,
+    native_scaled_mm_usable,
     register_layout_op,
 )
 
@@ -156,6 +157,17 @@ def _handle_mxfp8_mm(qt, args, kwargs):
     if a._qdata.dim() != 2:
         return torch.mm(*dequantize_args(args))
 
+    # Decline before dispatching, as the FP8 and NVFP4 handlers do: the native scaled
+    # GEMM does not exist on every part torch.cuda reports as "cuda" (see
+    # native_scaled_mm_usable), and a try/except does not survive torch.compile because
+    # the custom op is traced into the graph and the exception escapes at runtime. This
+    # handler used to reach the op unconditionally and rely on the except, which
+    # also could not have caught it: the refusal this hits is a ValueError about the
+    # block-scale element count, not a RuntimeError or TypeError.
+    if not native_scaled_mm_usable(a._qdata.device.type):
+        logger.debug("MXFP8 mm: no native scaled GEMM here, falling back to dequantize")
+        return torch.mm(*dequantize_args(args))
+
     a_transposed = getattr(a._params, "transposed", False)
     b_transposed = getattr(b._params, "transposed", False)
 
@@ -182,6 +194,13 @@ def _handle_mxfp8_addmm(qt, args, kwargs):
     if not (isinstance(mat1, QuantizedTensor) and isinstance(mat2, QuantizedTensor)):
         return torch.addmm(*dequantize_args((bias, mat1, mat2)))
     if mat1._qdata.dim() != 2:
+        return torch.addmm(*dequantize_args((bias, mat1, mat2)))
+
+    # See _handle_mxfp8_mm: the native scaled GEMM is not available everywhere
+    # torch.cuda reports as "cuda", and a try/except fallback does not survive
+    # torch.compile because the custom op is traced into the graph.
+    if not native_scaled_mm_usable(mat1._qdata.device.type):
+        logger.debug("MXFP8 addmm: no native scaled GEMM here, falling back to dequantize")
         return torch.addmm(*dequantize_args((bias, mat1, mat2)))
 
     input_transposed = getattr(mat1._params, "transposed", False)
@@ -213,6 +232,13 @@ def _handle_mxfp8_linear(qt, args, kwargs):
     if not (isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor)):
         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
     if input_tensor._qdata.dim() != 2:
+        return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
+
+    # See _handle_mxfp8_mm: the native scaled GEMM is not available everywhere
+    # torch.cuda reports as "cuda", and a try/except fallback does not survive
+    # torch.compile because the custom op is traced into the graph.
+    if not native_scaled_mm_usable(input_tensor._qdata.device.type):
+        logger.debug("MXFP8 linear: no native scaled GEMM here, falling back to dequantize")
         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
 
     if getattr(input_tensor._params, "transposed", False) or getattr(weight._params, "transposed", False):

@@ -8,6 +8,7 @@
 
 #include "../device_arch.h"
 #include "../epilogue.h"
+#include "../gemm_gfx10.h"
 #include "../gemm_wmma.h"
 #include "../launchers.h"
 
@@ -56,7 +57,36 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
         gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         return;
     }
-    launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream);
+
+    if (comfy_is_gfx10()) {
+        // RDNA2: no matrix cores, use VALU v_dot4_i32_i8.
+        //
+        // One block per tile, never a persistent walk. The persistent variant
+        // this replaces was 1.14x-1.80x slower on every shape measured on the
+        // 6-CU gfx1035 (256^3 .. 4096x4096x8192), because a fixed grid of
+        // min(tiles, wgps * blocks_per_cu) gives the hardware's own block
+        // scheduler no tiles to overlap: consecutive tiles run back to back on
+        // one CU with a barrier between them. Letting the scheduler stream the
+        // grid is both simpler and faster. See the standalone benchmark notes B5.
+        // Shared with gemm_int8_valu_kernel so the grid cannot drift from the
+        // tile the kernel assumes. See kInt8BM in gemm_gfx10.h.
+        constexpr int BM = kInt8BM;
+        constexpr int BN = kInt8BN;
+        dim3 block(kInt8Threads);
+        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
+        gemm_int8_valu_kernel<OutT><<<grid, block, 0, stream>>>(
+            A, B, epi, C, M, N, K, ldc);
+    } else {
+        // 8-bit operand, and on gfx11 the fragment is a whole 128-bit K-step
+        // (mma.h's MmaInt8 : LdsPad16), so the heuristic may pick the wider thread
+        // tile. Stated here rather than read off the policy type because the
+        // tile choice is host code and only a device pass resolves MmaInt8 to an
+        // architecture -- see GemmPolicy in gemm_wmma.h. Harmless on gfx12, whose
+        // int8 fragment is 8 bytes: that whole branch is inside
+        // `comfy_small_igpu()`.
+        launch_gemm_wmma<MmaInt8, EpiRowwise, OutT>(Au, Bu, C, M, N, K, ldc, epi, stream,
+                                                    GemmPolicy{false, true});
+    }
 }
 
 }  // namespace comfy::hip_backend
@@ -102,6 +132,68 @@ extern "C" void launch_int8_gemm_kernel(
     }
 }
 
+// INT4 on VALU, the int4 counterpart of the above. a and b are signed int4
+// packed two per byte (low nibble = even k), so a row is K / 2 bytes wide and a
+// 16-byte LDS read covers 32 k-values -- hence K must be a multiple of 32.
+//
+// The launcher lives here rather than in gemm_gfx10.h because that header is
+// included by ops/gemm_fp16.hip as well, and a plain extern "C" definition would
+// be emitted into both objects and collide at link time.
+extern "C" void launch_int4_gemm_kernel(
+    const void* a, const void* b, void* c,
+    const void* scale_a, const void* scale_b, int scale_b_stride,
+    const void* bias, int bias_code,
+    int M, int N, int K, int ldc, int out_code, hipStream_t stream) {
+
+    using namespace comfy::hip_backend;
+
+    if (M == 0 || N == 0) {
+        return;
+    }
+    // v_dot8_i32_i4 exists on gfx10 and nowhere else: the stub in gemm_gfx10.h's
+    // !__GFX10__ arm is a trap. This binding is exposed on every target, so a
+    // caller on an RDNA3/4 part would get that trap rather than an answer --
+    // refuse here instead. convrot_w4a4.hip checks comfy_is_gfx10() before
+    // calling, so the only way to land here is a direct call on the wrong device.
+    if (!comfy_is_gfx10()) {
+        throw std::runtime_error("int4_gemm: v_dot8_i32_i4 is gfx10 only");
+    }
+    if (ldc < N) {
+        throw std::runtime_error("int4_gemm: ldc=" + std::to_string(ldc) +
+                                 " is narrower than N=" + std::to_string(N));
+    }
+    // The tile reads a row 16 bytes at a time and each read is 32 k-values, so
+    // the row has to be a whole number of reads. An empty GEMM does no reads, so
+    // this only applies once there is real work above.
+    if (K % 32 != 0) {
+        throw std::runtime_error("int4_gemm: K=" + std::to_string(K) +
+                                 " must be a multiple of 32");
+    }
+
+    EpiRowwise epi{static_cast<const float*>(scale_a), static_cast<const float*>(scale_b),
+                   scale_b_stride, bias, bias_code};
+
+    const int8_t* A = static_cast<const int8_t*>(a);
+    const int8_t* B = static_cast<const int8_t*>(b);
+
+    // One block per tile, the same grid launch_int8 settled on.
+    dim3 block(kInt8Threads);
+    dim3 grid((N + kInt8BN - 1) / kInt8BN, (M + kInt8BM - 1) / kInt8BM);
+
+    if (out_code == kBF16) {
+        gemm_int4_valu_kernel<__bf16><<<grid, block, 0, stream>>>(A, B, epi,
+                                                                  static_cast<__bf16*>(c), M, N, K, ldc);
+    } else if (out_code == kF16) {
+        gemm_int4_valu_kernel<__half><<<grid, block, 0, stream>>>(A, B, epi,
+                                                                 static_cast<__half*>(c), M, N, K, ldc);
+    } else if (out_code == kF32) {
+        gemm_int4_valu_kernel<float><<<grid, block, 0, stream>>>(A, B, epi,
+                                                                 static_cast<float*>(c), M, N, K, ldc);
+    } else {
+        throw std::runtime_error("int4_gemm: unsupported output dtype");
+    }
+}
+
 namespace comfy::hip_backend {
 
 // Two 128-row activation tiles share one weight tile. Each half of the block
@@ -113,7 +205,7 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
     __bf16* __restrict__ C, int M, int N, int K, int ldc, Epi epi) {
     #pragma clang fp contract(off)
     #pragma clang fp reassociate(off)
-    constexpr int BM = 128, BN = 128, BK = 128, stride = BK + kLdsPad;
+    constexpr int BM = 128, BN = 128, BK = 128, stride = BK + MmaInt8::kLdsPad;
     constexpr int TM = 2, TN = 4, steps = BK / MmaInt8::kStepBytes;
     __shared__ __align__(16) uint8_t As[2][BM * stride];
     __shared__ __align__(16) uint8_t Bs[BN * stride];
@@ -142,8 +234,8 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
         #pragma unroll
         for (int j = 0; j < TN; ++j) acc[i][j] = MmaInt8::zero();
 
-    TileStager<BM, BK, 512, true> sa0, sa1;
-    TileStager<BN, BK, 512> sb;
+    TileStager<BM, BK, 512, MmaInt8::kLdsPad, true> sa0, sa1;
+    TileStager<BN, BK, 512, MmaInt8::kLdsPad> sb;
     const int64_t tile0 = static_cast<int64_t>(pair * 2) * (K / BK);
     const int64_t tile1 = tile0 + K / BK;
     sa0.load_contiguous(A + tile0 * BM * BK);
