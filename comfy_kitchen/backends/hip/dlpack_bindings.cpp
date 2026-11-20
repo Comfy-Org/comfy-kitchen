@@ -499,7 +499,8 @@ void rms_gated_residual_bf16(
 void int8_gemm_a_tiled128(
     nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
     nb::ndarray<> scale_a, nb::ndarray<> scale_b, int scale_b_stride,
-    OptArray bias, int M, int N, int K, int out_code, uintptr_t stream_ptr) {
+    OptArray bias, int M, int N, int K, int out_code, uintptr_t stream_ptr,
+    int b_tiled) {
     constexpr const char* kFn = "int8_gemm_a_tiled128";
     if (scale_b_stride != 0 && scale_b_stride != 1) {
         throw std::runtime_error(std::string(kFn) +
@@ -512,6 +513,10 @@ void int8_gemm_a_tiled128(
         throw std::runtime_error(
             std::string(kFn) +
             ": requires positive N/K and K divisible by 128");
+    }
+    if (b_tiled && N % 256 != 0) {
+        throw std::runtime_error(
+            std::string(kFn) + ": tiled B requires N divisible by 256");
     }
     require_dtype(a, 4, 4, kFn, "a");
     require_dtype(b, 4, 4, kFn, "b");
@@ -529,7 +534,7 @@ void int8_gemm_a_tiled128(
     launch_int8_gemm_a_tiled128_kernel(
         a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
         scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N,
-        out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+        out_code, b_tiled, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -3377,7 +3382,11 @@ NB_MODULE(_C, m) {
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
     m.def("rms_gated_residual_bf16", &rms_gated_residual_bf16);
-    m.def("int8_gemm_a_tiled128", &int8_gemm_a_tiled128);
+    m.def("int8_gemm_a_tiled128", &int8_gemm_a_tiled128,
+          nb::arg("a"), nb::arg("b"), nb::arg("c"), nb::arg("scale_a"),
+          nb::arg("scale_b"), nb::arg("scale_b_stride"), nb::arg("bias"),
+          nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("out_code"),
+          nb::arg("stream_ptr"), nb::arg("b_tiled") = 0);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
     m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
           nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),

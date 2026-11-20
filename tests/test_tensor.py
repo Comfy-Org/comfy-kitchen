@@ -52,6 +52,7 @@ def test_gemv_optimization_unsupported(layout):
     weight = QuantizedTensor.from_float(torch.randn(32, 256, dtype=torch.bfloat16), layout)
     storage = torch.full((64,), 73, dtype=torch.uint8)
     assert weight.optimize_for_gemv(storage) is weight
+    assert weight.optimize_for_gemm(storage) is weight
     assert torch.all(storage == 73)
 
 
