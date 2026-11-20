@@ -33,6 +33,7 @@ __all__ = [
 import torch
 
 from comfy_kitchen.constraints import (
+    INT8_EXCLUDED_COMPUTE_CAPABILITIES,
     ExactDims,
     FunctionConstraints,
     ParamConstraint,
@@ -248,6 +249,7 @@ def _build_constraints() -> dict:
             },
             default_devices=triton_devices,
             min_compute_capability=(8, 0),  # Required for Triton INT8 dot
+            excluded_compute_capabilities=INT8_EXCLUDED_COMPUTE_CAPABILITIES,
         ),
         "w4a8_int8_linear": FunctionConstraints(
             params={
@@ -264,6 +266,7 @@ def _build_constraints() -> dict:
             },
             default_devices=triton_devices,
             min_compute_capability=(8, 0),  # Required for Triton INT8 dot
+            excluded_compute_capabilities=INT8_EXCLUDED_COMPUTE_CAPABILITIES,
         ),
         "quantize_int8_rowwise": FunctionConstraints(
             params={
