@@ -1,4 +1,5 @@
 __all__ = [
+    "act_cat_quantize_fp8",
     "adaln",
     "rms_gated_residual",
     "fp16_conv3d",
@@ -76,6 +77,7 @@ from comfy_kitchen.constraints import (
 )
 from comfy_kitchen.registry import registry
 
+from .act_cat_quant import act_cat_quantize_fp8
 from .adaln import adaln, rms_adaln
 from .awq import gemv_awq_w4a16
 from .conv3d import fp16_conv3d, fp16_conv3d_out
@@ -203,6 +205,18 @@ def _build_constraints() -> dict:
                 ),
                 "scale": ParamConstraint(dtypes=standard_floats),
                 "output_type": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "act_cat_quantize_fp8": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "h": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "act": ParamConstraint(dtypes=frozenset({str})),
+                "output_type": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn, torch.float8_e5m2}),
+                ),
             },
             default_devices=all_devices,
         ),
