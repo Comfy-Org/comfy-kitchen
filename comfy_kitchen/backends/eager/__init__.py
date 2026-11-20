@@ -6,6 +6,7 @@ __all__ = [
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
     "group_norm_stats3d",
+    "flow_warp_cat",
     "na3d",
     "window_attention",
     "sol_attn",
@@ -85,6 +86,7 @@ from .convrot_w4a4 import (
     prepare_int4_weight_for_int8_linear,
     quantize_convrot_w4a4_weight,
 )
+from .flow_warp_cat import flow_warp_cat
 from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out, group_norm_stats3d
 from .na import na3d, window_attention
 from .quantization import (
@@ -703,6 +705,14 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
         call_rules=(window_attention_common_call_rule,),
+    )
+    out["flow_warp_cat"] = FunctionConstraints(
+        params={
+            "grid_x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(1),)),
+            "grid_y": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(1),)),
+            "prefix": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(4),)),
+        },
+        default_devices=all_devices,
     )
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
