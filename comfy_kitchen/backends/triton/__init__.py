@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "qk_layernorm_kv_interleaved",
 ]
 
 # Try to import triton and register if available
@@ -55,6 +56,7 @@ try:
 
     from .adaln import adaln, rms_adaln
     from .na import na3d
+    from .qk_layernorm_kv_interleaved import qk_layernorm_kv_interleaved
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
@@ -125,6 +127,29 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _qk_layernorm_kv_interleaved_call_rule(kwargs):
+        # No size threshold: every call that passes the checks below goes to the kernel.
+        names = ("q", "kv", "q_weight", "q_bias", "k_weight", "k_bias")
+        tensors = [kwargs.get(n) for n in names]
+        heads = kwargs.get("heads")
+        if any(t is None for t in tensors) or heads is None:
+            return ValidationResult.ok()
+        q, kv = tensors[0], tensors[1]
+        if any(t.device != q.device for t in tensors):
+            return ValidationResult.fail("q", "all tensors must be on one device")
+        bs, n_ctx, channels = q.shape
+        n_data = kv.shape[1]
+        if bs == 0 or n_ctx == 0 or n_data == 0:
+            return ValidationResult.fail("q", "empty inputs are not supported by triton")
+        # the statistics follow torch's layer_norm kernel order for head_dim 64
+        if channels != heads * 64:
+            return ValidationResult.fail("q", "head_dim must be 64")
+        if any(not t.is_contiguous() for t in tensors):
+            return ValidationResult.fail("q", "q, kv, weights and biases must be contiguous")
+        if bs * max(n_ctx, n_data) * heads >= 2**31:
+            return ValidationResult.fail("q", "q and k must have fewer than 2**31 rows")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -336,6 +361,19 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
+    out["qk_layernorm_kv_interleaved"] = FunctionConstraints(
+        params={
+            name: ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(3),))
+            for name in ("q", "kv")
+        }
+        | {
+            name: ParamConstraint(dtypes=frozenset({torch.float16}), shape_rules=(ExactDims(1),))
+            for name in ("q_weight", "q_bias", "k_weight", "k_bias")
+        },
+        default_devices=cuda_devices,
+        call_rules=(_qk_layernorm_kv_interleaved_call_rule,),
     )
     return out
 

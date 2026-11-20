@@ -7,6 +7,7 @@ __all__ = [
     "group_norm_silu_pad3d_out",
     "group_norm_stats3d",
     "na3d",
+    "qk_layernorm_kv_interleaved",
     "window_attention",
     "sol_attn",
     "rms_adaln",
@@ -87,6 +88,7 @@ from .convrot_w4a4 import (
 )
 from .group_norm_pad3d import group_norm_silu_pad3d, group_norm_silu_pad3d_out, group_norm_stats3d
 from .na import na3d, window_attention
+from .qk_layernorm_kv_interleaved import qk_layernorm_kv_interleaved
 from .quantization import (
     dequantize_int8_convrot_weight,
     dequantize_int8_convrot_weight_dtype,
@@ -703,6 +705,13 @@ def _build_constraints() -> dict:
         },
         default_devices=all_devices,
         call_rules=(window_attention_common_call_rule,),
+    )
+    out["qk_layernorm_kv_interleaved"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(3),)),
+            "kv": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(3),)),
+        },
+        default_devices=all_devices,
     )
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in out:
