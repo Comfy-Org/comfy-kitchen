@@ -336,15 +336,6 @@ def sol_attn_common_call_rule(kwargs):
     return ValidationResult.ok()
 
 
-def sol_attn_same_length_call_rule(kwargs):
-    """For a ``sol_attn`` backend whose kernels take one sequence length (after
-    the common rule, which then leaves q_offset 0 only)."""
-    q, k = kwargs.get("q"), kwargs.get("k")
-    if q is not None and k is not None and tuple(k.shape) != tuple(q.shape):
-        return ValidationResult.fail("k", "this backend needs k and v as long as q")
-    return ValidationResult.ok()
-
-
 def na3d_common_call_rule(kwargs):
     """Shared ``na3d`` validation (used by every backend's entry).
 

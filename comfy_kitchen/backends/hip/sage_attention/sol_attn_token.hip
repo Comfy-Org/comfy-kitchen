@@ -65,16 +65,16 @@ __forceinline__ __device__ float hist_edge(int b) {
 // per group of kTokGroup query blocks: centroid (quantized like the producer's),
 // best unrouted pooled score, and the blocks unrouted by every member
 __global__ __launch_bounds__(HD) void sol_token_group_kernel(
-    const float* __restrict__ qmean,    // [B*H, NPAD, HD]
+    const float* __restrict__ qmean,    // [B*H, NQ, HD]
     const float* __restrict__ tok_ref,  // [B*H, NQ]
     const uint32_t* __restrict__ bits,  // [B*H, NQ, W] unrouted
     int8_t* __restrict__ gcen8, float* __restrict__ gcens, float* __restrict__ gref,
-    uint32_t* __restrict__ gbits, int NQ, int NPAD, int NG, int W) {
+    uint32_t* __restrict__ gbits, int NQ, int NG, int W) {
     __shared__ __attribute__((aligned(16))) float sred[HD];
     const int grp = blockIdx.x, bh = blockIdx.y, d = threadIdx.x;
     const int qb0 = grp * kTokGroup, qb1 = imin(NQ, qb0 + kTokGroup);
     float c = 0.f;
-    for (int qb = qb0; qb < qb1; ++qb) c += qmean[(static_cast<size_t>(bh) * NPAD + qb) * HD + d];
+    for (int qb = qb0; qb < qb1; ++qb) c += qmean[(static_cast<size_t>(bh) * NQ + qb) * HD + d];
     c /= static_cast<float>(qb1 - qb0);
     const float csc = fmaxf(block_max128(fabsf(c), sred) / 127.0f, 1e-8f);
     const size_t gs = static_cast<size_t>(bh) * NG + grp;
@@ -471,7 +471,7 @@ void launch_sol_token(const void* qmean, const void* tok_ref, const void* cand_b
                       const void* vT, void* tok_tiles, void* tok_tilecnt, void* tok_hist,
                       void* tok_idx, void* tok_cnt, void* part_o, void* part_m, void* part_l,
                       void* o_part, void* m_part, void* l_part, int B, int Tp, int H, int NQ,
-                      int NPAD, int NTB, int n_tok, int tail, int sink_q_start, int sink_q_end,
+                      int NTB, int n_tok, int tail, int sink_q_start, int sink_q_end,
                       float scale_log2, hipStream_t stream) {
     const int bh = B * H;
     const int W = (NTB + 31) / 32;
@@ -483,7 +483,7 @@ void launch_sol_token(const void* qmean, const void* tok_ref, const void* cand_b
         static_cast<const float*>(qmean), static_cast<const float*>(tok_ref),
         static_cast<const uint32_t*>(cand_bits), static_cast<int8_t*>(gcen8),
         static_cast<float*>(gcens), static_cast<float*>(gref), static_cast<uint32_t*>(gbits), NQ,
-        NPAD, NG, W);
+        NG, W);
     sol_token_tiles_kernel<<<dim3(nctas, bh), 128, 0, stream>>>(
         static_cast<const uint32_t*>(gbits), static_cast<uint16_t*>(tok_tiles),
         static_cast<int32_t*>(tok_tilecnt), NG, NTB, W);

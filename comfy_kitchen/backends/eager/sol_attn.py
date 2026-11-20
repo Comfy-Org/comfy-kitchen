@@ -167,7 +167,7 @@ def sol_attn(
             f"{score_bytes / 2**30:.1f} GiB for the score tensor at "
             f"(B={b}, H={h}, T={t}, Tk={tk}). It was selected because no fused backend "
             f"accepted these inputs -- the fused backends take bfloat16 or float16 "
-            f"with head_dim 128 (HIP also needs k and v as long as q), and got "
+            f"with head_dim 128, and got "
             f"{q.dtype} on {q.device.type}."
         )
 
