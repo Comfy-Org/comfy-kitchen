@@ -145,7 +145,7 @@ def test_hip_rejects_nonfinite_points(bad):
 def test_hip_bindings_reject_undersized_and_wrong_dtype_buffers():
     from comfy_kitchen.backends import hip
 
-    w, c = hip._dl, hip._C
+    w, c = hip._dl, hip._geometry_ext(torch.device("cuda"))
     stream = torch.cuda.current_stream().cuda_stream
     pt = torch.zeros(4, dtype=torch.int32).cuda()
     with pytest.raises(RuntimeError, match="pt_prio has 3 elements"):
