@@ -21,5 +21,8 @@
   "wmma_gfx12": [
     "gfx1200",
     "gfx1201"
+  ],
+  "geometry_only": [
+    "gfx942"
   ]
 }

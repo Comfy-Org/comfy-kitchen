@@ -215,7 +215,7 @@ def test_hip_binding_rejects_undersized_buffers():
 
     def launch(**over):
         a = {**good, **over}
-        hip._C.edge_collapse_checks(w(verts), w(faces), w(a["offsets"]), w(a["cursor"]), w(a["fan"]), w(edges), w(verts[:1]),
+        hip._geometry_ext(torch.device("cuda")).edge_collapse_checks(w(verts), w(faces), w(a["offsets"]), w(a["cursor"]), w(a["fan"]), w(edges), w(verts[:1]),
                                     3, 1, 0.0, w(a["flips"]), w(a["skinny"]), w(a["link_ok"]),
                                     torch.cuda.current_stream().cuda_stream)
 

@@ -22,16 +22,21 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _HIP_DIR = _ROOT / "comfy_kitchen" / "backends" / "hip"
 _HIP_CMAKE = _HIP_DIR / "CMakeLists.txt"
 _HIP_ARCH_MANIFEST = _HIP_DIR / "architectures.json"
-_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
+_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12", "geometry_only")
+_HIP_FULL_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
+_GEOMETRY_OPS = {
+    "delaunay3d", "mesh_bvh", "closest_point_on_mesh", "closest_hit_on_mesh",
+    "connected_components", "edge_collapse_checks", "min_cut",
+}
 
 
 def _architecture_groups() -> dict[str, list[str]]:
     return json.loads(_HIP_ARCH_MANIFEST.read_text(encoding="utf-8"))
 
 
-def _manifest_archs() -> list[str]:
+def _manifest_archs(group_names=_HIP_ARCH_GROUP_NAMES) -> list[str]:
     groups = _architecture_groups()
-    return [arch for group_name in _HIP_ARCH_GROUP_NAMES for arch in groups[group_name]]
+    return [arch for group_name in group_names for arch in groups[group_name]]
 
 
 def test_non_rocm_runtime_does_not_import_hip_backend():
@@ -94,9 +99,111 @@ def test_hip_declines_unsupported_arch(arches):
     assert hip_backend._unsupported_arch_reason(arches) is not None
 
 
-@pytest.mark.parametrize("arch", _manifest_archs())
+@pytest.mark.parametrize("arch", _manifest_archs(_HIP_FULL_GROUP_NAMES))
 def test_hip_accepts_every_manifest_target(arch):
     assert hip_backend._unsupported_arch_reason([arch]) is None
+
+
+@pytest.mark.parametrize("arch", _manifest_archs(("geometry_only",)))
+def test_geometry_only_targets_get_only_the_geometry_ops(arch, monkeypatch):
+    """CDNA runs wave64 only: the full backend declines it, the geometry kernels do not."""
+    monkeypatch.setattr(hip_backend, "_GEOM", object())
+    assert hip_backend._unsupported_arch_reason([arch]) is not None
+    assert hip_backend._geometry_unsupported_reason([arch]) is None
+    assert not hip_backend._has_wmma([arch])
+
+
+def test_geometry_ops_need_the_extension_for_every_device(monkeypatch):
+    rdna, cdna = _manifest_archs(("wmma_gfx11",))[0], _manifest_archs(("geometry_only",))[0]
+    monkeypatch.setattr(hip_backend, "_GEOM", None)
+    monkeypatch.setattr(hip_backend, "_C", object())
+    assert hip_backend._geometry_unsupported_reason([cdna]) is not None
+    assert hip_backend._geometry_unsupported_reason([rdna]) is None
+    monkeypatch.setattr(hip_backend, "_GEOM", object())
+    assert hip_backend._geometry_unsupported_reason([rdna, cdna]) is None
+    monkeypatch.setattr(hip_backend, "_C", None)
+    assert hip_backend._geometry_unsupported_reason([rdna, cdna]) is not None
+    assert hip_backend._geometry_unsupported_reason([cdna]) is None
+
+
+@pytest.mark.parametrize("arches", [[], [None], ["gfx90a"], ["gfx942", "gfx90a"], ["gfx942", None]])
+def test_geometry_ops_decline_unreviewed_or_unknown_targets(arches, monkeypatch):
+    monkeypatch.setattr(hip_backend, "_GEOM", object())
+    monkeypatch.setattr(hip_backend, "_C", object())
+    assert hip_backend._geometry_unsupported_reason(arches) is not None
+
+
+def test_geometry_kernels_come_from_the_extension_built_for_the_device(monkeypatch):
+    geom, full = object(), object()
+    monkeypatch.setattr(hip_backend, "_GEOM", geom)
+    monkeypatch.setattr(hip_backend, "_C", full)
+    cdna, rdna = _manifest_archs(("geometry_only",))[0], _manifest_archs(("wmma_gfx12",))[0]
+    monkeypatch.setattr(hip_backend, "_gfx_arch", lambda device=None: cdna if device == "cdna" else rdna)
+    assert hip_backend._geometry_ext("cdna") is geom
+    assert hip_backend._geometry_ext("rdna") is full
+
+
+def test_geometry_wrappers_do_not_call_the_wave32_extension_directly():
+    tree = ast.parse((_HIP_DIR / "__init__.py").read_text(encoding="utf-8"))
+    wrappers = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in _GEOMETRY_OPS}
+    assert set(wrappers) == _GEOMETRY_OPS
+    for name, node in wrappers.items():
+        direct = [n for n in ast.walk(node) if isinstance(n, ast.Attribute)
+                  and isinstance(n.value, ast.Name) and n.value.id == "_C"]
+        assert not direct, f"{name} calls _C directly; use _geometry_ext(...)"
+
+
+
+class _FakeGpuTensor:
+    """Stands in for a GPU destination on CPU-only runners; memmove only reads .device."""
+
+    def __init__(self, data):
+        self.device = torch.device("cuda")
+        self.data = data
+
+    def copy_(self, src):
+        self.data.copy_(src)
+
+
+@pytest.mark.parametrize("full_hip", [True, False])
+def test_memmove_uses_the_native_kernel_only_with_the_full_hip_extension(monkeypatch, full_hip):
+    """A geometry-only registration (wave64 CDNA: _geom, no _C) keeps the copy fallback."""
+    import comfy_kitchen as ck
+
+    native_calls = []
+    monkeypatch.setattr(torch.version, "hip", "7.2", raising=False)
+    monkeypatch.setattr(ck.registry, "is_available", lambda name: name == "hip")
+    monkeypatch.setattr(ck, "_hip_backend", hip_backend, raising=False)
+    monkeypatch.setattr(hip_backend, "is_available", lambda: full_hip)
+    monkeypatch.setattr(ck, "_memmove_", lambda dst, src: native_calls.append((dst, src)))
+
+    src = torch.arange(8.0)
+    dst = _FakeGpuTensor(torch.zeros(8))
+    ck.memmove(dst, src)
+    if full_hip:
+        assert len(native_calls) == 1
+    else:
+        assert not native_calls
+        assert torch.equal(dst.data, src)
+
+def test_cdna_registers_only_the_geometry_ops(monkeypatch):
+    calls = {}
+
+    class FakeRegistry:
+        def register(self, name, module, capabilities):
+            calls["register"] = set(capabilities)
+
+        def mark_unavailable(self, name, reason):
+            calls["unavailable"] = reason
+
+    # the package attribute comfy_kitchen.registry is the registry object, not the module
+    monkeypatch.setattr(sys.modules["comfy_kitchen.registry"], "registry", FakeRegistry())
+    monkeypatch.setattr(hip_backend, "_GEOM", object())
+    monkeypatch.setattr(torch.version, "hip", "7.2", raising=False)
+    monkeypatch.setattr(hip_backend, "_visible_gfx_arches", lambda: tuple(_manifest_archs(("geometry_only",))))
+    monkeypatch.delenv("COMFY_KITCHEN_DISABLE_HIP", raising=False)
+    hip_backend._register()
+    assert calls == {"register": _GEOMETRY_OPS}
 
 
 @pytest.mark.parametrize(
@@ -275,7 +382,8 @@ def test_architecture_manifest_is_unique_and_shared_by_setup_and_runtime():
     assert set(groups["wmma_gfx12"]) == hip_backend._ARCH_WMMA_GFX12
     assert "gfx1200" in groups["wmma_gfx12"]
     assert "gfx1201" in groups["wmma_gfx12"]
-    assert set(manifest_archs) == hip_backend._ARCH_SUPPORTED
+    assert set(groups["geometry_only"]) == hip_backend._ARCH_GEOMETRY_ONLY
+    assert set(_manifest_archs(_HIP_FULL_GROUP_NAMES)) == hip_backend._ARCH_SUPPORTED
 
 
 def test_setup_architecture_check_is_exact_and_fail_closed():
@@ -334,12 +442,33 @@ def test_hip_kernels_are_independent_of_the_python_extension_target():
     """Keep expensive HIP objects reusable across the CPython wheel matrix."""
     text = _HIP_CMAKE.read_text(encoding="utf-8")
 
-    assert "add_library(comfy_kitchen_hip_kernels OBJECT ${HIP_SOURCES})" in text
-    assert "target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_hip_kernels>)" in text
+    assert "add_library(${target} OBJECT ${ARGN})" in text
+    assert "target_sources(${name} PRIVATE $<TARGET_OBJECTS:${kernels}>)" in text
+    assert re.search(r"_ck_add_kernels\(comfy_kitchen_hip_kernels \S+ \$\{HIP_SOURCES\}\)", text)
+    assert re.search(r"_ck_add_extension\(_C comfy_kitchen_hip_kernels \$\{CPP_SOURCES\}\)", text)
 
     module_calls = re.findall(r"nanobind_add_module\((.*?)\)", text, re.DOTALL)
     assert module_calls
     assert all("${HIP_SOURCES}" not in call for call in module_calls)
+    assert all("${GEOMETRY_HIP_SOURCES}" not in call for call in module_calls)
+
+
+def test_cmake_builds_wave64_targets_only_the_geometry_kernels():
+    """CDNA cannot run wave32; only the wavefront-agnostic geometry kernels go to _geom."""
+    text = _HIP_CMAKE.read_text(encoding="utf-8")
+
+    assert "if(_arch IN_LIST COMFY_HIP_GEOMETRY_ARCHS)" in text
+    assert re.search(
+        r"_ck_add_kernels\(comfy_kitchen_hip_geometry_kernels \S+ \$\{GEOMETRY_HIP_SOURCES\}\)", text
+    )
+    assert "_ck_add_extension(_geom comfy_kitchen_hip_geometry_kernels geometry_module.cpp geometry_bindings.cpp)" in text
+    # the wave32 flag goes on the full kernel set only
+    assert text.count("-mno-wavefrontsize64") == 1
+    assert re.search(r"target_compile_options\(comfy_kitchen_hip_kernels PRIVATE \$<\$<COMPILE_LANGUAGE:HIP>:"
+                     r"-mno-wavefrontsize64>\)", text)
+    geometry = re.search(r"set\(GEOMETRY_HIP_SOURCES\n(.*?)\)", text, re.DOTALL).group(1).split()
+    full = re.search(r"set\(HIP_SOURCES\n(.*?)\)", text, re.DOTALL).group(1).split()
+    assert set(geometry) <= set(full)
 
 
 def test_combined_wheel_cache_keys_include_hip_sources():

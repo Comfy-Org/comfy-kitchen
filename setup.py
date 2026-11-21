@@ -310,7 +310,7 @@ def get_cuda_path() -> tuple[pathlib.Path, pathlib.Path] | None:
 # Keep build-time, CMake, and runtime architecture policy in one package resource.
 # Exact membership is intentional: accepting an unreviewed gfx11xx/gfx12xx target
 # can compile the no-WMMA trap stubs into an otherwise successful wheel.
-HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
+HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12", "geometry_only")
 HIP_ARCH_MANIFEST_PATH = (
     pathlib.Path(__file__).resolve().parent
     / "comfy_kitchen"
@@ -551,8 +551,9 @@ def setup_hip_extension() -> CMakeExtension | None:
     print(f"Found HIP compiler: {hip_compiler}")
 
     # RDNA2 has no matrix cores, so it gets the elementwise kernels only; the GEMMs
-    # need the gfx11 or gfx12 WMMA intrinsics. Everything below RDNA2 (and CDNA,
-    # which uses MFMA rather than WMMA) has no path through these sources at all.
+    # need the gfx11 or gfx12 WMMA intrinsics. CDNA runs wave64 only, so the
+    # geometry_only targets get just the wavefront-agnostic geometry kernels (_geom).
+    # Everything below RDNA2 has no path through these sources at all.
     archs = get_hip_archs_override()
     if archs:
         unsupported = [arch for arch in archs if not hip_arch_supported(arch)]
@@ -568,7 +569,7 @@ def setup_hip_extension() -> CMakeExtension | None:
             archs = [arch for arch in detected if hip_arch_supported(arch)]
             if not archs:
                 message = (
-                    f"Visible AMD GPUs ({';'.join(detected)}) are not RDNA2/3/4; "
+                    f"Visible AMD GPUs ({';'.join(detected)}) are not supported targets; "
                     "these kernels would not run on them."
                 )
                 if BUILD_HIP:
