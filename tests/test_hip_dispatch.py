@@ -153,6 +153,39 @@ def test_geometry_wrappers_do_not_call_the_wave32_extension_directly():
         assert not direct, f"{name} calls _C directly; use _geometry_ext(...)"
 
 
+
+class _FakeGpuTensor:
+    """Stands in for a GPU destination on CPU-only runners; memmove only reads .device."""
+
+    def __init__(self, data):
+        self.device = torch.device("cuda")
+        self.data = data
+
+    def copy_(self, src):
+        self.data.copy_(src)
+
+
+@pytest.mark.parametrize("full_hip", [True, False])
+def test_memmove_uses_the_native_kernel_only_with_the_full_hip_extension(monkeypatch, full_hip):
+    """A geometry-only registration (wave64 CDNA: _geom, no _C) keeps the copy fallback."""
+    import comfy_kitchen as ck
+
+    native_calls = []
+    monkeypatch.setattr(torch.version, "hip", "7.2", raising=False)
+    monkeypatch.setattr(ck.registry, "is_available", lambda name: name == "hip")
+    monkeypatch.setattr(ck, "_hip_backend", hip_backend, raising=False)
+    monkeypatch.setattr(hip_backend, "is_available", lambda: full_hip)
+    monkeypatch.setattr(ck, "_memmove_", lambda dst, src: native_calls.append((dst, src)))
+
+    src = torch.arange(8.0)
+    dst = _FakeGpuTensor(torch.zeros(8))
+    ck.memmove(dst, src)
+    if full_hip:
+        assert len(native_calls) == 1
+    else:
+        assert not native_calls
+        assert torch.equal(dst.data, src)
+
 def test_cdna_registers_only_the_geometry_ops(monkeypatch):
     calls = {}
 
