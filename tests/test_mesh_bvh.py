@@ -322,7 +322,7 @@ def test_hip_rejects_non_float32_inputs():
 def test_hip_bindings_reject_undersized_and_wrong_dtype_buffers():
     from comfy_kitchen.backends import hip
 
-    w, c = hip._dl, hip._C
+    w, c = hip._dl, hip._geometry_ext(torch.device("cuda"))
     stream = torch.cuda.current_stream().cuda_stream
     tris = torch.tensor([[[0, 0, 0], [1, 0, 0], [0, 1, 0.0]]]).cuda()
     bvh = hip.mesh_bvh(tris)

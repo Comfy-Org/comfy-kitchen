@@ -78,7 +78,7 @@ def test_rejects_bad_input():
 def test_hip_binding_rejects_undersized_and_wrong_dtype_buffers():
     from comfy_kitchen.backends import hip
 
-    w, launch = hip._dl, hip._C.connected_components
+    w, launch = hip._dl, hip._geometry_ext(torch.device("cuda")).connected_components
     edges = torch.tensor([[0, 1]], dtype=torch.int32).cuda()
     parent = torch.arange(2, dtype=torch.int32).cuda()
     labels = torch.empty(2, dtype=torch.int64).cuda()
