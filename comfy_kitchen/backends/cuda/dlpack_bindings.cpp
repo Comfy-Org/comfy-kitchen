@@ -25,6 +25,7 @@
 #include <tuple>
 
 #include "cublaslt_runtime.h"
+#include "group_norm_config.h"
 #include "input_act_codes.h"
 
 namespace nb = nanobind;
@@ -124,6 +125,13 @@ extern "C" {
         int input_dtype_code,
         bool hi_first,
         cudaStream_t stream);
+
+    bool try_launch_rope_gqa(
+        const void* q, const void* k, const void* freqs,
+        const void* q_scale, const void* k_scale, void* q_out, void* k_out,
+        int64_t batch, int64_t heads, int64_t k_heads, int64_t tokens, int64_t head_dim,
+        bool bnhd, bool split_half, bool fp32_weights, float epsilon,
+        int input_dtype, bool rms, cudaStream_t stream);
 
     void launch_rms_rope_kernel(
         const void* q,
@@ -276,13 +284,14 @@ extern "C" {
 
     // Sol-Attn sparse attention — see sage_attention/sol_attn.cu.
     extern const char* const sol_attn_plan_names[];   // null-terminated
-    int sol_attn_plan(int batch, int seq_len, int num_heads, int n_tok, int64_t* out, int cap);
+    int sol_attn_plan(int batch, int seq_len, int key_len, int num_heads, int n_tok,
+                      int64_t* out, int cap);
     void sol_producer_begin(void* workspace, int batch, int seq_len,
                             int num_heads, int n_tok, cudaStream_t stream);
     void sol_producer_chunk(
         void* workspace, const void* qkv, const void* fab,
         const void* qw, const void* kw, const void* kmean, const void* vscale,
-        const void* blen, float rope_eps, int rot_dim, int t0, int M,
+        const void* blen, float rope_eps, int rot_dim, bool split_half, int t0, int M,
         int batch, int seq_len, int num_heads, int n_tok, cudaStream_t stream);
     void launch_sol_attn_core(
         void* workspace, void* out, const void* vscale, void* kmean_next, void* vamax_out,
@@ -293,10 +302,10 @@ extern "C" {
         int n_tok, cudaStream_t stream);
     void launch_sol_attn(
         const void* q, const void* k, const void* v, void* out, void* workspace,
-        int batch, int seq_len, int num_heads, int head_dim, int elem,
+        int batch, int seq_len, int key_len, int num_heads, int head_dim, int elem,
         float tau, float scale, const void* key_bias,
         const void* ext_threshold, const void* blen, int tail,
-        int sink_start, int sink_end, int sink_q_start, int sink_q_end,
+        int sink_start, int sink_end, int sink_q_start, int sink_q_end, int q_offset,
         int64_t qs_b, int64_t qs_t, int64_t qs_h,
         int64_t ks_b, int64_t ks_t, int64_t ks_h,
         int64_t vs_b, int64_t vs_t, int64_t vs_h,
@@ -699,6 +708,22 @@ void apply_rope(
         throw std::runtime_error("Output shape must match input shape");
     }
 
+    // Get input dtype code
+    int input_dtype_code = map_dtype_to_code(xq.dtype());
+    int output_dtype_code = map_dtype_to_code(xq_out.dtype());
+    if ((input_dtype_code != 1 && input_dtype_code != 2) ||
+        output_dtype_code != input_dtype_code) {
+        throw std::runtime_error(
+            "apply_rope inputs and outputs must share an FP16/BF16 dtype");
+    }
+
+    // Get freqs dtype code
+    int freqs_dtype_code = map_dtype_to_code(freqs.dtype());
+    if (freqs_dtype_code < 0 || freqs_dtype_code > 2) {
+        throw std::runtime_error(
+            "apply_rope frequencies must be FP32, FP16, or BF16");
+    }
+
     // Handle optional xk and xk_out
     bool has_xk = !xk_obj.is_none();
     bool has_xk_out = !xk_out_obj.is_none();
@@ -716,18 +741,46 @@ void apply_rope(
         auto xk = nb::cast<nb::ndarray<nb::device::cuda>>(xk_obj);
         auto xk_out = nb::cast<nb::ndarray<nb::device::cuda>>(xk_out_obj);
         
-        if (xk.ndim() != 4 ||
-            xk.shape(0) != batch || xk.shape(1) != dim1 ||
-            xk.shape(2) != dim2 || xk.shape(3) != head_dim) {
-            throw std::runtime_error("xk shape must match xq shape");
+        if (xk.ndim() != 4 || xk_out.ndim() != 4) {
+            throw std::runtime_error("apply_rope requires 4D key inputs and outputs");
         }
-        
-        if (xk_out.ndim() != 4 ||
-            xk_out.shape(0) != batch || xk_out.shape(1) != dim1 ||
-            xk_out.shape(2) != dim2 || xk_out.shape(3) != head_dim) {
-            throw std::runtime_error("xk_out shape must match xq shape");
+        bool same_shape = true;
+        for (int axis = 0; axis < 4; ++axis) {
+            same_shape &= xk.shape(axis) == xq.shape(axis);
+            if (xk_out.shape(axis) != xk.shape(axis))
+                throw std::runtime_error("xk_out shape must match xk shape");
         }
-        
+        if (!same_shape) {
+            const bool bnhd = freqs_dim2 == 1 && freqs_dim1 == dim1;
+            const int ha = bnhd ? 2 : 1, ta = bnhd ? 1 : 2;
+            bool eligible = xk.shape(0) == batch && xk.shape(ta) == xq.shape(ta) &&
+                xk.shape(3) == head_dim && freqs_batch == 1 &&
+                freqs.shape(ha) == 1 && freqs.shape(ta) == xq.shape(ta) &&
+                freqs_dtype_code == 0 &&
+                map_dtype_to_code(xk.dtype()) == input_dtype_code &&
+                map_dtype_to_code(xk_out.dtype()) == input_dtype_code;
+            uint64_t qs = 1, ks = 1, fs = 1;
+            for (int axis = 3; axis >= 0; --axis) {
+                eligible &= xq.stride(axis) == qs && xq_out.stride(axis) == qs &&
+                    xk.stride(axis) == ks && xk_out.stride(axis) == ks;
+                qs *= xq.shape(axis);
+                ks *= xk.shape(axis);
+            }
+            for (int axis = 5; axis >= 0; --axis) {
+                eligible &= freqs.stride(axis) == fs;
+                fs *= freqs.shape(axis);
+            }
+            if (eligible && try_launch_rope_gqa(
+                    xq.data(), xk.data(), freqs.data(), nullptr, nullptr,
+                    xq_out.data(), xk_out.data(), batch, xq.shape(ha), xk.shape(ha),
+                    xq.shape(ta), head_dim, bnhd, split_half, true, 0.f,
+                    input_dtype_code, false, reinterpret_cast<cudaStream_t>(stream_ptr)))
+                return;
+            apply_rope(xq, freqs, xq_out, nb::none(), nb::none(), stream_ptr, split_half);
+            apply_rope(xk, freqs, xk_out, nb::none(), nb::none(), stream_ptr, split_half);
+            return;
+        }
+
         xk_data = xk.data();
         xk_out_data = xk_out.data();
         k_s0 = xk.stride(0); k_s1 = xk.stride(1);
@@ -738,22 +791,6 @@ void apply_rope(
             map_dtype_to_code(xk_out.dtype()) != map_dtype_to_code(xq.dtype())) {
             throw std::runtime_error("apply_rope inputs and outputs must share dtype");
         }
-    }
-
-    // Get input dtype code
-    int input_dtype_code = map_dtype_to_code(xq.dtype());
-    int output_dtype_code = map_dtype_to_code(xq_out.dtype());
-    if ((input_dtype_code != 1 && input_dtype_code != 2) ||
-        output_dtype_code != input_dtype_code) {
-        throw std::runtime_error(
-            "apply_rope inputs and outputs must share an FP16/BF16 dtype");
-    }
-
-    // Get freqs dtype code
-    int freqs_dtype_code = map_dtype_to_code(freqs.dtype());
-    if (freqs_dtype_code < 0 || freqs_dtype_code > 2) {
-        throw std::runtime_error(
-            "apply_rope frequencies must be FP32, FP16, or BF16");
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
@@ -950,6 +987,57 @@ void rms_rope1(nb::ndarray<nb::device::cuda> q,
       epsilon, input_dtype_code,
       freqs_dtype_code, scale_dtype_code, false, split_half,
       reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+// Unequal-head inputs retain the single-tensor path for layouts the fast path cannot use.
+void rms_rope_gqa(nb::ndarray<nb::device::cuda> q, nb::ndarray<nb::device::cuda> k,
+                 nb::ndarray<nb::device::cuda> freqs,
+                 nb::ndarray<nb::device::cuda> q_scale,
+                 nb::ndarray<nb::device::cuda> k_scale,
+                 nb::ndarray<nb::device::cuda> q_out,
+                 nb::ndarray<nb::device::cuda> k_out, float epsilon,
+                 uintptr_t stream_ptr, bool split_half = false, int64_t rot_dim = 0) {
+  if (rot_dim != 0)
+    throw std::runtime_error("native grouped-query RMS-RoPE requires full rotation");
+  bool eligible = q.ndim() == 4 && k.ndim() == 4 && q_out.ndim() == 4 &&
+      k_out.ndim() == 4 && freqs.ndim() == 6 && q_scale.ndim() == 1 && k_scale.ndim() == 1;
+  if (eligible) {
+    const bool bnhd = freqs.shape(2) == 1 && freqs.shape(1) == q.shape(1);
+    const int head_axis = bnhd ? 2 : 1, token_axis = bnhd ? 1 : 2;
+    const int64_t batch = q.shape(0), heads = q.shape(head_axis),
+                  k_heads = k.shape(head_axis), tokens = q.shape(token_axis), D = q.shape(3);
+    const int weight_type = map_dtype_to_code(q_scale.dtype());
+    eligible = k.shape(0) == batch && k.shape(token_axis) == tokens && k.shape(3) == D &&
+        map_dtype_to_code(q.dtype()) == 2 && map_dtype_to_code(k.dtype()) == 2 &&
+        map_dtype_to_code(q_out.dtype()) == 2 && map_dtype_to_code(k_out.dtype()) == 2 &&
+        map_dtype_to_code(freqs.dtype()) == 0 && (weight_type == 0 || weight_type == 2) &&
+        map_dtype_to_code(k_scale.dtype()) == weight_type &&
+        q_scale.shape(0) == D && k_scale.shape(0) == D &&
+        q_scale.stride(0) == 1 && k_scale.stride(0) == 1 &&
+        freqs.shape(0) == 1 && freqs.shape(bnhd ? 2 : 1) == 1 &&
+        freqs.shape(token_axis) == tokens && freqs.shape(3) == D / 2 &&
+        freqs.shape(4) == 2 && freqs.shape(5) == 2;
+    uint64_t qs = 1, ks = 1, fs = 1;
+    for (int axis = 3; axis >= 0; --axis) {
+      eligible &= q_out.shape(axis) == q.shape(axis) && k_out.shape(axis) == k.shape(axis) &&
+          q.stride(axis) == qs && q_out.stride(axis) == qs &&
+          k.stride(axis) == ks && k_out.stride(axis) == ks;
+      qs *= q.shape(axis);
+      ks *= k.shape(axis);
+    }
+    for (int axis = 5; axis >= 0; --axis) {
+      eligible &= freqs.stride(axis) == fs;
+      fs *= freqs.shape(axis);
+    }
+    if (eligible && try_launch_rope_gqa(
+            q.data(), k.data(), freqs.data(), q_scale.data(), k_scale.data(),
+            q_out.data(), k_out.data(), batch, heads, k_heads, tokens, D,
+            bnhd, split_half, weight_type == 0, epsilon, 2, true,
+            reinterpret_cast<cudaStream_t>(stream_ptr)))
+      return;
+  }
+  rms_rope1(q, freqs, q_scale, q_out, epsilon, stream_ptr, split_half);
+  rms_rope1(k, freqs, k_scale, k_out, epsilon, stream_ptr, split_half);
 }
 
 // Nanobind wrapper: signed INT8 V quantization
@@ -1621,9 +1709,9 @@ static void need_elems(const nb::ndarray<nb::device::cuda>& a, int64_t n, const 
                                  + " elements, got " + std::to_string(a.size()));
 }
 static void need_workspace(const nb::ndarray<nb::device::cuda>& ws, int64_t batch, int64_t seq_len,
-                           int64_t num_heads, int64_t token_aug, const char* who) {
+                           int64_t key_len, int64_t num_heads, int64_t token_aug, const char* who) {
     int64_t v[48];
-    const int n = sol_attn_plan((int)batch, (int)seq_len, (int)num_heads, (int)token_aug, v, 48);
+    const int n = sol_attn_plan((int)batch, (int)seq_len, (int)key_len, (int)num_heads, (int)token_aug, v, 48);
     if (n > 48 || (int64_t)ws.size() < v[n - 1])   // last slot is "total"
         throw std::runtime_error(std::string(who) + ": workspace too small for this shape");
 }
@@ -1671,9 +1759,12 @@ static int64_t row_stride_3d(const A& a, const char* who, const char* what) {
 }
 
 // Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
-nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads, int64_t token_aug = 0) {
+// key_len < 0: k/v as long as q.
+nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads, int64_t token_aug = 0,
+                          int64_t key_len = -1) {
     int64_t v[48];
-    const int n = sol_attn_plan((int)batch, (int)seq_len, (int)num_heads, (int)token_aug, v, 48);
+    const int n = sol_attn_plan((int)batch, (int)seq_len, (int)(key_len < 0 ? seq_len : key_len),
+                                (int)num_heads, (int)token_aug, v, 48);
     if (n > 48)
         throw std::runtime_error("sol_attn_plan: Plan grew past the binding's buffer");
     nb::dict d;
@@ -1694,33 +1785,40 @@ void sol_attn(
     std::optional<nb::ndarray<nb::device::cuda>> key_bias = std::nullopt,
     std::optional<nb::ndarray<nb::device::cuda>> threshold = std::nullopt,
     std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt,
-    bool tail = true, int64_t token_aug = 0)
+    bool tail = true, int64_t token_aug = 0, int64_t q_offset = 0)
 {
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    // k and v may be longer than q (seq_len is q's length)
+    const int64_t key_len = k.ndim() == 4 ? (int64_t)k.shape(1) : seq_len;
+    // first: the plan rejects non-positive extents, which would size nothing below
+    need_workspace(workspace, batch, seq_len, key_len, num_heads, token_aug, "sol_attn");
     if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
         throw std::runtime_error("sol_attn: threshold must have B*H*ceil(T/64) elements");
+    if (block_len && key_len != seq_len)
+        throw std::runtime_error("sol_attn: block_len needs q and k of the same length");
     if (block_len) check_block_len(*block_len, seq_len, "sol_attn");
+    if (q_offset < 0 || q_offset > key_len - seq_len)   // also k shorter than q
+        throw std::runtime_error("sol_attn: q_offset must leave the queries inside the keys");
     const int elem = sol_elem_code(q);
     if (elem < 0) throw std::runtime_error("sol_attn: q must be bfloat16 or float16");
     need_bthd(q, batch, seq_len, num_heads, head_dim, elem, "sol_attn", "q");
-    need_bthd(k, batch, seq_len, num_heads, head_dim, elem, "sol_attn", "k");
-    need_bthd(v, batch, seq_len, num_heads, head_dim, elem, "sol_attn", "v");
+    need_bthd(k, batch, key_len, num_heads, head_dim, elem, "sol_attn", "k");
+    need_bthd(v, batch, key_len, num_heads, head_dim, elem, "sol_attn", "v");
     need_bthd(out, batch, seq_len, num_heads, head_dim, elem, "sol_attn", "out");
     need_staging_layout(q, "sol_attn", "q");
     need_staging_layout(k, "sol_attn", "k");
     need_staging_layout(v, "sol_attn", "v");
     need_contiguous(out, "sol_attn", "out");
-    need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_attn");
-    if (key_bias) need_elems(*key_bias, batch * seq_len, "sol_attn", "key_bias");
+    if (key_bias) need_elems(*key_bias, batch * key_len, "sol_attn", "key_bias");
     // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
     launch_sol_attn(
         q.data(), k.data(), v.data(), out.data(), workspace.data(),
-        (int)batch, (int)seq_len, (int)num_heads, (int)head_dim, elem,
+        (int)batch, (int)seq_len, (int)key_len, (int)num_heads, (int)head_dim, elem,
         tau, scale,
         key_bias ? key_bias->data() : nullptr,
         threshold ? threshold->data() : nullptr,
         block_len ? block_len->data() : nullptr, tail ? 1 : 0,
-        (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end,
+        (int)sink_start, (int)sink_end, (int)sink_q_start, (int)sink_q_end, (int)q_offset,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2), (int)token_aug, stream);
@@ -1741,7 +1839,8 @@ void sol_producer_chunk_py(
     float rope_eps, int64_t rot_dim, int64_t t0, int64_t m,
     int64_t batch, int64_t seq_len, int64_t num_heads,
     uintptr_t stream_ptr,
-    std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt, int64_t token_aug = 0) {
+    std::optional<nb::ndarray<nb::device::cuda>> block_len = std::nullopt, int64_t token_aug = 0,
+    bool split_half = true) {
     if (batch != 1)
         throw std::runtime_error("sol_producer_chunk: the producer path is B=1 only");
     if (rot_dim <= 0 || rot_dim > 128 || rot_dim % 8)
@@ -1749,7 +1848,7 @@ void sol_producer_chunk_py(
     if (t0 < 0 || m < 0 || t0 + m > seq_len || (m && t0 % 64))
         throw std::runtime_error("sol_producer_chunk: chunk [t0, t0 + m) must lie in [0, seq_len] with a 64-aligned start");
     if (block_len) check_block_len(*block_len, seq_len, "sol_producer_chunk");
-    need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_producer_chunk");
+    need_workspace(workspace, batch, seq_len, seq_len, num_heads, token_aug, "sol_producer_chunk");
     need_elems(qkv, m * 3 * num_heads * 128, "sol_producer_chunk", "qkv");
     need_elems(fab, seq_len * rot_dim * 2, "sol_producer_chunk", "fab");
     need_elems(qw, 128, "sol_producer_chunk", "qw");
@@ -1759,7 +1858,7 @@ void sol_producer_chunk_py(
     sol_producer_chunk(workspace.data(), qkv.data(), fab.data(), qw.data(),
                        kw.data(), kmean.data(), vscale.data(),
                        block_len ? block_len->data() : nullptr,
-                       rope_eps, (int)rot_dim, (int)t0, (int)m,
+                       rope_eps, (int)rot_dim, split_half, (int)t0, (int)m,
                        (int)batch, (int)seq_len, (int)num_heads, (int)token_aug,
                        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
@@ -1782,7 +1881,7 @@ void sol_attn_core_py(
     if (threshold && (int64_t)threshold->size() != batch * num_heads * ((seq_len + 63) / 64))
         throw std::runtime_error("sol_attn_core: threshold must have B*H*ceil(T/64) elements");
     if (block_len) check_block_len(*block_len, seq_len, "sol_attn_core");
-    need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_attn_core");
+    need_workspace(workspace, batch, seq_len, seq_len, num_heads, token_aug, "sol_attn_core");
     need_elems(out, batch * seq_len * num_heads * 128, "sol_attn_core", "out");
     launch_sol_attn_core(
         workspace.data(), out.data(), vscale.data(), kmean_next.data(), vamax_out.data(),
@@ -2027,7 +2126,7 @@ void group_norm_silu_pad3d(
 {
     const bool norm = weight.size() > 0;
     const bool given = stats.size() > 0;
-    if (row_stride < W * C) {
+    if ((row_stride != -T && row_stride < W * C)) {
         throw std::invalid_argument("group_norm_silu_pad3d: row stride is shorter than a row");
     }
     if (norm && (static_cast<int64_t>(weight.size()) != C || static_cast<int64_t>(bias.size()) != C)) {
@@ -2040,7 +2139,7 @@ void group_norm_silu_pad3d(
         static_cast<int64_t>(out.size()) != B * C * (T + front) * (H + top + bottom) * (W + left + right)) {
         throw std::invalid_argument("group_norm_silu_pad3d: x/out sizes do not match the given shape");
     }
-    const int64_t chunks = (H * W + 1023) / 1024;
+    const int64_t chunks = comfy::group_norm_chunks(B * T, C, H * W);
     if (norm && !given && static_cast<int64_t>(workspace.size()) < 2 * B * T * (chunks * C + num_groups)) {
         throw std::invalid_argument("group_norm_silu_pad3d: workspace too small");
     }
@@ -2067,10 +2166,10 @@ void group_norm_stats3d(
     int dtype_code,
     uintptr_t stream_ptr)
 {
-    if (static_cast<int64_t>(x.size()) != B * C * T * H * W || row_stride < W * C) {
+    if (static_cast<int64_t>(x.size()) != B * C * T * H * W || (row_stride != -T && row_stride < W * C)) {
         throw std::invalid_argument("group_norm_stats3d: x size or row stride does not match the given shape");
     }
-    const int64_t chunks = (H * W + 1023) / 1024;
+    const int64_t chunks = comfy::group_norm_chunks(B * T, C, H * W);
     if (static_cast<int64_t>(workspace.size()) < 2 * B * T * chunks * C) {
         throw std::invalid_argument("group_norm_stats3d: workspace too small");
     }
@@ -2441,6 +2540,7 @@ extern "C" {
         const void* xq,
         const void* weight,
         const void* decode_lut,
+        const float* codebook,
         const void* s_channel,
         const void* xs,
         const void* bias,
@@ -3342,20 +3442,37 @@ bool cutlass_turing_int4_dequant(
         a.data(), b.data(), xs.data(), ws.data(), bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
 }
 
-// Code width implied by the packed row: K/2 bytes at 4 bits, 3K/4 at 6. The 6-bit layout is
-// uniform (no codebook), needs K % 32 so its rows and high plane stay 8-byte aligned, and
-// G a multiple of 16 because its decoder applies one scale per 16-col vector (the C++ twin
-// of the eager _check_six_bit_layout rule).
+// Code width implied by an MMA record stream's size: N*K*(512*bits/8+32)/512 bytes, i.e.
+// 7/16 (3-bit), 9/16 (4), 11/16 (5), 13/16 (6) of N*K. 0 when no width matches.
+static int64_t w4a8_mma_bits_from_size(int64_t size, int64_t N, int64_t K) {
+    for (int64_t bits = 3; bits <= 6; ++bits)
+        if (size == N * K * (2 * bits + 1) / 16) return bits;
+    return 0;
+}
+
+// Code width implied by the packed row: 3K/8 bytes at 3 bits, K/2 at 4, 5K/8 at 5, 3K/4 at 6.
+// Multi-plane rows need K % 32 (6) or K % 64 (3/5) so the row and its high plane stay
+// aligned, and G a multiple of 16 because their decoders apply one scale per 16-col vector
+// (the C++ twin of the eager _check_plane_layout rule). 5/6-bit are uniform (no codebook);
+// 3-bit needs its 8-entry table.
 static int64_t w4a8_bits_from_width(int64_t cols, int64_t K, int64_t G, bool has_codebook, const char* who) {
     const int64_t bits = (K > 0) ? (cols * 8) / K : 0;
-    if ((bits != 4 && bits != 6) || cols * 8 != K * bits)
-        throw std::runtime_error(std::string(who) + ": packed width must be K/2 (4-bit) or 3K/4 (6-bit)");
-    if (bits == 6 && (K % 32 != 0 || G < 16 || G % 16 != 0))
-        throw std::runtime_error(std::string(who) + ": 6-bit storage needs K % 32 == 0 and G a multiple of 16");
-    if (bits == 6 && has_codebook)
-        throw std::runtime_error(std::string(who) + ": 6-bit storage has no codebook");
+    if ((bits != 3 && bits != 4 && bits != 5 && bits != 6) || cols * 8 != K * bits)
+        throw std::runtime_error(std::string(who) + ": packed width must be 3K/8, K/2, 5K/8 or 3K/4 (3/4/5/6-bit)");
+    if (bits != 4) {
+        const int64_t k_align = bits == 6 ? 32 : 64;
+        if (K % k_align != 0 || G < 16 || G % 16 != 0)
+            throw std::runtime_error(std::string(who) + ": " + std::to_string(bits) + "-bit storage needs K % "
+                                     + std::to_string(k_align) + " == 0 and G a multiple of 16");
+    }
+    if ((bits == 5 || bits == 6) && has_codebook)
+        throw std::runtime_error(std::string(who) + ": " + std::to_string(bits) + "-bit storage has no codebook");
+    if (bits == 3 && !has_codebook)
+        throw std::runtime_error(std::string(who) + ": 3-bit storage needs its 8-entry codebook");
     return bits;
 }
+
+static int64_t w4a8_codebook_entries(int64_t bits) { return bits == 3 ? 8 : 16; }
 
 // Grouped int4/int6 -> int8 dequant (group scale folded; per-channel scale applied in GEMM).
 void dequant_int4_grouped_to_int8(
@@ -3375,8 +3492,8 @@ void dequant_int4_grouped_to_int8(
         throw std::runtime_error("dequant_int4_grouped: s_rel must have shape [N, K/G]");
     if (static_cast<int64_t>(out.shape(0)) != N)
         throw std::runtime_error("dequant_int4_grouped: out must be [N, K]");
-    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
-        throw std::runtime_error("dequant_int4_grouped: codebook must be [16]");
+    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != w4a8_codebook_entries(bits))
+        throw std::runtime_error("dequant_int4_grouped: codebook must be [16] (4-bit) or [8] (3-bit)");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
     launch_dequant_int4_grouped_to_int8(qw.data(), s_rel.data(), cb, out.data(), N, K, G, bits, stream);
@@ -3400,8 +3517,8 @@ void dequant_int4_grouped_to_int8_e4m3(
         throw std::runtime_error("dequant_int4_grouped: s_rel must have shape [N, K/G]");
     if (static_cast<int64_t>(out.shape(0)) != N)
         throw std::runtime_error("dequant_int4_grouped: out must be [N, K]");
-    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != 16)
-        throw std::runtime_error("dequant_int4_grouped: codebook must be [16]");
+    if (codebook.has_value() && static_cast<int64_t>(codebook->shape(0)) != w4a8_codebook_entries(bits))
+        throw std::runtime_error("dequant_int4_grouped: codebook must be [16] (4-bit) or [8] (3-bit)");
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const void* cb = codebook.has_value() ? codebook->data() : nullptr;
     launch_dequant_int4_grouped_to_int8_e4m3(qw.data(), s_rel.data(), cb, out.data(), N, K, G, bits, stream);
@@ -3455,8 +3572,9 @@ bool quantize_wxa8_convrot_fused(
     if (in_code < 0 || in_code > 2)
         throw std::runtime_error("quantize_wxa8_convrot_fused: weight must be fp32/fp16/bf16");
     if (N <= 0) throw std::runtime_error("quantize_wxa8_convrot_fused: N must be positive");
-    if (!((bits == 4 && group_size == 16) || (bits == 6 && (group_size == 16 || group_size == 32 || group_size == 64))))
-        throw std::runtime_error("quantize_wxa8_convrot_fused: bits/group_size must be 4/16 or 6/{16,32,64}");
+    const bool codebook_bits = bits == 4 || bits == 3, uniform_bits = bits == 6 || bits == 5;
+    if (!((codebook_bits && group_size == 16) || (uniform_bits && (group_size == 16 || group_size == 32 || group_size == 64))))
+        throw std::runtime_error("quantize_wxa8_convrot_fused: bits/group_size must be 4/16, 3/16, 6/{16,32,64} or 5/{16,32,64}");
     if (K % 256 != 0 || K % group_size != 0)
         throw std::runtime_error("quantize_wxa8_convrot_fused: K must be a multiple of 256 and of group_size");
     if (static_cast<int64_t>(packed.shape(0)) != N || static_cast<int64_t>(packed.shape(1)) != K * bits / 8)
@@ -3465,10 +3583,10 @@ bool quantize_wxa8_convrot_fused(
         throw std::runtime_error("quantize_wxa8_convrot_fused: s_rel must be [N, K/group_size]");
     if (static_cast<int64_t>(s_channel.shape(0)) != N)
         throw std::runtime_error("quantize_wxa8_convrot_fused: s_channel must be [N]");
-    if (bits == 4 && static_cast<int64_t>(codebook.size()) != 16)
-        throw std::runtime_error("quantize_wxa8_convrot_fused: codebook must be [16] at 4 bits");
+    if (codebook_bits && static_cast<int64_t>(codebook.size()) != w4a8_codebook_entries(bits))
+        throw std::runtime_error("quantize_wxa8_convrot_fused: codebook must be [16] at 4 bits, [8] at 3");
     return launch_quantize_wxa8_convrot_fused(
-        weight.data(), bits == 4 ? codebook.data() : nullptr, packed.data(), s_rel.data(), s_channel.data(),
+        weight.data(), codebook_bits ? codebook.data() : nullptr, packed.data(), s_rel.data(), s_channel.data(),
         N, K, static_cast<int>(bits), static_cast<int>(group_size), in_code, stochastic, seed,
         reinterpret_cast<cudaStream_t>(stream_ptr));
 }
@@ -3479,7 +3597,7 @@ void pack_w4a8_mma_inplace(
     nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> scratch,
     uintptr_t stream_ptr) {
     const int64_t N = scales.shape(0), K = scales.shape(1) * 16;
-    const int bits = data.size() == N * K * 9 / 16 ? 4 : (data.size() == N * K * 13 / 16 ? 6 : 0);
+    const int bits = static_cast<int>(w4a8_mma_bits_from_size(static_cast<int64_t>(data.size()), N, K));
     if (!bits || N <= 0 || N % 16 || K <= 0 || K % 256
             || data.stride(0) != 1 || scales.stride(1) != 1 || scales.stride(0) != K / 16
             || scratch.stride(0) != 1 || scratch.size() < static_cast<size_t>(2 * K * bits))
@@ -3521,9 +3639,11 @@ static int64_t validate_w4a8_codebook_gemm_contract(
         if (N <= 0 || N % 16 || K <= 0 || K % 256 || G != 16
                 || weight.ndim() != 1 || weight.stride(0) != 1 || s_rel.size() != 0)
             throw std::runtime_error("w4a8_codebook_gemm: invalid packed storage geometry");
-        bits = weight.size() == N * K * 9 / 16 ? 4 : (weight.size() == N * K * 13 / 16 ? 6 : 0);
+        bits = w4a8_mma_bits_from_size(static_cast<int64_t>(weight.size()), N, K);
         if (!bits)
             throw std::runtime_error("w4a8_codebook_gemm: invalid packed weight size");
+        if (bits == 3 && codebook_size < 0)
+            throw std::runtime_error("w4a8_codebook_gemm: 3-bit record streams need their 8-entry codebook");
     } else {
         if (weight.ndim() != 2 || weight.shape(0) != N || s_rel.ndim() != 2
                 || weight.stride(1) != 1 || weight.stride(0) != weight.shape(1)
@@ -3539,8 +3659,8 @@ static int64_t validate_w4a8_codebook_gemm_contract(
         throw std::runtime_error("w4a8_codebook_gemm: xs must have M values");
     if (s_channel_size != N)
         throw std::runtime_error("w4a8_codebook_gemm: s_channel must be [N]");
-    if (codebook_size >= 0 && codebook_size != 16)
-        throw std::runtime_error("w4a8_codebook_gemm: codebook must be [16]");
+    if (codebook_size >= 0 && codebook_size != w4a8_codebook_entries(bits))
+        throw std::runtime_error("w4a8_codebook_gemm: codebook must be [16] (4-bit) or [8] (3-bit)");
     // the strided int8 GEMM reads bias in the output dtype
     if (bias_size >= 0 && (bias_size != N || bias_dtype_code != out_dtype_code))
         throw std::runtime_error("w4a8_codebook_gemm: bias must be [N] in the output dtype");
@@ -3611,7 +3731,8 @@ bool w4a8_codebook_mma_linear(
     nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> workspace,
     nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> counters,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> out,
-    int64_t convrot_group_size, int64_t G, int out_dtype_code, uintptr_t stream_ptr) {
+    int64_t convrot_group_size, int64_t G, int out_dtype_code, uintptr_t stream_ptr,
+    std::optional<nb::ndarray<float, nb::ndim<1>, nb::device::cuda>> codebook) {
     const int64_t M = xq.shape(0);
     const int64_t K = xq.shape(1);
     const int64_t in_width = comfy::input_act_width(static_cast<int>(act_code));
@@ -3622,10 +3743,10 @@ bool w4a8_codebook_mma_linear(
             || xs.shape(0) != M || xs.shape(1) != 1
             || N % 16 != 0 || K % G != 0)
         throw std::runtime_error("w4a8_codebook_mma_linear shape mismatch or M > 8");
-    // record stream size implies the code width: 288-byte records at 4 bits, 416 at 6
-    const int64_t bits = weight.size() == N * K * 9 / 16 ? 4 : (weight.size() == N * K * 13 / 16 ? 6 : 0);
+    // record stream size implies the code width: 224-byte records at 3 bits, 288 at 4, 352 at 5, 416 at 6
+    const int64_t bits = w4a8_mma_bits_from_size(static_cast<int64_t>(weight.size()), N, K);
     if (bits == 0)
-        throw std::runtime_error("w4a8_codebook_mma_linear weight is not a 4- or 6-bit record stream");
+        throw std::runtime_error("w4a8_codebook_mma_linear weight is not a 3..6-bit record stream");
     if (act_code != comfy::kActNone && act_code != comfy::kActSwiGLU && act_code != comfy::kActRmsNorm)
         throw std::runtime_error("w4a8_codebook_mma_linear act_code must be none, swiglu, or rms_norm");
     const bool has_act_weight = act_weight.has_value() && act_weight->size() > 0;
@@ -3642,10 +3763,17 @@ bool w4a8_codebook_mma_linear(
                     || partial_absmax->stride(1) != 1
                     || partial_absmax->stride(0) != K / convrot_group_size)))
         throw std::runtime_error("w4a8_codebook_mma_linear staged scratch mismatch");
-    if (bits == 4 && (!decode_lut.has_value()
-            || decode_lut->shape(0) != 256 || decode_lut->shape(1) != 16
-            || decode_lut->stride(1) != 1 || decode_lut->stride(0) != 16))
-        throw std::runtime_error("w4a8_codebook_mma_linear decode LUT must be contiguous [256, 16]");
+    if (bits == 3 || bits == 4) {
+        const int levels = 1 << bits;
+        if (decode_lut) {
+            if (decode_lut->shape(0) != 256 || decode_lut->shape(1) != levels
+                    || decode_lut->stride(1) != 1 || decode_lut->stride(0) != levels)
+                throw std::runtime_error("w4a8_codebook_mma_linear invalid decode LUT");
+        } else if (!codebook || codebook->size() != levels || codebook->stride(0) != 1
+                   || codebook->device_id() != weight.device_id()) {
+            throw std::runtime_error("w4a8_codebook_mma_linear requires a matching codebook or decode LUT");
+        }
+    }
     if ((bias.has_value() && bias->size() != N)
             || workspace.shape(0) != M || workspace.shape(1) != N
             || counters.size() != N / 16 || counters.stride(0) != 1
@@ -3685,7 +3813,8 @@ bool w4a8_codebook_mma_linear(
             false, 0, stream);
     }
     return launch_w4a8_codebook_mma(
-        xq.data(), weight.data(), decode_lut.has_value() ? decode_lut->data() : nullptr, s_channel.data(), xs.data(),
+        xq.data(), weight.data(), decode_lut ? decode_lut->data() : nullptr,
+        codebook ? codebook->data() : nullptr, s_channel.data(), xs.data(),
         bias.has_value() ? bias->data() : nullptr,
         residual.has_value() ? residual->data() : nullptr,
         residual_scale.has_value() ? residual_scale->data() : nullptr,
@@ -4950,7 +5079,7 @@ NB_MODULE(_C, m) {
           nb::arg("residual").none(), nb::arg("residual_scale").none(),
           nb::arg("workspace"), nb::arg("counters"), nb::arg("out"), nb::arg("convrot_group_size"),
           nb::arg("g"),
-          nb::arg("out_dtype_code"), nb::arg("stream_ptr"));
+          nb::arg("out_dtype_code"), nb::arg("stream_ptr"), nb::arg("codebook").none() = nb::none());
     m.def("w4a8_codebook_linear_chunked", &w4a8_codebook_linear_chunked,
           "Fused W4A8 inference orchestration: ConvRot activation quantization followed by chunked decode/GEMM",
           nb::arg("input"), nb::arg("xq"), nb::arg("xs"), nb::arg("weight"),
@@ -5090,6 +5219,14 @@ NB_MODULE(_C, m) {
           nb::arg("k_scale"), nb::arg("q_out"), nb::arg("k_out"),
           nb::arg("epsilon"), nb::arg("stream_ptr"),
           nb::arg("split_half") = false, nb::arg("rot_dim") = 0);
+
+    m.def("rms_rope_gqa", &rms_rope_gqa, "Fused RMSNorm and RoPE for unequal head counts",
+          nb::arg("q"), nb::arg("k"), nb::arg("freqs"),
+          nb::arg("q_scale"), nb::arg("k_scale"), nb::arg("q_out"), nb::arg("k_out"),
+          nb::arg("epsilon"), nb::arg("stream_ptr"), nb::arg("split_half") = false,
+          nb::arg("rot_dim") = 0);
+
+    m.attr("apply_rope_gqa") = m.attr("apply_rope");
 
     m.def("rms_rope1", &rms_rope1, "Fused RMSNorm and RoPE for a single tensor",
           nb::arg("q"), nb::arg("freqs"), nb::arg("q_scale"), nb::arg("q_out"),
@@ -5302,7 +5439,8 @@ NB_MODULE(_C, m) {
 
     m.def("sol_attn_plan", &sol_attn_plan_py,
           "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
-          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"), nb::arg("token_aug") = 0);
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"), nb::arg("token_aug") = 0,
+          nb::arg("key_len") = -1);
 
     m.def("sol_attn", &sol_attn,
           "Sol-Attn training-free sparse attention (BF16 or FP16 in/out, head_dim 128)",
@@ -5317,7 +5455,7 @@ NB_MODULE(_C, m) {
           nb::arg("key_bias") = nb::none(),
           nb::arg("threshold") = nb::none(),
           nb::arg("block_len") = nb::none(),
-          nb::arg("tail") = true, nb::arg("token_aug") = 0);
+          nb::arg("tail") = true, nb::arg("token_aug") = 0, nb::arg("q_offset") = 0);
 
     m.def("sol_producer_begin", &sol_producer_begin_py,
           nb::arg("workspace"), nb::arg("batch"), nb::arg("seq_len"),
@@ -5327,7 +5465,8 @@ NB_MODULE(_C, m) {
           nb::arg("kw"), nb::arg("kmean"), nb::arg("vscale"),
           nb::arg("rope_eps"), nb::arg("rot_dim"), nb::arg("t0"), nb::arg("m"),
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(), nb::arg("token_aug") = 0);
+          nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(), nb::arg("token_aug") = 0,
+          nb::arg("split_half") = true);
     m.def("sol_attn_core", &sol_attn_core_py,
           nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"),
           nb::arg("kmean_next"), nb::arg("vamax_out"),

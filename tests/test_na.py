@@ -6,7 +6,7 @@ import torch
 
 import comfy_kitchen as ck
 from comfy_kitchen.exceptions import NoCapableBackendError
-from tests.conftest import assert_values_close, get_capable_backends
+from tests.conftest import assert_values_close, get_capable_backends, requires_cuda_backend
 
 # ---------------------------------------------------------------------------
 # Reference implementation: direct per-query loop over NATTEN window semantics
@@ -94,6 +94,23 @@ def test_na3d_backends(shape, kernel, causal, dtype, scale):
         with ck.use_backend(backend):
             out = ck.na3d(q, k, v, list(kernel), list(causal), scale)
         assert_values_close(out.float(), ref.float(), rtol, atol, name=f"na3d[{backend}]")
+
+
+@requires_cuda_backend
+@pytest.mark.parametrize("frames,kt,kh,kw", [(1, 1, 3, 5), (1, 1, 7, 7), (9, 2, 5, 5)])
+@pytest.mark.parametrize("q_value,k_value,scale", [(0.0, 0.0, 3e38), (1e19, 2.5e19, 1.0)])
+def test_cuda_na3d_finite_logits(frames, kt, kh, kw, q_value, k_value, scale):
+    if torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("CUDA na3d requires SM80+")
+    q = torch.zeros((1, frames, 11, 13, 1, 64), dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros_like(q)
+    q[..., 0] = q_value
+    k[..., 0] = k_value
+    v = torch.ones_like(q)
+    # All visible keys have equal finite logits, so every output is exactly one.
+    with ck.use_backend("cuda"):
+        out = ck.na3d(q, k, v, [kt, kh, kw], scale=scale)
+    torch.testing.assert_close(out, v, rtol=0, atol=0)
 
 
 def test_na2d_matches_na3d_single_frame():
