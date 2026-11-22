@@ -18,6 +18,7 @@ import importlib.util
 import os
 import sys
 import weakref
+from functools import cache
 from typing import NamedTuple
 
 import torch
@@ -220,7 +221,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
-from comfy_kitchen.tensor.w4a8_packed import _FIXED_LUT, _mma_bits, w4a8_mma_record_bytes  # noqa: E402
+from comfy_kitchen.tensor.w4a8_packed import _mma_bits, default_w4a8_codebook  # noqa: E402
 from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     w4a8_int8_linear as eager_w4a8_int8_linear,
 )
@@ -260,13 +261,28 @@ _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBA
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
 _W4A8_CHUNKED = os.environ.get("COMFY_KITCHEN_W4A8_CHUNKED", "1") != "0"
-_W4A8_FIXED_DECODE_LUTS: dict[torch.device, torch.Tensor] = {}
+_W4A8_DECODE_LUTS: dict[tuple[torch.device, tuple[float, ...]], torch.Tensor] = {}
+_W4A8_FIXED_CODEBOOKS: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
-def _w4a8_fixed_decode_lut(device: torch.device) -> torch.Tensor:
-    if (decode_lut := _W4A8_FIXED_DECODE_LUTS.get(device)) is None:
-        codebook = torch.tensor(_FIXED_LUT, dtype=torch.float32)
-        scales = torch.arange(256, dtype=torch.uint8)
+def _w4a8_fixed_codebook(device: torch.device, levels: int) -> torch.Tensor:
+    """The frozen codebook on ``device``, cached like the decode LUT below (outside
+    execution-scoped allocations: the cache outlives every capture)."""
+    if (codebook := _W4A8_FIXED_CODEBOOKS.get((device, levels))) is None:
+        with allocation_context():
+            codebook = default_w4a8_codebook(levels, device="cpu").to(device)
+        _W4A8_FIXED_CODEBOOKS[(device, levels)] = codebook
+    return codebook
+
+
+def _w4a8_decode_lut(device: torch.device, codebook: torch.Tensor) -> torch.Tensor:
+    """[256 fp8 scales, levels] int8 table of ``codebook`` (16 levels: 4-bit, 8: 3-bit): the
+    int8-grid levels the M<=8 stream decodes to. Reads the table back (a sync), so callers
+    build it once per weight at repack time, never per call; cached per device and table."""
+    key = (device, tuple(codebook.float().cpu().tolist()))
+    if (decode_lut := _W4A8_DECODE_LUTS.get(key)) is None:
+        codebook = torch.tensor(key[1], dtype=torch.float32, device="cpu")
+        scales = torch.arange(256, dtype=torch.uint8, device="cpu")
         scales = scales.view(torch.float8_e4m3fn).float()
         table = (
             (scales[:, None] * codebook[None, :])
@@ -279,8 +295,14 @@ def _w4a8_fixed_decode_lut(device: torch.device) -> torch.Tensor:
         # stream can read it, and keep it outside execution-scoped allocations.
         with allocation_context():
             decode_lut = table.to(device)
-        _W4A8_FIXED_DECODE_LUTS[device] = decode_lut
+        _W4A8_DECODE_LUTS[key] = decode_lut
     return decode_lut
+
+
+@cache
+def _w4a8_fixed_decode_lut(device: torch.device, levels: int = 16) -> torch.Tensor:
+    """The decode table of the frozen codebook, for packed weights that carry none."""
+    return _w4a8_decode_lut(device, default_w4a8_codebook(levels, device="cpu"))
 
 
 _NVIDIA_16_SERIES = (
@@ -1522,12 +1544,11 @@ def _fused_quantize_wxa8(weight, bits, group_size, convrot_groupsize, codebook, 
     if (not _WXA8_FUSED_QUANT or weight.dtype not in (torch.float16, torch.bfloat16)
             or convrot_groupsize != 256 or k % 256 != 0 or k % group_size != 0):
         return None
-    if bits == 4:
+    if bits in (3, 4):
         cb = codebook.to(device=weight.device, dtype=torch.float32).contiguous()
-        packed = torch.empty(n, k // 2, dtype=torch.int8, device=weight.device)
     else:
         cb = _empty_cuda_tensor(weight.device, torch.float32)
-        packed = torch.empty(n, k * 3 // 4, dtype=torch.int8, device=weight.device)
+    packed = torch.empty(n, k * bits // 8, dtype=torch.int8, device=weight.device)
     s_rel = torch.empty(n, k // group_size, dtype=torch.float8_e4m3fn, device=weight.device)
     s_channel = torch.empty(n, dtype=torch.float32, device=weight.device)
     ok = _C.quantize_wxa8_convrot_fused(
@@ -1544,7 +1565,7 @@ def _fused_quantize_wxa8(weight, bits, group_size, convrot_groupsize, codebook, 
     )
     if not ok:
         return None
-    return packed, s_rel, s_channel, None, (cb if bits == 4 else None)
+    return packed, s_rel, s_channel, None, (cb if bits in (3, 4) else None)
 
 
 def quantize_w4a8_int8_weight(
@@ -1565,19 +1586,22 @@ def quantize_w4a8_int8_weight(
     torch.Tensor | None,
     torch.Tensor | None,
 ]:
-    """Prepare W4A8/W6A8 weights: the fused CUDA requant for the default configs (4-bit symmetric
-    codebook g16, or 6-bit without the quantize-time scale search; fp8 scales). W4A8
-    uses staged CUDA requant when fusion is unavailable; other configs use chunked eager."""
-    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits)
+    """Prepare W4A8/W6A8 (and 3/5-bit) weights: the fused CUDA requant for the default configs
+    (4/3-bit symmetric codebook g16, or 6/5-bit without the quantize-time scale search; fp8
+    scales). W4A8 uses staged CUDA requant when fusion is unavailable; other configs use
+    chunked eager."""
+    validate_w4a8_weight_shape(weight, group_size, convrot_groupsize, bits,
+                              codebook_tensor if symmetric and (bits == 3 or codebook) else None)
     fused_ok = scale_dtype == torch.float8_e4m3fn and symmetric and (
-        (bits == 4 and codebook and group_size == 16)
-        or (bits == 6 and not scale_search and group_size in (16, 32, 64))
+        ((bits == 3 or (bits == 4 and codebook)) and group_size == 16)   # 3-bit is always codebook
+        or (bits in (5, 6) and not scale_search and group_size in (16, 32, 64))
     )
     if fused_ok:
         cb = None
-        if bits == 4:
+        if bits in (3, 4):
             cb = (codebook_tensor if codebook_tensor is not None
-                  else _decide_codebook(weight, rotate_int8_convrot_weight, group_size, convrot_groupsize))
+                  else _decide_codebook(weight, rotate_int8_convrot_weight, group_size, convrot_groupsize,
+                                        levels=16 if bits == 4 else 8))
         out = _fused_quantize_wxa8(weight, bits, group_size, convrot_groupsize, cb, stochastic_rounding)
         if out is not None:
             return out
@@ -2081,15 +2105,13 @@ def _w4a8_cluster_quantizer_ok(k: int, input_act: str | None, device: torch.devi
 def _w4a8_mma_linear(
     x_2d, rotated, partial_absmax, act_weight, input_act_eps, input_act, xq, xs,
     qdata, s_channel, bias_float, resid_2d, resid_scale, out,
-    convrot_groupsize, group_size, output_dtype_code, stream_ptr,
+    convrot_groupsize, group_size, output_dtype_code, stream_ptr, decode_lut, codebook,
 ):
     """Quantize x_2d and run the streamed MMA GEMM into out."""
     m, n = out.shape
     # Call-local split-K sums and counters also isolate independently replayed graphs.
     scratch = torch.zeros(m * n + n // 16, dtype=torch.int32, device=out.device)
     workspace, counters = scratch[:m * n].view(m, n), scratch[m * n:]
-    bits = _mma_bits(qdata.numel(), n, xq.shape[1])
-    decode_lut = _w4a8_fixed_decode_lut(qdata.device) if bits == 4 else None
     used = _C.w4a8_codebook_mma_linear(
         _wrap_for_dlpack(x_2d),
         _wrap_for_dlpack(rotated) if rotated is not None else None,
@@ -2112,6 +2134,7 @@ def _w4a8_mma_linear(
         group_size,
         output_dtype_code,
         stream_ptr,
+        _wrap_for_dlpack(codebook) if codebook is not None else None,
     )
     if not used:
         raise RuntimeError("MMA-packed W4A8 weight is unsupported on this device")
@@ -2487,7 +2510,7 @@ def pack_w4a8_mma_weight_(dest: torch.Tensor, s_rel: torch.Tensor):
     """
     n, groups = s_rel.shape
     k = groups * 16
-    bits = 4 if dest.numel() == n * k * 9 // 16 else 6
+    bits = _mma_bits(dest.numel(), n, k)
     scales = s_rel.view(torch.uint8).clone()
     scratch = torch.empty(2 * k * bits, dtype=torch.uint8, device=dest.device)
     _C.pack_w4a8_mma_inplace(
@@ -2667,8 +2690,14 @@ def w4a8_packed_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    decode_lut: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Resident packed W4A8/W6A8: small-M MMA or direct packed dequantization for prefill."""
+    """Resident packed W4A8/W6A8: small-M MMA or direct packed dequantization for prefill.
+
+    decode_lut is the stream's [256, levels] int8 table of ``codebook`` (built once at
+    repack time by ``optimize_for_gemv``). A raw packed call can supply the codebook
+    directly. Omitting both uses the frozen codebook.
+    """
     if input_act in (None, "none"):
         input_act = None
     if residual is not None and residual_scale is None:
@@ -2691,12 +2720,14 @@ def w4a8_packed_linear(
         qdata.dim() != 1
         or qdata.dtype != torch.int8
         or n % 16
-        or qdata.numel() not in (n * k * w4a8_mma_record_bytes(4) // 512, n * k * w4a8_mma_record_bytes(6) // 512)
         or s_rel.numel() != 0
         or group_size != 16
         or correction is not None
     ):
         raise ValueError("invalid MMA-packed W4A8 operands")
+    bits = _mma_bits(qdata.numel(), n, k)
+    if codebook is not None and (bits not in (3, 4) or codebook.shape != (1 << bits,)):
+        raise ValueError(f"invalid codebook for {bits}-bit packed weight")
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     m = x_2d.shape[0]
     if residual is not None and not (
@@ -2706,6 +2737,7 @@ def w4a8_packed_linear(
             w4a8_packed_linear(
                 x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
                 convrot_groupsize, out_dtype, input_act, input_act_weight, input_act_eps,
+                decode_lut=decode_lut,
             ),
             residual,
             residual_scale,
@@ -2714,6 +2746,16 @@ def w4a8_packed_linear(
     xs = torch.empty(m, 1, dtype=torch.float32, device=x.device)
     out = torch.empty(m, n, dtype=out_dtype, device=x.device)
     if m <= 8:
+        stream_codebook = None
+        # A captured call retains tensor addresses. copy_ updates codebook in
+        # place and rebinds decode_lut, so graph replays must read codebook.
+        if decode_lut is not None and codebook is not None and torch.cuda.is_current_stream_capturing():
+            decode_lut = None
+        if decode_lut is None and bits in (3, 4):
+            if codebook is None:
+                decode_lut = _w4a8_fixed_decode_lut(x.device, 1 << bits)
+            else:
+                stream_codebook = codebook.to(device=x.device, dtype=torch.float32).contiguous()
         # Staged-pair scratch is only needed where the single cluster quantizer
         # cannot run (pre-sm_90, very wide K); a fused activation implies the cluster path.
         rotated = partial_absmax = act_weight = None
@@ -2733,9 +2775,11 @@ def w4a8_packed_linear(
             x_2d, rotated, partial_absmax, act_weight, input_act_eps, input_act, xq, xs,
             qdata, s_channel, bias_float, resid_2d, resid_scale, out,
             convrot_groupsize, group_size, DTYPE_TO_CODE[out_dtype],
-            torch.cuda.current_stream(x.device).cuda_stream,
+            torch.cuda.current_stream(x.device).cuda_stream, decode_lut, stream_codebook,
         )
     else:
+        if codebook is None and bits in (3, 4):
+            codebook = _w4a8_fixed_codebook(x.device, 1 << bits)
         bias_arg = _gemm_vector_arg(bias, x.device, out_dtype) if bias is not None else None
         used, _, _ = _w4a8_linear_chunked(
             x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
@@ -2938,8 +2982,8 @@ def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
     kk = _topk_count(n - _sink_count(n, s0, s1), topk_ratio)
     if kk == 0:   # nothing beyond the forced blocks: a threshold no finite score clears
         return torch.full(c8.shape[:-1], float("inf"), device=c8.device, dtype=c8.dtype)
-    # Head slices, scaled in place: the whole [BH, N, N] scores spilled a 10 GB card at 109k tokens
-    step = max(1, _SOL_TOPK_SLICE_BYTES // (n * n * c8.element_size()))
+    # Head slices, scaled in place: the whole [BH, NQ, N] scores spilled a 10 GB card at 109k tokens
+    step = max(1, _SOL_TOPK_SLICE_BYTES // (c8.shape[1] * n * c8.element_size()))
     row_scale = (csc * log2s).unsqueeze(-1)
     col_scale = ksc.squeeze(-1).unsqueeze(-2)
     kth = torch.empty(c8.shape[:-1], device=c8.device, dtype=c8.dtype)
@@ -3014,11 +3058,12 @@ def _topk_threshold(q, k, topk_ratio, scale, lengths, valid, sinks):
 _ROPE_FAB_CACHE = {}
 
 
-def _packed_rope_fab(freqs, t, rot):
+def _packed_rope_fab(freqs, t, rot, split_half=True):
     """[..., T, 1, rot/2, 2, 2] -> [T, rot, 2] per-channel (self, partner)
-    coefficients. Cached per freqs tensor (H3 reuses one across a step's
+    coefficients, pair i on channels (i, i + rot/2) or interleaved on
+    (2i, 2i + 1). Cached per freqs tensor (H3 reuses one across a step's
     layers); the weak ref validates an id() hit without retaining freqs."""
-    key = (id(freqs), t, rot)
+    key = (id(freqs), t, rot, split_half)
     hit = _ROPE_FAB_CACHE.get(key)
     if hit is not None and hit[0]() is freqs:
         return hit[1]
@@ -3027,10 +3072,12 @@ def _packed_rope_fab(freqs, t, rot):
         raise ValueError(f"sol_attn: rope_freqs covers {f.shape[0]} tokens, T={t}")
     with allocation_context():
         fab = torch.empty(t, rot, 2, device=freqs.device, dtype=torch.float32)
-    fab[:, :rot // 2, 0] = f[:, :, 0, 0]
-    fab[:, :rot // 2, 1] = f[:, :, 0, 1]
-    fab[:, rot // 2:, 0] = f[:, :, 1, 1]
-    fab[:, rot // 2:, 1] = f[:, :, 1, 0]
+    first, second = ((slice(0, rot // 2), slice(rot // 2, rot)) if split_half
+                     else (slice(0, rot, 2), slice(1, rot, 2)))
+    fab[:, first, 0] = f[:, :, 0, 0]
+    fab[:, first, 1] = f[:, :, 0, 1]
+    fab[:, second, 0] = f[:, :, 1, 1]
+    fab[:, second, 1] = f[:, :, 1, 0]
     _ROPE_FAB_CACHE.clear()   # one live entry
     _ROPE_FAB_CACHE[key] = (weakref.ref(freqs), fab)
     return fab
@@ -3069,10 +3116,11 @@ def sol_attn(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    q_offset: int = 0,
 ) -> torch.Tensor:
-    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors.
-    See sage_attention/sol_attn.cu and the public docstring for ``tail``,
-    ``block_len`` and ``coarse_gate``.
+    """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors;
+    k and v may be longer than q. See sage_attention/sol_attn.cu and the
+    public docstring for ``tail``, ``block_len``, ``coarse_gate`` and ``q_offset``.
 
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block
@@ -3089,14 +3137,15 @@ def sol_attn(
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
     _check_sol_args(q.device, sink_blocks, sink_q, topk_ratio, q=q, k=k, v=v,
-                    block_len=block_len, coarse_gate=coarse_gate)
+                    block_len=block_len, coarse_gate=coarse_gate, q_offset=q_offset)
+    tk = k.shape[1]
     if scale is None:
         scale = d ** -0.5
+    lengths = valid = None   # zero-padded tiles only; None keeps the default arithmetic exact
     if block_len is not None:
         block_len = block_len.contiguous()
-    lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
-    valid = _valid_rows(t, lengths) if block_len is not None else None
-    mean_lengths = lengths if block_len is not None else None   # exact default arithmetic
+        lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
+        valid = _valid_rows(t, lengths)
     # Only the last dim must be contiguous (16 B staging loads), so a BHND
     # view goes in as-is. A misaligned load faults asynchronously and poisons
     # the context, so base pointer and leading strides are checked here.
@@ -3118,13 +3167,13 @@ def sol_attn(
     kb = None
     if key_bias is not None:
         # exact branch only, in log2 units; biased blocks must be sink-covered
-        kb = _normalize_key_bias(key_bias, batch, t, q.device)
-        kb = (kb * _LOG2E).expand(batch, t).contiguous()
+        kb = _normalize_key_bias(key_bias, batch, tk, q.device)
+        kb = (kb * _LOG2E).expand(batch, tk).contiguous()
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug))
+    p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug), key_len=tk)
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
     # after the large buffers so its temporaries don't fragment the cache they reuse
-    thr = (_topk_threshold(q, k, topk_ratio, scale, mean_lengths, valid, sb)
+    thr = (_topk_threshold(q, k, topk_ratio, scale, lengths, valid, sb)
            if topk_ratio else None)
     _C.sol_attn(
         _wrap_for_dlpack(q),
@@ -3139,9 +3188,11 @@ def sol_attn(
         key_bias=None if kb is None else _wrap_for_dlpack(kb),
         threshold=None if thr is None else _wrap_for_dlpack(thr),
         block_len=None if block_len is None else _wrap_for_dlpack(block_len),
-        tail=bool(tail), token_aug=int(token_aug),
+        tail=bool(tail), token_aug=int(token_aug), q_offset=int(q_offset),
     )
     if coarse_gate is not None:
+        if lengths is None:
+            lengths = _block_lengths(t, (t + 63) // 64, q.device)
         add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
                     coarse_gate)
     return out
@@ -3165,21 +3216,25 @@ def sol_attn_chunked(
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
+    rope_split_half: bool = True,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
-    bf16, 64-aligned starts, B=1); full Q/K/V are never materialised.
+    bf16 or fp16, 64-aligned starts, B=1); full Q/K/V are never materialised.
     ``tail`` / ``block_len`` / ``coarse_gate`` / ``token_aug`` as in ``sol_attn``.
 
     ``qkv_chunks``: an iterable of chunks or a zero-arg callable returning one.
     ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when None the
     producer runs twice (measure, then quantize), so pass a callable to stream
-    on the first call. Returns ``(out[1,T,H,128] bf16, kmean_next, vscale_next)``."""
+    on the first call. ``rope_split_half``: q and k rotate in the pairs
+    (i, i + rot/2) of ``rms_rope_split_half``, or when False in the interleaved
+    pairs (2i, 2i + 1) of ``rms_rope``. Returns ``(out[1,T,H,128] in the chunks'
+    dtype, kmean_next, vscale_next)``."""
     d = _SOL_HD
     rot = rope_freqs.shape[-3] * 2
     # the fused rope pairs channels across lanes of 4: rot/2 must be lane-aligned
     if rot % 8 or not 0 < rot <= d:
         raise ValueError(f"sol_attn_chunked: rot_dim must be a multiple of 8 in (0, {d}], got {rot}")
-    fab = _packed_rope_fab(rope_freqs, t, rot)
+    fab = _packed_rope_fab(rope_freqs, t, rot, bool(rope_split_half))
     dev = fab.device
     _check_sol_args(dev, sink_blocks, sink_q, topk_ratio)
     if scale is None:
@@ -3198,8 +3253,10 @@ def sol_attn_chunked(
     ws = torch.empty(p["total"], dtype=torch.uint8, device=dev)
     stream = torch.cuda.current_stream(dev).cuda_stream
     width = 3 * h * d
+    dtype = torch.bfloat16
 
     def produce(km, vsc):
+        nonlocal dtype
         _C.sol_producer_begin(_wrap_for_dlpack(ws), 1, t, h, stream, token_aug=int(token_aug))
         t0 = 0
         for chunk in (factory() if factory is not None else qkv_chunks):
@@ -3207,17 +3264,19 @@ def sol_attn_chunked(
             if t0 % 64 and m:
                 raise ValueError("sol_attn_chunked: chunk starts must be 64-aligned")
             # bare pointers below: a wrong width reads OOB, a host tensor poisons the context
-            if chunk.shape[-1] != width or chunk.dtype != torch.bfloat16 or chunk.device != dev:
+            if (chunk.shape[-1] != width or chunk.dtype not in (torch.bfloat16, torch.float16)
+                    or chunk.device != dev):
                 raise ValueError(
-                    f"sol_attn_chunked: chunks must be [M, {width}] bfloat16 on {dev}, "
+                    f"sol_attn_chunked: chunks must be [M, {width}] bfloat16 or float16 on {dev}, "
                     f"got {tuple(chunk.shape)} {chunk.dtype} on {chunk.device}")
+            dtype = chunk.dtype
             _C.sol_producer_chunk(
-                _wrap_for_dlpack(ws), _wrap_for_dlpack(chunk.contiguous()),
+                _wrap_for_dlpack(ws), _wrap_for_dlpack(chunk.to(torch.bfloat16).contiguous()),
                 _wrap_for_dlpack(fab), _wrap_for_dlpack(qw), _wrap_for_dlpack(kw),
                 _wrap_for_dlpack(km), _wrap_for_dlpack(vsc),
                 float(rope_eps), rot, t0, m, 1, t, h, stream,
                 block_len=None if block_len is None else _wrap_for_dlpack(block_len),
-                token_aug=int(token_aug))
+                token_aug=int(token_aug), split_half=bool(rope_split_half))
             t0 += m
         if t0 != t:
             raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")
@@ -3250,7 +3309,8 @@ def sol_attn_chunked(
         block_len=None if block_len is None else _wrap_for_dlpack(block_len), tail=bool(tail), token_aug=int(token_aug))
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale), coarse_gate)
-    return out, kmean_next, vscale_of(vamax)
+    ws = None   # released before a converted copy of out exists
+    return out.to(dtype), kmean_next, vscale_of(vamax)
 
 
 def _perm_d_index(device):
@@ -3272,8 +3332,8 @@ def _ws_block_means(ws, p, bh, lengths):
     """(qm, km, vm) ``[BH, NTB, 128]`` fp32 block means over live rows, read
     from what the kernels already left in the workspace: the qmean slot, K
     means in scratch, V sums in vcT (bf16)."""
-    ntb, npad, d = p["NTB"], p["NPAD"], _SOL_HD
-    qm = ws[p["qmean"]:p["qmean"] + bh * npad * d * 4].view(torch.float32).view(bh, npad, d)[:, :ntb]
+    ntb, npad, nq, d = p["NTB"], p["NPAD"], p["NQ"], _SOL_HD
+    qm = ws[p["qmean"]:p["qmean"] + bh * nq * d * 4].view(torch.float32).view(bh, nq, d)
     vm = ws[p["vcT"]:p["vcT"] + bh * d * npad * 2].view(torch.bfloat16).view(bh, d, npad)[:, :, :ntb]
     return qm, _ws_ksums(ws, p, bh), vm.transpose(1, 2).float() / lengths.view(1, -1, 1)
 
@@ -3778,6 +3838,14 @@ def fp16_conv3d_out(
     out.copy_(res if residual is None else res + residual)
 
 
+def _group_norm_chunks(b: int, c: int, t: int, h: int, w: int) -> int:
+    # Match group_norm_chunk_rows in group_norm_config.h.
+    chunk_rows = 64
+    while chunk_rows < 1024 and b * t * h * w * ((c + 63) // 64) > 512 * chunk_rows:
+        chunk_rows *= 2
+    return -(-(h * w) // chunk_rows)
+
+
 def group_norm_silu_pad3d(
     x: torch.Tensor,
     weight: torch.Tensor | None,
@@ -3807,8 +3875,11 @@ def group_norm_silu_pad3d(
                   or b * (t + front) > 65535)
     row_stride = _ndhwc_row_stride(x) if served else None
     if served and row_stride is None:
-        row_stride = w * c
-        x = x.contiguous(memory_format=torch.channels_last_3d)
+        if c >= 32 and h * w >= 64 and x.is_contiguous() and _aligned16(x) and x.numel() >= 1 << 20:
+            row_stride = -t  # Use direct NCDHW reads when the transpose tile has enough work.
+        else:
+            row_stride = w * c
+            x = x.contiguous(memory_format=torch.channels_last_3d)
     served = served and _aligned16(x)  # the kernels issue 16-byte vector loads
     if not served:
         res = _eager_group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, stats)
@@ -3827,7 +3898,7 @@ def group_norm_silu_pad3d(
     if weight is None:
         weight = bias = placeholder
     elif stats is None:
-        chunks = -(-(h * w) // 1024)
+        chunks = _group_norm_chunks(b, c, t, h, w)
         workspace = torch.empty(2 * b * t * (chunks * c + num_groups), dtype=torch.float32, device=x.device)
     _C.group_norm_silu_pad3d(
         _wrap_for_dlpack(x), _wrap_for_dlpack(weight), _wrap_for_dlpack(bias),
@@ -3859,12 +3930,15 @@ def group_norm_stats3d(x: torch.Tensor, num_groups: int, eps: float) -> torch.Te
     served = not (c % 8 or c > 2048 or c % num_groups or num_groups > 1024 or b * t > 65535)
     row_stride = _ndhwc_row_stride(x) if served else None
     if served and row_stride is None:
-        row_stride = w * c
-        x = x.contiguous(memory_format=torch.channels_last_3d)
+        if x.is_contiguous() and _aligned16(x):
+            row_stride = -t  # Native contiguous NCDHW input; avoid a layout copy.
+        else:
+            row_stride = w * c
+            x = x.contiguous(memory_format=torch.channels_last_3d)
     served = served and _aligned16(x)
     if not served:
         return _eager_group_norm_stats3d(x, num_groups, eps)
-    chunks = -(-(h * w) // 1024)
+    chunks = _group_norm_chunks(b, c, t, h, w)
     workspace = torch.empty(2 * b * t * chunks * c, dtype=torch.float32, device=x.device)
     stats = torch.empty((b * t, num_groups, 2), dtype=torch.float32, device=x.device)
     _C.group_norm_stats3d(
@@ -3912,7 +3986,13 @@ def _apply_rope_cuda(
     xq: torch.Tensor, xk: torch.Tensor, freqs_cis: torch.Tensor, *,
     split_half: bool, inplace: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if xq.shape != xk.shape:
+    if xq.shape != xk.shape and (
+        not hasattr(_C, "apply_rope_gqa") or xq.ndim != 4 or xk.ndim != 4
+        or freqs_cis.ndim != 6 or xq.shape[0] != xk.shape[0]
+        or xq.shape[3] != xk.shape[3]
+        or xq.shape[2 if freqs_cis.shape[1] == 1 else 1]
+        != xk.shape[2 if freqs_cis.shape[1] == 1 else 1]
+    ):
         return (
             _apply_rope1_cuda(xq, freqs_cis, split_half=split_half, inplace=inplace),
             _apply_rope1_cuda(xk, freqs_cis, split_half=split_half, inplace=inplace),
@@ -4057,23 +4137,25 @@ def _rms_rope_cuda(
             fallback = (_eager_rope.rms_rope_split_half_ if inplace
                         else _eager_rope.rms_rope_split_half)
             return fallback(q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
-        return (
-            _rms_rope1_cuda(
-                q, freqs_cis, q_scale, epsilon,
-                split_half=split_half, inplace=inplace,
-            ),
-            _rms_rope1_cuda(
-                k, freqs_cis, k_scale, epsilon,
-                split_half=split_half, inplace=inplace,
-            ),
-        )
+        if not hasattr(_C, "rms_rope_gqa"):
+            return (
+                _rms_rope1_cuda(
+                    q, freqs_cis, q_scale, epsilon,
+                    split_half=split_half, inplace=inplace,
+                ),
+                _rms_rope1_cuda(
+                    k, freqs_cis, k_scale, epsilon,
+                    split_half=split_half, inplace=inplace,
+                ),
+            )
 
     assert _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope", rot_dim=rot_dim) is not None
 
     q_out = q if inplace else torch.empty_like(q)
     k_out = k if inplace else torch.empty_like(k)
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
-    _C.rms_rope(
+    native_op = _C.rms_rope if q.shape == k.shape else _C.rms_rope_gqa
+    native_op(
         _wrap_for_dlpack(q),
         _wrap_for_dlpack(k),
         _wrap_for_dlpack(freqs_cis),

@@ -204,6 +204,14 @@ set_source_files_properties(
     PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
 )
 
+# Round shared-edge products separately so adjacent triangles agree on ray hits.
+set_property(SOURCE ops/mesh_bvh.hip APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+
+# All INT8 GEMM schedules round (acc * row_scale) * column_scale before
+# adding bias. Fast math can fuse the add or reassociate the scales.
+set_source_files_properties(ops/gemm_int8.hip PROPERTIES
+    COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+
 set(CPP_SOURCES
     dlpack_bindings.cpp
     int8_decode_bindings.cpp
