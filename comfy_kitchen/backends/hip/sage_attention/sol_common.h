@@ -212,12 +212,14 @@ __forceinline__ __device__ void quant_k_rows(const T* tile, int len,
     }
 }
 
-// Fused per-head RMSNorm + split-half RoPE in place, matching ops/rms_rope.hip
+// Fused per-head RMSNorm + RoPE in place, over split-half pairs (c, c + rot/2) or
+// interleaved pairs (2c, 2c + 1). The split-half form matches ops/rms_rope.hip
 // including its bf16 rounding between norm and rotation. One wave per token, lane
 // owns channels 4 * lane .. +3.
 __forceinline__ __device__ void norm_rope_rows(__bf16* tile, int ld, int len,
                                                const float* __restrict__ fab_t0,
-                                               const __bf16* __restrict__ w, float eps, int rot) {
+                                               const __bf16* __restrict__ w, float eps, int rot,
+                                               bool split_half) {
     // fab [T, rot, 2] is per-channel: out[c] = f.x * n[c] + f.y * n[partner(c)]
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
     const int nw = static_cast<int>(blockDim.x >> 5), c0 = lane * 4;
@@ -237,13 +239,19 @@ __forceinline__ __device__ void norm_rope_rows(__bf16* tile, int ld, int len,
         // round_bf16, not a __bf16 round trip: -ffast-math folds the cast away.
 #pragma unroll
         for (int i = 0; i < 4; ++i) n[i] = round_bf16(x[i] * rrms * wreg[i]);
-        // Explicit source lane: an xor shuffle is only correct for power-of-two
-        // offsets and rot/8 need not be one (H3 rot=96 -> 12).
-        const int poff = rot >> 3;
-        const int src = (c0 < (rot >> 1)) ? lane + poff : (c0 < rot ? lane - poff : lane);
         float p[4];
+        if (split_half) {
+            // Explicit source lane: an xor shuffle is only correct for power-of-two
+            // offsets and rot/8 need not be one (H3 rot=96 -> 12).
+            const int poff = rot >> 3;
+            const int src = (c0 < (rot >> 1)) ? lane + poff : (c0 < rot ? lane - poff : lane);
 #pragma unroll
-        for (int i = 0; i < 4; ++i) p[i] = __shfl(n[i], src, 32);
+            for (int i = 0; i < 4; ++i) p[i] = __shfl(n[i], src, 32);
+        } else {
+            // an interleaved lane holds both channels of its two pairs
+#pragma unroll
+            for (int i = 0; i < 4; ++i) p[i] = n[i ^ 1];
+        }
         float out[4];
         if (c0 < rot) {
             const float* fr = fab_t0 + static_cast<int64_t>(t) * (rot * 2) + c0 * 2;

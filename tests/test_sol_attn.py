@@ -82,7 +82,7 @@ def _dense(q, k, v):
     return out.permute(0, 2, 1, 3)
 
 
-def _chunked_case(seed, rot, v_scale=1.0):
+def _chunked_case(seed, rot, v_scale=1.0, split_half=True):
     """A qkv-projection tensor plus everything both attention paths need from
     it: the separate-rope reference inputs and the producer's chunk list."""
     g = torch.Generator(device="cuda").manual_seed(seed)
@@ -96,7 +96,10 @@ def _chunked_case(seed, rot, v_scale=1.0):
     q = qkv[:, :h * d].view(1, t, h, d).clone()
     k = qkv[:, h * d:2 * h * d].view(1, t, h, d).clone()
     v = qkv[:, 2 * h * d:].view(1, t, h, d)
-    ck.rms_rope_split_half_(q, k, freqs, qw, kw, epsilon=1e-6, rot_dim=rot)
+    if split_half:
+        ck.rms_rope_split_half_(q, k, freqs, qw, kw, epsilon=1e-6, rot_dim=rot)
+    else:
+        ck.rms_rope_(q, k, freqs, qw, kw, epsilon=1e-6)
     return {"t": t, "h": h, "chunks": list(qkv.split(1024)), "freqs": freqs,
             "norm": (qw, kw), "q": q, "k": k, "v": v}
 
@@ -390,6 +393,39 @@ def test_chunked_producer_matches_separate_rope(rot):
             c["chunks"], c["t"], c["h"], c["freqs"].clone(), c["norm"], kmean=km, vscale=vs,
             tau=1.4, sink_blocks=[0, 2])
     assert _cos(out3, ref) > 0.995
+
+
+def test_chunked_producer_interleaved_rope():
+    """rope_split_half=False rotates the pairs (2i, 2i + 1): checked against
+    rms_rope_ + sol_attn, and against the split-half producer given the same q
+    and k with each head's channels regrouped into halves."""
+    c = _chunked_case(seed=11, rot=HD, v_scale=0.02, split_half=False)
+    t, h, kw = c["t"], c["h"], {"tau": 1.4, "sink_blocks": [0, 2]}
+    ref = backend.sol_attn(c["q"], c["k"], c["v"], **kw)
+    out1, km, vs = backend.sol_attn_chunked(
+        c["chunks"], t, h, c["freqs"], c["norm"], rope_split_half=False, **kw)
+    out2, _, _ = backend.sol_attn_chunked(
+        c["chunks"], t, h, c["freqs"], c["norm"], kmean=km, vscale=vs, rope_split_half=False, **kw)
+    assert _cos(out1, ref) > 0.995
+    assert _cos(out2, ref) > 0.995
+    order = torch.cat((torch.arange(0, HD, 2), torch.arange(1, HD, 2))).cuda()
+    qk = (order + HD * torch.arange(2 * h, device="cuda")[:, None]).flatten()
+    columns = torch.cat((qk, torch.arange(2 * h * HD, 3 * h * HD, device="cuda")))
+    halves, _, _ = backend.sol_attn_chunked(
+        [chunk[:, columns] for chunk in c["chunks"]], t, h, c["freqs"],
+        tuple(w[order] for w in c["norm"]), **kw)
+    assert _rel(out1, halves) < 2e-3
+
+
+def test_chunked_producer_fp16_chunks():
+    """fp16 chunks go through the bf16 kernel and the output comes back fp16."""
+    c = _chunked_case(seed=11, rot=64, v_scale=0.02)
+    chunks = [chunk.half() for chunk in c["chunks"]]
+    ref, _, _ = backend.sol_attn_chunked(
+        [chunk.bfloat16() for chunk in chunks], c["t"], c["h"], c["freqs"], c["norm"], tau=1.4)
+    got, _, _ = backend.sol_attn_chunked(chunks, c["t"], c["h"], c["freqs"], c["norm"], tau=1.4)
+    assert got.dtype == torch.float16
+    assert torch.equal(got, ref.half())
 
 
 def test_exact_branch_quantization_error():
@@ -972,3 +1008,72 @@ def test_block_len_validation():
     c = _chunked_case(seed=11, rot=64)
     with pytest.raises(ValueError, match="block_len"):
         backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], block_len=bad_dtype)
+
+
+# ---- k/v with their own length: keys the queries leave out (a conditioning prefix) ----
+
+# t queries against prefix + t + extra keys: a ragged prefix, a suffix
+@pytest.mark.parametrize("t,prefix,extra", [(1000, 100, 0), (1024, 0, 300)])
+@pytest.mark.parametrize("select", [{"tau": 1.0}, {"topk_ratio": 0.2}])
+def test_key_prefix_matches_eager(t, prefix, extra, select):
+    q = _qkv(1, t, 4)[0]
+    _, k, v = _qkv(1, prefix + t + extra, 4, seed=1)
+    kw = dict(sink_blocks=[0, (prefix + 63) // 64], q_offset=prefix, **select)
+    got = ck.sol_attn(q, k, v, **kw)
+    assert got.shape == q.shape
+    assert _cos(got, sol_attn_eager(q, k, v, **kw)) > 0.998
+
+
+@pytest.mark.parametrize("select", [{"tau": 1.0}, {"topk_ratio": 0.2}])
+def test_key_prefix_rows_equal_the_full_sequence_call(select):
+    """With a block-aligned prefix a query block routes exactly as it does when the
+    prefix rows are queries too; a batch and a key_bias ride along."""
+    prefix = 128
+    q, k, v = _qkv(2, prefix + 1000, 4, seed=5)
+    part_q = q[:, prefix:].contiguous()
+    bias = torch.zeros(prefix + 1000, device="cuda")
+    bias[:64] = float("-inf")
+    kw = dict(sink_blocks=[0, prefix // 64], key_bias=bias, **select)
+    assert torch.equal(ck.sol_attn(part_q, k, v, q_offset=prefix, **kw), ck.sol_attn(q, k, v, **kw)[:, prefix:])
+    # the token stage splits its tile list by the query count, so its sums differ in order
+    kw["token_aug"] = 256
+    assert _cos(ck.sol_attn(part_q, k, v, q_offset=prefix, **kw), ck.sol_attn(q, k, v, **kw)[:, prefix:]) > 0.9999
+
+
+def test_diagonal_band_follows_q_offset():
+    """Each query block's own keys and the 64 tokens on either side stay exact, also when
+    q_offset is off the key-block grid. Query i has one strong key, at q_offset + i + shift,
+    and every key block's mean is zero: no pooled score clears a threshold, so only the
+    band can find it."""
+    t, prefix, g = 1024, 100, torch.Generator(device="cuda").manual_seed(11)
+    for shift, in_band in ((-64, True), (64, True), (-192, False), (192, False)):
+        q = 1.25 * torch.randn(1, t, 2, HD, device="cuda", generator=g)
+        k = 0.05 * torch.randn(1, prefix + t, 2, HD, device="cuda", generator=g)
+        j = prefix + torch.arange(t, device="cuda") + shift
+        ok = (j >= 0) & (j < prefix + t)
+        k[:, j[ok]] = q[:, ok]
+        for a in range(0, prefix + t, 64):
+            k[:, a:a + 64] -= k[:, a:a + 64].mean(dim=1, keepdim=True)
+        v = torch.randn(1, prefix + t, 2, HD, device="cuda", generator=g)
+        q, k, v = (x.to(torch.bfloat16) for x in (q, k, v))
+        for fn in (ck.sol_attn, sol_attn_eager):
+            found = _cos(fn(q, k, v, tau=6.0, q_offset=prefix)[:, ok], _dense(q, k, v)[:, ok])
+            assert (found > 0.99) if in_band else (found < 0.5), (shift, fn.__module__, found)
+
+
+def test_key_length_validation():
+    """q is not empty, the keys are at least as long, q_offset keeps the queries inside
+    them, and block_len / coarse_gate describe one sequence."""
+    q, k, v = _qkv(1, 512, 4)
+    longer = [torch.cat([x, x[:, :128]], dim=1) for x in (k, v)]
+    for bad in (192, 2**32 + 128):   # past the 128 spare keys; wraps to 128 as a C int
+        with pytest.raises(ValueError, match="q_offset"):
+            backend.sol_attn(q, *longer, tau=1.4, q_offset=bad)
+    # fewer keys than queries: the last query blocks would have no always-exact band
+    for bad, why in (((q[:, :0], k, v), "at least one token"), ((q, k[:, :256], v[:, :256]), "as many rows as q")):
+        with pytest.raises(ValueError, match=why):
+            backend.sol_attn(*bad, tau=1.4)
+    for bad in ({"block_len": torch.full((8,), 64, dtype=torch.int32, device="cuda")}, {"coarse_gate": torch.zeros_like(q)}):
+        for fn in (backend.sol_attn, sol_attn_eager):
+            with pytest.raises(ValueError, match="same length"):
+                fn(q, *longer, tau=1.4, **bad)

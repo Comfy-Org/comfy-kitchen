@@ -4,6 +4,7 @@ import torch
 
 import comfy_kitchen
 from comfy_kitchen.tensor import (
+    AsymW4A8Int8Layout,
     BaseLayoutParams,
     QuantizedTensor,
     TensorCoreFP8Layout,
@@ -12,6 +13,21 @@ from comfy_kitchen.tensor import (
     TensorWiseINT8Layout,
     get_cuda_capability,
 )
+
+
+def test_w4a8_positional_transpose_flag():
+    params = AsymW4A8Int8Layout.Params(
+        torch.ones(32, 16), torch.float32, (256, 32), torch.ones(32), None, None, 16, 256, False, True,
+    )
+    assert params.transposed and params.decode_lut is None
+
+
+@pytest.mark.parametrize(("bits", "levels"), [(3, 16), (4, 8)])
+def test_w4a8_quantize_rejects_mismatched_codebook(bits, levels, device):
+    weight = torch.ones(16, 256, dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="codebook must have shape"):
+        QuantizedTensor.from_float(weight, "AsymW4A8Int8Layout", bits=bits,
+                                   codebook_tensor=torch.linspace(-1, 1, levels, device=device))
 
 
 @pytest.mark.parametrize("bits", [4, 6, 8])
@@ -52,6 +68,7 @@ def test_gemv_optimization_unsupported(layout):
     weight = QuantizedTensor.from_float(torch.randn(32, 256, dtype=torch.bfloat16), layout)
     storage = torch.full((64,), 73, dtype=torch.uint8)
     assert weight.optimize_for_gemv(storage) is weight
+    assert weight.optimize_for_gemm(storage) is weight
     assert torch.all(storage == 73)
 
 
