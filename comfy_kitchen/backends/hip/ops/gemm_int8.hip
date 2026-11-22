@@ -14,29 +14,49 @@
 
 namespace comfy::hip_backend {
 
-// Small-M path: reduce K across the wave, one wave per output column.
-template <typename OutT>
+struct PackedInt8B {
+    const uint8_t* data;
+    int kbytes;
+
+    __forceinline__ __device__ uint4 chunk(int row, int kbyte) const {
+        const int64_t offset = (static_cast<int64_t>(row / 256) * (kbytes / 64) + kbyte / 64) * 256 * 64
+                               + (row % 256) * 64 + kbyte % 64;
+        return *reinterpret_cast<const uint4*>(data + offset);
+    }
+};
+
+// Small-M path. A row-major column uses a whole wave. With tiled B, each
+// half-wave reduces a column and the other half reads the neighbouring column.
+template <bool Tiled, typename OutT, typename Epi>
 __global__ __launch_bounds__(256) void gemv_int8_kernel(
-    const int8_t* __restrict__ A, const int8_t* __restrict__ B, OutT* __restrict__ C,
-    int M, int N, int K, int ldc, EpiRowwise epi) {
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
+    int M, int N, int K, int ldc, Epi epi) {
 
     const int col = blockIdx.x * blockDim.y + threadIdx.y;
     const int row = blockIdx.y;
     if (col >= N || row >= M) return;
 
-    const int8_t* a = A + static_cast<int64_t>(row) * K;
-    const int8_t* b = B + static_cast<int64_t>(col) * K;
-
+    constexpr int lanes = Tiled ? 16 : kWave;
     int sum = 0;
-    for (int k = threadIdx.x * 16; k < K; k += kWave * 16) {
-        const uint4 av = *reinterpret_cast<const uint4*>(a + k);
-        const uint4 bv = *reinterpret_cast<const uint4*>(b + k);
+    for (int k = threadIdx.x * 16; k < K; k += lanes * 16) {
+        uint4 av, bv;
+        if constexpr (Tiled) {
+            // M <= 8, so every row belongs to the first 128-row activation tile.
+            const int64_t offset = static_cast<int64_t>(k / 128) * 128 * 128 + row * 128 + k % 128;
+            av = *reinterpret_cast<const uint4*>(A + offset);
+            bv = PackedInt8B{B, K}.chunk(col, k);
+        } else {
+            av = *reinterpret_cast<const uint4*>(A + static_cast<int64_t>(row) * K + k);
+            bv = *reinterpret_cast<const uint4*>(B + static_cast<int64_t>(col) * K + k);
+        }
         const int8_t* ab = reinterpret_cast<const int8_t*>(&av);
         const int8_t* bb = reinterpret_cast<const int8_t*>(&bv);
         #pragma unroll
         for (int i = 0; i < 16; ++i) sum += ab[i] * bb[i];
     }
-    sum = wave_reduce_sum(sum);
+    #pragma unroll
+    for (int offset = lanes / 2; offset > 0; offset /= 2)
+        sum += __shfl_xor(sum, offset, lanes);
 
     if (threadIdx.x == 0) {
         epi.init();
@@ -54,7 +74,7 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
     if (M <= 8) {
         dim3 block(kWave, 8);
         dim3 grid((N + 7) / 8, M);
-        gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
+        gemv_int8_kernel<false><<<grid, block, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
         return;
     }
 
@@ -337,7 +357,7 @@ __global__ __launch_bounds__(512) void gemm_int8_dual_m_tiled_kernel(
 // occupy adjacent slices in packed B; every weight load serves all M rows.
 template <int ROWS, typename OutT, typename Epi>
 __global__ __launch_bounds__(256) void gemv_int8_b_tiled_kernel(
-    const uint8_t* __restrict__ A, const int8_t* __restrict__ B,
+    const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
     OutT* __restrict__ C, int M, int N, int K, int ldc, Epi epi) {
     #pragma clang fp contract(off)
     #pragma clang fp reassociate(off)
@@ -358,9 +378,7 @@ __global__ __launch_bounds__(256) void gemv_int8_b_tiled_kernel(
         }
         __syncthreads();
         for (int k = k16; k < kc; k += 128) {
-            const int64_t offset = (static_cast<int64_t>(col / 256) * (K / 64) + (k0 + k) / 64) * 256 * 64
-                                   + (col % 256) * 64 + (k % 64);
-            const uint4 bv = *reinterpret_cast<const uint4*>(B + offset);
+            const uint4 bv = PackedInt8B{B, K}.chunk(col, k0 + k);
             #pragma unroll
             for (int m = 0; m < ROWS; ++m) {
                 if (m < M) {
@@ -546,10 +564,10 @@ __global__ __launch_bounds__(1024, 8) void gemm_int8_big_tiled_kernel(
     // B rows lie K bytes apart, so when K is a multiple of 4 KiB every row of a
     // step shares its low address bits, and with the grid in lockstep so does
     // every resident block: all of them queue on one L2 slice (gfx1200, K 16384:
-    // 61 TOPS against 121 at K 16640). Start each block's K walk at its own
-    // 256-byte phase so the resident blocks spread over the slices. The int32
-    // accumulation makes the order irrelevant to the result.
-    const int rot = (bid % 16) * (256 / BK) % nk;
+    // 61 TOPS against 121 at K 16640). Stagger those blocks by 256 bytes.
+    // Other row strides and packed B already spread the loads across slices;
+    // walking K in order lets neighbouring blocks reuse the same tiles.
+    const int rot = !BT && K % 4096 == 0 ? (bid % 16) * (256 / BK) % nk : 0;
     auto kb_at = [&](int t) { const int s = t + rot; return (s < nk ? s : s - nk) * BK; };
     issue_a(kb_at(0)); issue_b(kb_at(0));
     store_a(IC<1>{}, 0); store_b(IC<0>{}, 0);
@@ -679,17 +697,6 @@ __global__ __launch_bounds__(1024, 8) void gemm_int8_big_tiled_kernel(
 
 }  // namespace comfy::hip_backend
 
-struct PackedInt8B {
-    const uint8_t* data;
-    int kbytes;
-
-    __forceinline__ __device__ uint4 chunk(int row, int kbyte) const {
-        const int64_t offset = (static_cast<int64_t>(row / 256) * (kbytes / 64) + kbyte / 64) * 256 * 64
-                               + (row % 256) * 64 + kbyte % 64;
-        return *reinterpret_cast<const uint4*>(data + offset);
-    }
-};
-
 template <typename OutT, typename Epi>
 static void launch_int8_tiled_a(
     const uint8_t* A, const uint8_t* B, OutT* C,
@@ -697,15 +704,18 @@ static void launch_int8_tiled_a(
     using namespace comfy::hip_backend;
     constexpr int BM = 128, BN = 128, BKB = 128;
     if (b_tiled) {
-        if (M <= 4) {
+        if (M <= 8 && N <= 1024 && K > 1024) {
+            // Narrow weights have few column tiles. For long K, split rows across blocks.
+            gemv_int8_kernel<true><<<dim3(N / 8, M), dim3(16, 8), 0, stream>>>(
+                A, B, C, M, N, K, ldc, epi);
+        } else if (M <= 4) {
             dim3 grid(N / 32);
-            const int8_t* b = reinterpret_cast<const int8_t*>(B);
             if (M == 1)
-                gemv_int8_b_tiled_kernel<1><<<grid, 256, 0, stream>>>(A, b, C, M, N, K, ldc, epi);
+                gemv_int8_b_tiled_kernel<1><<<grid, 256, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
             else if (M <= 2)
-                gemv_int8_b_tiled_kernel<2><<<grid, 256, 0, stream>>>(A, b, C, M, N, K, ldc, epi);
+                gemv_int8_b_tiled_kernel<2><<<grid, 256, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
             else
-                gemv_int8_b_tiled_kernel<4><<<grid, 256, 0, stream>>>(A, b, C, M, N, K, ldc, epi);
+                gemv_int8_b_tiled_kernel<4><<<grid, 256, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         } else {
             dim3 grid(N / 256, (M + 255) / 256);
             if constexpr (std::is_same_v<OutT, __bf16>) {

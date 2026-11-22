@@ -209,7 +209,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
         output_dtype_code = _INT8_DEQUANT_DTYPE_TO_CODE.get(params.orig_dtype, 0)
         group_size = params.convrot_groupsize if getattr(params, "convrot", False) else 0
         result = torch.ops.comfy_kitchen.dequantize_int8_embedding(
-            qdata, params.scale, indices, group_size, output_dtype_code
+            qdata, params.scale, indices, group_size, output_dtype_code, params.tiled
         )
         return result.to(params.orig_dtype)
 
@@ -239,6 +239,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
             or params.transposed
             or not params.is_weight
             or params.orig_dtype != torch.bfloat16
+            or qdata.ndim != 2
+            or qdata.numel() == 0
             or not qdata.is_cuda
             or torch.version.hip is None
             or not registry.is_available("hip")

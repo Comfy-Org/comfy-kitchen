@@ -29,7 +29,8 @@ namespace comfy::hip_backend {
 // is the slow direction on this part (the destination's inner dimension is
 // the source's outer one). The check is per chunk, not per element: a chunk is
 // eight channels of one spatial position, so it is inside or outside as a
-// whole.
+// whole. Templated so the default path compiles without the border test.
+template <bool ZERO_BORDER>
 struct ConvPatchSrc {
     const uint8_t* x;
     int zpq, pq, q_out;
@@ -39,7 +40,6 @@ struct ConvPatchSrc {
     int sd, sh, sw;
     int in_h, in_w;  // the input's spatial extents
     int pad_h, pad_w;  // the zero border's size
-    bool zero_border;
 
     __forceinline__ __device__ uint4 chunk(int row, int kbyte) const {
         const int n = row / zpq;
@@ -58,8 +58,10 @@ struct ConvPatchSrc {
 
         const int py = p * sh + r - pad_h;
         const int px = q * sw + s - pad_w;
-        if (zero_border && (py < 0 || py >= in_h || px < 0 || px >= in_w)) {
-            return make_uint4(0, 0, 0, 0);
+        if constexpr (ZERO_BORDER) {
+            if (py < 0 || py >= in_h || px < 0 || px >= in_w) {
+                return make_uint4(0, 0, 0, 0);
+            }
         }
         const int64_t idx = n * xn + (z * sd + t) * xd + py * xh + px * xw + c0;
         return *reinterpret_cast<const uint4*>(x + 2 * idx);
@@ -121,9 +123,6 @@ extern "C" bool launch_fp16_conv3d_kernel(
     const int64_t xh = packed ? static_cast<int64_t>(W) * C : xs_h;
     const int64_t xd = packed ? static_cast<int64_t>(H) * W * C : xs_d;
     const int64_t xn = packed ? static_cast<int64_t>(D) * H * W * C : xs_n;
-    const ConvPatchSrc src{static_cast<const uint8_t*>(x), Z * P * Q, P * Q, Q, C, xw, xh, xd, xn,
-                           R * S, S, sd, sh, sw, H, W, zero_border ? (R - 1) / 2 : 0,
-                           zero_border ? (S - 1) / 2 : 0, zero_border};
     EpiFp16 epi{static_cast<const __half*>(bias), nullptr, static_cast<const __half*>(resid), K};
     // `kbytes` here is 2 * depth -- a **patch volume** (output positions times the
     // filter extent), not a K -- so the heuristic's K bands, which were calibrated
@@ -139,8 +138,19 @@ extern "C" bool launch_fp16_conv3d_kernel(
     // `padding_waste` -> skinny test, which is evaluated before any tile branch,
     // so no value of this flag reaches them. Seven conv shapes, interleaved,
     // identical with kstep32 true and false.
-    launch_gemm_wmma<MmaF16, EpiFp16, __half, ConvPatchSrc>(
-        src, static_cast<const uint8_t*>(w), static_cast<__half*>(out), M, K,
-        static_cast<int>(2 * depth), K, epi, stream, GemmPolicy{false, false});
+    auto run = [&](auto zero_tag) {
+        constexpr bool ZB = decltype(zero_tag)::value;
+        const ConvPatchSrc<ZB> src{static_cast<const uint8_t*>(x), Z * P * Q, P * Q, Q, C, xw, xh,
+                                   xd, xn, R * S, S, sd, sh, sw, H, W,
+                                   ZB ? (R - 1) / 2 : 0, ZB ? (S - 1) / 2 : 0};
+        launch_gemm_wmma<MmaF16, EpiFp16, __half, ConvPatchSrc<ZB>>(
+            src, static_cast<const uint8_t*>(w), static_cast<__half*>(out), M, K,
+            static_cast<int>(2 * depth), K, epi, stream, GemmPolicy{false, false});
+    };
+    if (zero_border) {
+        run(std::true_type{});
+    } else {
+        run(std::false_type{});
+    }
     return true;
 }

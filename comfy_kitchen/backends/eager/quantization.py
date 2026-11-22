@@ -1007,15 +1007,28 @@ def dequantize_int8_embedding(
     indices: torch.Tensor,
     group_size: int,
     output_dtype_code: int,
+    tiled: bool = False,
 ) -> torch.Tensor:
     """Gather rows from an INT8 embedding table ``[vocab, dim]`` and dequantize only those rows.
 
     Indexes first, unlike ``dequantize_int8_convrot_weight*`` which materializes the whole table.
     ``scale`` is per-row ``[vocab, 1]`` or scalar. ``group_size <= 0`` means the table is not
     ConvRot-rotated; if it is, the rows are un-rotated after the lookup (a Linear folds that into
-    its GEMM, a lookup has no GEMM). Returns ``[*indices.shape, dim]``.
+    its GEMM, a lookup has no GEMM). With ``tiled=True``, rows use the resident
+    INT8 GEMM layout. Returns ``[*indices.shape, dim]``.
     """
-    x = torch.nn.functional.embedding(indices, q).to(torch.float32)
+    if tiled:
+        # Each logical row spans K/64 chunks in [N/256, K/64, 256, 64] storage.
+        # Gather those chunks directly so temporary storage scales with the lookup.
+        # Keep invalid indices out of bounds even if their tile offset would overflow int64.
+        row = indices.long().clamp(-1, q.shape[0]).unsqueeze(-1)
+        chunks = q.shape[1] // 64
+        tile = (row // 256) * chunks + torch.arange(chunks, device=indices.device)
+        chunk_rows = tile * 256 + row % 256
+        codes = torch.nn.functional.embedding(chunk_rows, q.view(-1, 64)).flatten(-2)
+    else:
+        codes = torch.nn.functional.embedding(indices, q)
+    x = codes.to(torch.float32)
     if scale.dim() >= 2:
         x = x * torch.nn.functional.embedding(indices, scale).to(torch.float32)
     else:
@@ -1289,6 +1302,7 @@ def _op_dequantize_int8_embedding(
     indices: torch.Tensor,
     group_size: int,
     output_dtype_code: int,
+    tiled: bool = False,
 ) -> torch.Tensor:
     kwargs = {
         "q": q,
@@ -1297,12 +1311,14 @@ def _op_dequantize_int8_embedding(
         "group_size": group_size,
         "output_dtype_code": output_dtype_code,
     }
+    if tiled:
+        kwargs["tiled"] = True
     impl = registry.get_implementation("dequantize_int8_embedding", kwargs=kwargs)
     return impl(**kwargs)
 
 
 @_op_dequantize_int8_embedding.register_fake
-def _op_dequantize_int8_embedding_fake(q, scale, indices, group_size, output_dtype_code):
+def _op_dequantize_int8_embedding_fake(q, scale, indices, group_size, output_dtype_code, tiled=False):
     return torch.empty(
         (*indices.shape, q.shape[-1]),
         dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code],

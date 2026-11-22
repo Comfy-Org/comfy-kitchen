@@ -63,9 +63,11 @@ constexpr int kWave = 32;
 // fragment reads were the four-scalar form of that.
 struct LdsPad8 {
     static constexpr int kLdsPad = 8;
+    static constexpr bool kHoistEpi = false;
 };
 struct LdsPad16 {
     static constexpr int kLdsPad = 16;
+    static constexpr bool kHoistEpi = false;
 };
 
 // The 16-byte pad is a schedule trade measured on the 6-WGP 780M (see
@@ -389,6 +391,8 @@ struct MmaInt8 : MmaInt8Pad {
     using Acc = v8i;
     using Frag = v4i;  // whole K-step of 16 int8, duplicated across half-waves
     static constexpr int kStepBytes = 16;
+    // The hoisted epilogue is measured on this device pass only.
+    static constexpr bool kHoistEpi = kInt8LdsPad16;
     static __forceinline__ __device__ Frag load(const void* lds, int row, int kbyte, int stride,
                                                 int lane) {
         // LdsPad16 makes every LDS row 16-byte aligned (BKB is already a multiple

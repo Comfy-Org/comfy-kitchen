@@ -342,35 +342,49 @@ TileStager<BM, BKB, kThreads, kPad, COALESCED_STAGING> sa;
 
     // Row-major writeback: the TN column tiles of one accumulator row cover
     // TN*16 consecutive columns, keeping the stores of an iteration contiguous.
-    //
-    // The epilogue's per-row and per-column operands are hoisted into registers
-    // first. The stores below go through OutT*, so the compiler has to assume they
-    // may alias the scale / bias / residual pointers and re-issues every load in
-    // the loop -- and this loop runs TM*8*TN times per lane. The values handed to
-    // operator() are exactly the ones it used to load, so the arithmetic is
-    // unchanged; see epilogue.h.
     const int col_lane = acc_col(lane);
-    float col_scale[TN], col_bias_v[TN];
-    #pragma unroll
-    for (int j = 0; j < TN; ++j) {
-        const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
-        col_scale[j] = (col < N) ? epi.col_scale(col) : 0.0f;
-        col_bias_v[j] = (col < N) ? epi.col_bias(col) : 0.0f;
-    }
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
+    if constexpr (Mma::kHoistEpi) {
+        // gfx1103 int8: hoist the per-row and per-column operands. The stores
+        // go through OutT*, so without this the compiler must assume they alias
+        // the scale / bias pointers and re-issues every load per element.
+        float col_scale[TN], col_bias_v[TN];
         #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-            const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
-            if (r >= M) continue;
-            const float rs = epi.row_scale(r);
-            OutT* crow = C + static_cast<int64_t>(r) * ldc;
+        for (int j = 0; j < TN; ++j) {
+            const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
+            col_scale[j] = (col < N) ? epi.col_scale(col) : 0.0f;
+            col_bias_v[j] = (col < N) ? epi.col_bias(col) : 0.0f;
+        }
+        #pragma unroll
+        for (int i = 0; i < TM; ++i) {
             #pragma unroll
-            for (int j = 0; j < TN; ++j) {
-                const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
-                if (col >= N) continue;
-                crow[col] = static_cast<OutT>(epi(r, col, Mma::get(acc[i][j], e), rs, col_scale[j],
-                                                 col_bias_v[j]));
+            for (int e = 0; e < 8; ++e) {
+                const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
+                if (r >= M) continue;
+                const float rs = epi.row_scale(r);
+                OutT* crow = C + static_cast<int64_t>(r) * ldc;
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
+                    if (col >= N) continue;
+                    crow[col] = static_cast<OutT>(epi(r, col, Mma::get(acc[i][j], e), rs,
+                                                     col_scale[j], col_bias_v[j]));
+                }
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int i = 0; i < TM; ++i) {
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
+                if (r >= M) continue;
+                OutT* crow = C + static_cast<int64_t>(r) * ldc;
+                #pragma unroll
+                for (int j = 0; j < TN; ++j) {
+                    const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;
+                    if (col >= N) continue;
+                    crow[col] = static_cast<OutT>(epi(r, col, Mma::get(acc[i][j], e)));
+                }
             }
         }
     }

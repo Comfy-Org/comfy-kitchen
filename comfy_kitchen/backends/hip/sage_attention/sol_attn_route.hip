@@ -51,8 +51,10 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
     // token routing, or null: the best pooled score this row left unrouted, and
     // the [B*H, NQ, ceil(NTB/32)] bitmap of the blocks it left
     float* __restrict__ tok_ref, uint32_t* __restrict__ cand_bits,
-    const int32_t* __restrict__ blen, int tail, int T, int NTB,
-    int NPAD, int NQ, int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2) {
+    const int32_t* __restrict__ blen, int tail, int T, int NTB,   // T: key tokens
+    int NPAD, int NQ, int sink_s, int sink_e, int sink_qs, int sink_qe,
+    int diag_lo, int diag_span,   // always-exact band: diag_lo <= b - qb <= diag_lo + diag_span
+    float scale_log2) {
     __shared__ __attribute__((aligned(16))) int8_t sKc[BN * kStrideKc];
     __shared__ __attribute__((aligned(16))) __bf16 sVcT[HD * kStrideVc];
     __shared__ float sLen[BN];
@@ -148,7 +150,9 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
                 const bool pre = valid && b >= sink_lo && b < sink_e;
                 const float score =
                     valid ? static_cast<float>(s_acc[kt][e]) * qsc * sKcs[slot] : kNeg;
-                const bool routed = valid && ((score >= thr) || abs(qb - b) <= 1);
+                const bool in_band =
+                    static_cast<unsigned>(b - qb - diag_lo) <= static_cast<unsigned>(diag_span);
+                const bool routed = valid && ((score >= thr) || in_band);
                 const bool cand = !pre && (q_in_sink ? valid : routed);
                 if (cand) {
                     if (slot < 32) {
@@ -293,11 +297,11 @@ void launch_sol_route(const void* cen8, const void* cens, const void* kci, const
                       const void* vcT, const void* vsc, const void* threshold, void* blk_idx,
                       void* blk_cnt, void* o_part, void* m_part, void* l_part, void* tok_ref,
                       void* cand_bits,
-                      // NQ (query blocks) and NTB (key blocks) coincide today; kept
-                      // separate so a query prefix needs no kernel change
+                      // NQ (query blocks) and NTB (key blocks, of T key tokens) differ
+                      // when the keys carry rows the queries leave out (a conditioning prefix)
                       const void* blen, int tail, int B, int T, int H, int NTB, int NPAD, int NQ,
-                      int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2,
-                      hipStream_t stream) {
+                      int sink_s, int sink_e, int sink_qs, int sink_qe, int diag_lo,
+                      int diag_span, float scale_log2, hipStream_t stream) {
     dim3 grid((NQ + BQ - 1) / BQ, B * H);
     sol_route_kernel<<<grid, kThreads, 0, stream>>>(
         static_cast<const int8_t*>(cen8), static_cast<const float*>(cens),
@@ -307,5 +311,5 @@ void launch_sol_route(const void* cen8, const void* cens, const void* kci, const
         static_cast<int32_t*>(blk_cnt), static_cast<__bf16*>(o_part), static_cast<float*>(m_part),
         static_cast<float*>(l_part), static_cast<float*>(tok_ref),
         static_cast<uint32_t*>(cand_bits), static_cast<const int32_t*>(blen), tail, T, NTB, NPAD,
-        NQ, sink_s, sink_e, sink_qs, sink_qe, scale_log2);
+        NQ, sink_s, sink_e, sink_qs, sink_qe, diag_lo, diag_span, scale_log2);
 }

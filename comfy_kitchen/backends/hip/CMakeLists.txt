@@ -211,9 +211,13 @@ set_source_files_properties(
     PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
 )
 
-# ROCm clang still contracts the products despite #pragma clang fp contract(off) in
-# ray_triangle; only exact products keep neighbours' shared-edge functions exact negations.
-set_source_files_properties(ops/mesh_bvh.hip PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+# Round shared-edge products separately so adjacent triangles agree on ray hits.
+set_property(SOURCE ops/mesh_bvh.hip APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+
+# All INT8 GEMM schedules round (acc * row_scale) * column_scale before
+# adding bias. Fast math can fuse the add or reassociate the scales.
+set_source_files_properties(ops/gemm_int8.hip PROPERTIES
+    COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
 
 set(CPP_SOURCES
     dlpack_bindings.cpp
