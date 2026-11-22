@@ -31,12 +31,12 @@ endfunction()
 _ck_read_arch_group(COMFY_HIP_ELEMENTWISE_ARCHS elementwise_only)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX11_ARCHS wmma_gfx11)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX12_ARCHS wmma_gfx12)
-_ck_read_arch_group(COMFY_HIP_GEOMETRY_ARCHS geometry_only)
+_ck_read_arch_group(COMFY_HIP_CDNA_ARCHS cdna)
 set(COMFY_HIP_SUPPORTED_ARCHS
     ${COMFY_HIP_ELEMENTWISE_ARCHS}
     ${COMFY_HIP_WMMA_GFX11_ARCHS}
     ${COMFY_HIP_WMMA_GFX12_ARCHS}
-    ${COMFY_HIP_GEOMETRY_ARCHS}
+    ${COMFY_HIP_CDNA_ARCHS}
 )
 list(LENGTH COMFY_HIP_SUPPORTED_ARCHS _arch_count)
 list(REMOVE_DUPLICATES COMFY_HIP_SUPPORTED_ARCHS)
@@ -59,12 +59,13 @@ endforeach()
 set(CMAKE_HIP_ARCHITECTURES "${COMFY_HIP_ARCHS}")
 
 # RDNA targets get every kernel, at wave32, in _C. CDNA targets run wave64 only, so
-# they get just the geometry kernels, which do not depend on the wavefront size, in
-# _geom. One configure can build both: each kernel target sets its own architectures.
+# they get the geometry kernels, which do not depend on the wavefront size, and the
+# MFMA INT8 linear, in _cdna. One configure can build both: each kernel target sets
+# its own architectures.
 set(COMFY_HIP_WAVE32_ARCHS)
 set(COMFY_HIP_WAVE64_ARCHS)
 foreach(_arch IN LISTS COMFY_HIP_ARCHS)
-    if(_arch IN_LIST COMFY_HIP_GEOMETRY_ARCHS)
+    if(_arch IN_LIST COMFY_HIP_CDNA_ARCHS)
         list(APPEND COMFY_HIP_WAVE64_ARCHS ${_arch})
     else()
         list(APPEND COMFY_HIP_WAVE32_ARCHS ${_arch})
@@ -227,12 +228,21 @@ set_property(SOURCE ops/mesh_bvh.hip APPEND PROPERTY COMPILE_OPTIONS -ffp-contra
 set_source_files_properties(ops/gemm_int8.hip PROPERTIES
     COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
 
+# The MFMA INT8 linear reproduces the eager backend's rounding step by step.
+set_source_files_properties(ops/gemm_int8_mfma.hip PROPERTIES
+    COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+
 set(GEOMETRY_HIP_SOURCES
     ops/delaunay3d.hip
     ops/mesh_bvh.hip
     ops/connected_components.hip
     ops/edge_collapse.hip
     ops/min_cut.hip
+)
+
+set(CDNA_HIP_SOURCES
+    ${GEOMETRY_HIP_SOURCES}
+    ops/gemm_int8_mfma.hip
 )
 
 set(CPP_SOURCES
@@ -316,6 +326,6 @@ if(COMFY_HIP_WAVE32_ARCHS)
 endif()
 
 if(COMFY_HIP_WAVE64_ARCHS)
-    _ck_add_kernels(comfy_kitchen_hip_geometry_kernels "${COMFY_HIP_WAVE64_ARCHS}" ${GEOMETRY_HIP_SOURCES})
-    _ck_add_extension(_geom comfy_kitchen_hip_geometry_kernels geometry_module.cpp geometry_bindings.cpp)
+    _ck_add_kernels(comfy_kitchen_hip_cdna_kernels "${COMFY_HIP_WAVE64_ARCHS}" ${CDNA_HIP_SOURCES})
+    _ck_add_extension(_cdna comfy_kitchen_hip_cdna_kernels cdna_module.cpp geometry_bindings.cpp cdna_bindings.cpp)
 endif()

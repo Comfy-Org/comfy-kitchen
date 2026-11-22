@@ -54,6 +54,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
+from comfy_kitchen.tensor.int8_utils import _build_hadamard as _int8_hadamard
 
 logger = logging.getLogger("comfy_kitchen.hip")
 
@@ -167,8 +168,9 @@ def _load_extension(name: str):
 
 _C, _EXT_ERROR = _load_extension("_C")
 _EXT_AVAILABLE = _C is not None
-# Wave64-only (CDNA) targets get the geometry kernels as their own module, see CMakeLists.txt.
-_GEOM, _GEOM_ERROR = _load_extension("_geom")
+# Wave64-only (CDNA) targets get the geometry kernels and the MFMA INT8 linear as their
+# own module, see CMakeLists.txt.
+_CDNA, _CDNA_ERROR = _load_extension("_cdna")
 
 
 def _gfx_arch(device: torch.device | int | None = None) -> str | None:
@@ -210,8 +212,9 @@ _ARCH_WMMA_GFX117 = frozenset(_ARCH_GROUPS.get("wmma_gfx117", []))
 _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
 _ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX117 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
-# CDNA runs wave64 only, and every kernel but the geometry ones assumes wave32.
-_ARCH_GEOMETRY_ONLY = frozenset(_ARCH_GROUPS.get("geometry_only", []))
+# CDNA runs wave64 only, and every kernel but the geometry ones and the MFMA INT8
+# linear assumes wave32.
+_ARCH_CDNA = frozenset(_ARCH_GROUPS.get("cdna", []))
 _GEOMETRY_OPS = frozenset({
     "delaunay3d", "mesh_bvh", "closest_point_on_mesh", "closest_hit_on_mesh",
     "connected_components", "edge_collapse_checks", "min_cut",
@@ -264,25 +267,32 @@ def _geometry_unsupported_reason(arches: Sequence[str | None]) -> str | None:
     """Why the geometry ops must not register for this set of devices, or None if they may.
 
     They run on every target _unsupported_arch_reason accepts and also on the
-    geometry_only (CDNA) targets, provided the extension for each device loaded.
+    cdna targets, provided the extension for each device loaded.
     """
     if not arches:
         return "no HIP device available"
     if any(a is None for a in arches):
         return "could not read the architecture of every visible device"
-    unsupported = sorted({a for a in arches if a not in _ARCH_SUPPORTED | _ARCH_GEOMETRY_ONLY})
+    unsupported = sorted({a for a in arches if a not in _ARCH_SUPPORTED | _ARCH_CDNA})
     if unsupported:
         return f"architecture is not in the validated target manifest: {', '.join(unsupported)}"
-    if _GEOM is None and any(a in _ARCH_GEOMETRY_ONLY for a in arches):
-        return _GEOM_ERROR or "HIP geometry extension not built"
+    if _CDNA is None and any(a in _ARCH_CDNA for a in arches):
+        return _CDNA_ERROR or "HIP CDNA extension not built"
     if _C is None and any(a in _ARCH_SUPPORTED for a in arches):
         return _EXT_ERROR or "HIP extension not built"
     return None
 
 
 def _geometry_ext(device: torch.device):
-    """The extension holding the geometry kernels for ``device``: _geom on CDNA, else _C."""
-    return _GEOM if _gfx_arch(device) in _ARCH_GEOMETRY_ONLY else _C
+    """The extension holding the geometry kernels for ``device``: _cdna on CDNA, else _C."""
+    return _CDNA if _gfx_arch(device) in _ARCH_CDNA else _C
+
+
+def _is_cdna(device: torch.device) -> bool:
+    """Whether ``device`` is a CDNA target. Reads the cached arch list: this is on the per-GEMM path."""
+    arches = _visible_gfx_arches()
+    index = torch.cuda.current_device() if device.index is None else device.index
+    return 0 <= index < len(arches) and arches[index] in _ARCH_CDNA
 
 def _has_wmma(arches: Sequence[str | None]) -> bool:
     """Whether every visible device has matrix cores.
@@ -954,12 +964,18 @@ def int8_linear(
     residual_scale: torch.Tensor | None = None,
     weight_tiled: bool = False,
 ) -> torch.Tensor:
-    """INT8 linear with dynamic row-wise activation quantization, on WMMA.
+    """INT8 linear with dynamic row-wise activation quantization, on WMMA (MFMA on CDNA).
 
     weight_tiled: weight bytes are in the big-tile GEMM's B order (see
     TensorWiseINT8Layout.optimize_for_gemm); the kernel is selected from M at
     execution time without changing the weight layout.
     """
+    if _is_cdna(x.device):
+        if weight_tiled:
+            raise ValueError("tiled INT8 weights are a WMMA layout; CDNA reads the row-major weight")
+        return _int8_linear_cdna(
+            x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+            input_act, input_act_weight, input_act_eps, residual, residual_scale)
     x, input_act, act_weight = _split_input_act(
         x, input_act, input_act_weight, input_act_eps, convrot, convrot_groupsize)
     # k_act is the activated (quantized) row width: swiglu and situ halve the raw row.
@@ -1035,6 +1051,65 @@ def int8_linear(
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
     # pre-norm blocks apply it to.
+    return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale)
+
+
+def _int8_linear_cdna(
+    x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+    input_act, input_act_weight, input_act_eps, residual, residual_scale,
+) -> torch.Tensor:
+    """int8_linear on wave64 CDNA, bit-identical to the eager backend.
+
+    The input activation and the rotation are eager's; the row-wise quantizer and
+    the GEMM with its dequant epilogue are MFMA kernels that round as eager does.
+    They take bf16 in and out, which is what ComfyUI runs; other dtypes go to eager.
+    """
+    if x.dtype != torch.bfloat16 or out_dtype != torch.bfloat16:
+        return _eager.int8_linear(
+            x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+            input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
+            residual=residual, residual_scale=residual_scale,
+        )
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    k = x.shape[-1]
+    if k % 16 != 0 or k != weight.shape[-1]:
+        return _eager.int8_linear(
+            x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+            residual=residual, residual_scale=residual_scale,
+        )
+
+    # For ComfyUI's operands every conversion below is a no-op. This runs once per
+    # linear call and the denoisers are host-bound at small M, so keep it lean.
+    weight = _aligned(weight.to(device=x.device).contiguous())
+    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1).contiguous()
+    n = weight.shape[0]
+    if weight_scale.numel() not in (1, n):
+        raise ValueError(
+            f"INT8 weight scale must be scalar or per-output-channel, got {tuple(weight_scale.shape)}"
+        )
+    if bias is not None:
+        # eager adds the bias in the output dtype
+        bias = _bias_operand(bias, n, x.device).to(torch.bfloat16)
+
+    orig_shape = x.shape
+    if convrot:
+        if k % convrot_groupsize != 0:
+            raise ValueError(f"ConvRot group size {convrot_groupsize} does not divide input features {k}")
+        h = _int8_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        # eager's matmul over [rows, groups, G] folds to this mm, so the bits match;
+        # calling mm directly skips matmul's host-side shape handling.
+        x2d = torch.mm(x.reshape(-1, convrot_groupsize), h).view(-1, k)
+    else:
+        x2d = x.reshape(-1, k).contiguous()
+    m = x2d.shape[0]
+    # int8 rows, padded to 16 bytes, then the float32 row scales
+    q_bytes = (m * k + 15) // 16 * 16
+    workspace = torch.empty(q_bytes + 4 * m, dtype=torch.int8, device=x.device)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+    _CDNA.int8_linear_mfma(
+        _dl(x2d), _dl(weight), _dl(weight_scale), 0 if weight_scale.numel() == 1 else 1,
+        None if bias is None else _dl(bias), _dl(workspace), _dl(out), m, n, k, _stream(x2d),
+    )
     return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale)
 
 
@@ -4383,6 +4458,23 @@ def sage_int8_attend(
     return output
 
 
+def _cdna_int8_constraints() -> dict:
+    """The CDNA int8_linear kernels are bf16 in and out; other dtypes route to triton/eager."""
+    from comfy_kitchen.constraints import DivisibleBy, FunctionConstraints, ParamConstraint
+
+    bf16 = frozenset({torch.bfloat16})
+    return {
+        "int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=bf16, shape_rules=(DivisibleBy(-1, 16),)),
+                "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "out_dtype": ParamConstraint(dtypes=bf16),
+            },
+            default_devices=frozenset({"cuda", "hip"}),
+        ),
+    }
+
+
 def _register():
     from comfy_kitchen.registry import registry
 
@@ -4392,7 +4484,7 @@ def _register():
         registry.mark_unavailable("hip", "disabled by COMFY_KITCHEN_DISABLE_HIP=1")
         return
 
-    if not _EXT_AVAILABLE and _GEOM is None:
+    if not _EXT_AVAILABLE and _CDNA is None:
         registry.mark_unavailable("hip", _EXT_ERROR or "HIP extension not built")
         return
 
@@ -4405,12 +4497,14 @@ def _register():
     if reason is not None:
         # A CDNA device (alone or next to RDNA ones) still runs the geometry kernels.
         if _geometry_unsupported_reason(arches) is None:
-            registry.register(
-                name="hip",
-                module=sys.modules[__name__],
-                capabilities={k: v for k, v in _build_constraints(False).items() if k in _GEOMETRY_OPS},
-            )
-            logger.debug("registered HIP backend for %s (geometry ops only)", ", ".join(sorted(set(arches))))
+            capabilities = {k: v for k, v in _build_constraints(False).items() if k in _GEOMETRY_OPS}
+            # The MFMA int8_linear is advertised only when every device has it.
+            cdna_only = all(a in _ARCH_CDNA for a in arches)
+            if cdna_only:
+                capabilities.update(_cdna_int8_constraints())
+            registry.register(name="hip", module=sys.modules[__name__], capabilities=capabilities)
+            logger.debug("registered HIP backend for %s (%s)", ", ".join(sorted(set(arches))),
+                         "CDNA: geometry ops and int8_linear" if cdna_only else "geometry ops only")
             return
         registry.mark_unavailable("hip", reason)
         return

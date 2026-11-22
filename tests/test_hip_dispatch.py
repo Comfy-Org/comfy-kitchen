@@ -22,7 +22,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _HIP_DIR = _ROOT / "comfy_kitchen" / "backends" / "hip"
 _HIP_CMAKE = _HIP_DIR / "CMakeLists.txt"
 _HIP_ARCH_MANIFEST = _HIP_DIR / "architectures.json"
-_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12", "geometry_only")
+_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12", "cdna")
 _HIP_FULL_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
 _GEOMETRY_OPS = {
     "delaunay3d", "mesh_bvh", "closest_point_on_mesh", "closest_hit_on_mesh",
@@ -104,22 +104,22 @@ def test_hip_accepts_every_manifest_target(arch):
     assert hip_backend._unsupported_arch_reason([arch]) is None
 
 
-@pytest.mark.parametrize("arch", _manifest_archs(("geometry_only",)))
-def test_geometry_only_targets_get_only_the_geometry_ops(arch, monkeypatch):
+@pytest.mark.parametrize("arch", _manifest_archs(("cdna",)))
+def test_cdna_targets_are_declined_by_the_full_backend(arch, monkeypatch):
     """CDNA runs wave64 only: the full backend declines it, the geometry kernels do not."""
-    monkeypatch.setattr(hip_backend, "_GEOM", object())
+    monkeypatch.setattr(hip_backend, "_CDNA", object())
     assert hip_backend._unsupported_arch_reason([arch]) is not None
     assert hip_backend._geometry_unsupported_reason([arch]) is None
     assert not hip_backend._has_wmma([arch])
 
 
 def test_geometry_ops_need_the_extension_for_every_device(monkeypatch):
-    rdna, cdna = _manifest_archs(("wmma_gfx11",))[0], _manifest_archs(("geometry_only",))[0]
-    monkeypatch.setattr(hip_backend, "_GEOM", None)
+    rdna, cdna = _manifest_archs(("wmma_gfx11",))[0], _manifest_archs(("cdna",))[0]
+    monkeypatch.setattr(hip_backend, "_CDNA", None)
     monkeypatch.setattr(hip_backend, "_C", object())
     assert hip_backend._geometry_unsupported_reason([cdna]) is not None
     assert hip_backend._geometry_unsupported_reason([rdna]) is None
-    monkeypatch.setattr(hip_backend, "_GEOM", object())
+    monkeypatch.setattr(hip_backend, "_CDNA", object())
     assert hip_backend._geometry_unsupported_reason([rdna, cdna]) is None
     monkeypatch.setattr(hip_backend, "_C", None)
     assert hip_backend._geometry_unsupported_reason([rdna, cdna]) is not None
@@ -128,16 +128,16 @@ def test_geometry_ops_need_the_extension_for_every_device(monkeypatch):
 
 @pytest.mark.parametrize("arches", [[], [None], ["gfx90a"], ["gfx942", "gfx90a"], ["gfx942", None]])
 def test_geometry_ops_decline_unreviewed_or_unknown_targets(arches, monkeypatch):
-    monkeypatch.setattr(hip_backend, "_GEOM", object())
+    monkeypatch.setattr(hip_backend, "_CDNA", object())
     monkeypatch.setattr(hip_backend, "_C", object())
     assert hip_backend._geometry_unsupported_reason(arches) is not None
 
 
 def test_geometry_kernels_come_from_the_extension_built_for_the_device(monkeypatch):
     geom, full = object(), object()
-    monkeypatch.setattr(hip_backend, "_GEOM", geom)
+    monkeypatch.setattr(hip_backend, "_CDNA", geom)
     monkeypatch.setattr(hip_backend, "_C", full)
-    cdna, rdna = _manifest_archs(("geometry_only",))[0], _manifest_archs(("wmma_gfx12",))[0]
+    cdna, rdna = _manifest_archs(("cdna",))[0], _manifest_archs(("wmma_gfx12",))[0]
     monkeypatch.setattr(hip_backend, "_gfx_arch", lambda device=None: cdna if device == "cdna" else rdna)
     assert hip_backend._geometry_ext("cdna") is geom
     assert hip_backend._geometry_ext("rdna") is full
@@ -167,7 +167,7 @@ class _FakeGpuTensor:
 
 @pytest.mark.parametrize("full_hip", [True, False])
 def test_memmove_uses_the_native_kernel_only_with_the_full_hip_extension(monkeypatch, full_hip):
-    """A geometry-only registration (wave64 CDNA: _geom, no _C) keeps the copy fallback."""
+    """A CDNA registration (wave64: _cdna, no _C) keeps the copy fallback."""
     import comfy_kitchen as ck
 
     native_calls = []
@@ -186,7 +186,7 @@ def test_memmove_uses_the_native_kernel_only_with_the_full_hip_extension(monkeyp
         assert not native_calls
         assert torch.equal(dst.data, src)
 
-def test_cdna_registers_only_the_geometry_ops(monkeypatch):
+def _register_with(monkeypatch, arches, full_ext):
     calls = {}
 
     class FakeRegistry:
@@ -198,12 +198,63 @@ def test_cdna_registers_only_the_geometry_ops(monkeypatch):
 
     # the package attribute comfy_kitchen.registry is the registry object, not the module
     monkeypatch.setattr(sys.modules["comfy_kitchen.registry"], "registry", FakeRegistry())
-    monkeypatch.setattr(hip_backend, "_GEOM", object())
+    monkeypatch.setattr(hip_backend, "_CDNA", object())
+    if full_ext:
+        monkeypatch.setattr(hip_backend, "_C", object())
+        monkeypatch.setattr(hip_backend, "_EXT_AVAILABLE", True)
     monkeypatch.setattr(torch.version, "hip", "7.2", raising=False)
-    monkeypatch.setattr(hip_backend, "_visible_gfx_arches", lambda: tuple(_manifest_archs(("geometry_only",))))
+    monkeypatch.setattr(hip_backend, "_visible_gfx_arches", lambda: tuple(arches))
     monkeypatch.delenv("COMFY_KITCHEN_DISABLE_HIP", raising=False)
     hip_backend._register()
+    return calls
+
+
+def test_cdna_registers_the_geometry_ops_and_int8_linear(monkeypatch):
+    calls = _register_with(monkeypatch, _manifest_archs(("cdna",)), full_ext=False)
+    assert calls == {"register": _GEOMETRY_OPS | {"int8_linear"}}
+
+
+def test_cdna_int8_linear_is_bf16_only(monkeypatch):
+    """Other dtypes have no CDNA kernel, so the registry must route them past HIP."""
+    constraint = hip_backend._cdna_int8_constraints()["int8_linear"]
+    assert constraint.params["x"].dtypes == frozenset({torch.bfloat16})
+    assert constraint.params["out_dtype"].dtypes == frozenset({torch.bfloat16})
+
+
+def test_mixed_rdna_and_cdna_registers_only_the_geometry_ops(monkeypatch):
+    arches = [_manifest_archs(("wmma_gfx12",))[0], _manifest_archs(("cdna",))[0]]
+    calls = _register_with(monkeypatch, arches, full_ext=True)
     assert calls == {"register": _GEOMETRY_OPS}
+
+
+def _fake_cdna_linear(monkeypatch):
+    """Route int8_linear to the CDNA path on CPU; returns the list of eager fallback calls."""
+    eager_calls = []
+    monkeypatch.setattr(hip_backend, "_is_cdna", lambda device: True)
+    monkeypatch.setattr(hip_backend._eager, "int8_linear", lambda *a, **kw: eager_calls.append(kw) or "eager")
+    return eager_calls
+
+
+@pytest.mark.parametrize("dtype,out_dtype,k", [
+    (torch.float16, torch.float16, 64),
+    (torch.bfloat16, torch.float32, 64),
+    (torch.bfloat16, torch.bfloat16, 24),
+])
+def test_cdna_int8_linear_falls_back_to_eager_without_a_kernel(monkeypatch, dtype, out_dtype, k):
+    eager_calls = _fake_cdna_linear(monkeypatch)
+    monkeypatch.setattr(hip_backend, "_CDNA", None)  # a kernel launch would fail
+    x = torch.zeros(3, k, dtype=dtype)
+    w = torch.zeros(8, k, dtype=torch.int8)
+    out = hip_backend.int8_linear(x, w, torch.ones(()), out_dtype=out_dtype)
+    assert out == "eager"
+    assert len(eager_calls) == 1
+
+
+def test_cdna_int8_linear_rejects_tiled_weights(monkeypatch):
+    _fake_cdna_linear(monkeypatch)
+    x = torch.zeros(3, 64, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="tiled"):
+        hip_backend.int8_linear(x, torch.zeros(8, 64, dtype=torch.int8), torch.ones(()), weight_tiled=True)
 
 
 @pytest.mark.parametrize(
@@ -382,7 +433,7 @@ def test_architecture_manifest_is_unique_and_shared_by_setup_and_runtime():
     assert set(groups["wmma_gfx12"]) == hip_backend._ARCH_WMMA_GFX12
     assert "gfx1200" in groups["wmma_gfx12"]
     assert "gfx1201" in groups["wmma_gfx12"]
-    assert set(groups["geometry_only"]) == hip_backend._ARCH_GEOMETRY_ONLY
+    assert set(groups["cdna"]) == hip_backend._ARCH_CDNA
     assert set(_manifest_archs(_HIP_FULL_GROUP_NAMES)) == hip_backend._ARCH_SUPPORTED
 
 
@@ -451,17 +502,21 @@ def test_hip_kernels_are_independent_of_the_python_extension_target():
     assert module_calls
     assert all("${HIP_SOURCES}" not in call for call in module_calls)
     assert all("${GEOMETRY_HIP_SOURCES}" not in call for call in module_calls)
+    assert all("${CDNA_HIP_SOURCES}" not in call for call in module_calls)
 
 
-def test_cmake_builds_wave64_targets_only_the_geometry_kernels():
-    """CDNA cannot run wave32; only the wavefront-agnostic geometry kernels go to _geom."""
+def test_cmake_builds_wave64_targets_only_the_cdna_kernels():
+    """CDNA cannot run wave32; only the geometry kernels and the MFMA INT8 linear go to _cdna."""
     text = _HIP_CMAKE.read_text(encoding="utf-8")
 
-    assert "if(_arch IN_LIST COMFY_HIP_GEOMETRY_ARCHS)" in text
+    assert "if(_arch IN_LIST COMFY_HIP_CDNA_ARCHS)" in text
     assert re.search(
-        r"_ck_add_kernels\(comfy_kitchen_hip_geometry_kernels \S+ \$\{GEOMETRY_HIP_SOURCES\}\)", text
+        r"_ck_add_kernels\(comfy_kitchen_hip_cdna_kernels \S+ \$\{CDNA_HIP_SOURCES\}\)", text
     )
-    assert "_ck_add_extension(_geom comfy_kitchen_hip_geometry_kernels geometry_module.cpp geometry_bindings.cpp)" in text
+    assert ("_ck_add_extension(_cdna comfy_kitchen_hip_cdna_kernels cdna_module.cpp geometry_bindings.cpp "
+            "cdna_bindings.cpp)") in text
+    cdna = re.search(r"set\(CDNA_HIP_SOURCES\n(.*?)\)", text, re.DOTALL).group(1).split()
+    assert cdna == ["${GEOMETRY_HIP_SOURCES}", "ops/gemm_int8_mfma.hip"]
     # the wave32 flag goes on the full kernel set only
     assert text.count("-mno-wavefrontsize64") == 1
     assert re.search(r"target_compile_options\(comfy_kitchen_hip_kernels PRIVATE \$<\$<COMPILE_LANGUAGE:HIP>:"

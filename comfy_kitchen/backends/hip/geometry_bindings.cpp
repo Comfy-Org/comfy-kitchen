@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Geometry ops: Delaunay, triangle BVH queries, connected components, edge-collapse
 // checks and min cut. None of these kernels depend on the wavefront size, so this unit
-// is linked into _C (wave32, RDNA) and into _geom (native wave64, CDNA).
+// is linked into _C (wave32, RDNA) and into _cdna (native wave64, CDNA).
 #include <cstdint>
 #include <stdexcept>
 #include <string>

@@ -138,6 +138,13 @@ What a GPU gets depends on whether it has matrix cores:
 | RDNA3.5    | `gfx1150`-`gfx1153`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
 | RDNA3      | `gfx1100`-`gfx1103`         | WMMA, no fp8 | All HIP-supported kernels; fp8 widened  |
 | RDNA2      | `gfx1030`-`gfx1036`         | none         | Non-WMMA kernels incl. AWQ GEMV; WMMA GEMMs decline |
+| CDNA3      | `gfx942`                    | MFMA         | Mesh geometry kernels and bf16 `int8_linear` only |
+
+CDNA runs wave64 only, while every other HIP kernel is written for wave32, so
+CDNA targets get their own module, `_cdna`: the geometry kernels, which do not
+depend on the wavefront size, and an MFMA `int8_linear` whose quantizer and
+dequant epilogue round exactly as the eager backend does. Its output is
+bit-identical to eager.
 
 fp8, int8 and int4 share one byte-addressed tile kernel (`gemm_wmma.h`). RDNA3
 and RDNA4 spread a WMMA operand across the wave differently and RDNA3 has no fp8
