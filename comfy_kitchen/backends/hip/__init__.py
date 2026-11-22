@@ -1106,10 +1106,18 @@ def _int8_linear_cdna(
     q_bytes = (m * k + 15) // 16 * 16
     workspace = torch.empty(q_bytes + 4 * m, dtype=torch.int8, device=x.device)
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-    _CDNA.int8_linear_mfma(
+    args = (
         _dl(x2d), _dl(weight), _dl(weight_scale), 0 if weight_scale.numel() == 1 else 1,
         None if bias is None else _dl(bias), _dl(workspace), _dl(out), m, n, k, _stream(x2d),
     )
+    # The stream handle does not name a device (each device's default stream is null), so
+    # the operands' device must be current. Entering torch.cuda.device costs ~4 us per call,
+    # so only switch when it is not.
+    if x2d.device.index == torch.cuda.current_device():
+        _CDNA.int8_linear_mfma(*args)
+    else:
+        with torch.cuda.device(x2d.device):
+            _CDNA.int8_linear_mfma(*args)
     return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale)
 
 

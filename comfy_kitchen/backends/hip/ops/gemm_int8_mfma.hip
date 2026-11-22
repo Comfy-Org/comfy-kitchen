@@ -31,6 +31,9 @@ constexpr int kMaxGridY = 65535;
 
 __device__ __forceinline__ float bf16_round(float v) { return __bfloat162float(__float2bfloat16(v)); }
 
+// torch's amax and clamp propagate NaN; fmaxf drops it.
+__device__ __forceinline__ float nan_max(float a, float b) { return (a != a || b != b) ? __int_as_float(0x7fc00000) : fmaxf(a, b); }
+
 __device__ __forceinline__ void store_16b(int8_t* dst, int4 v) {
     // LDS rows are 8-byte aligned (PITCH), so the 16 loaded bytes go in as two longs.
     long* p = reinterpret_cast<long*>(dst);
@@ -145,22 +148,24 @@ __global__ __launch_bounds__(256) void quantize_int8_rowwise_bf16_exact_kernel(
     const __hip_bfloat16* xr = x + row * K;
 
     float m = 0.0f;
-    for (int j = t; j < K; j += 256) m = fmaxf(m, fabsf(__bfloat162float(xr[j])));
+    for (int j = t; j < K; j += 256) m = nan_max(m, fabsf(__bfloat162float(xr[j])));
     red[t] = m;
     __syncthreads();
     for (int s = 128; s > 0; s >>= 1) {
-        if (t < s) red[t] = fmaxf(red[t], red[t + s]);
+        if (t < s) red[t] = nan_max(red[t], red[t + s]);
         __syncthreads();
     }
 
-    const float scale = fmaxf(red[0] * (1.0f / 127.0f), 1e-30f);
+    // A NaN in the row makes its scale, and so its output row, NaN, as in eager.
+    const float scale = nan_max(red[0] * (1.0f / 127.0f), 1e-30f);
     if (t == 0) scales[row] = scale;
     const float sb = bf16_round(scale);
     int8_t* qr = q + row * K;
     for (int j = t; j < K; j += 256) {
         // rintf is round-half-to-even, matching torch.round.
         const float v = rintf(bf16_round(__fdiv_rn(__bfloat162float(xr[j]), sb)));
-        qr[j] = static_cast<int8_t>(fminf(fmaxf(v, -128.0f), 127.0f));
+        // NaN (inf / inf in an inf row) converts to 0 in torch's float-to-int8 cast.
+        qr[j] = v != v ? 0 : static_cast<int8_t>(fminf(fmaxf(v, -128.0f), 127.0f));
     }
 }
 

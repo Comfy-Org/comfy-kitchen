@@ -78,6 +78,37 @@ def test_cdna_int8_linear_noncontiguous_input_matches_eager():
         assert torch.equal(hip.int8_linear(x, w, ws, convrot=convrot), eager.int8_linear(x, w, ws, convrot=convrot))
 
 
+def test_cdna_int8_linear_nonfinite_rows_match_eager():
+    """A NaN or inf in a row makes eager's row scale non-finite; the output row must match, NaNs included."""
+    hip = _skip_unless_cdna()
+    torch.manual_seed(13)
+    x = torch.randn(6, 256, device="cuda", dtype=torch.bfloat16)
+    x[1, 7] = float("nan")
+    x[3, 0] = float("inf")
+    x[4, 9] = float("-inf")
+    w = torch.randint(-127, 128, (64, 256), dtype=torch.int8, device="cuda")
+    ws = torch.rand(64, device="cuda") * 0.01
+    b = torch.randn(64, device="cuda", dtype=torch.bfloat16)
+    got, want = hip.int8_linear(x, w, ws, b), eager.int8_linear(x, w, ws, b)
+    assert torch.equal(got.isnan(), want.isnan())
+    assert torch.equal(got.nan_to_num(), want.nan_to_num())
+
+
+def test_cdna_int8_linear_runs_on_the_operands_device():
+    """With another device current, the kernel must still launch on the operands' device."""
+    hip = _skip_unless_cdna()
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs two devices")
+    torch.manual_seed(17)
+    x = torch.randn(40, 512, device="cuda:1", dtype=torch.bfloat16)
+    w = torch.randint(-127, 128, (256, 512), dtype=torch.int8, device="cuda:1")
+    ws = torch.rand(256, device="cuda:1") * 0.01
+    with torch.cuda.device(0):
+        got = hip.int8_linear(x, w, ws, convrot=True)
+    assert got.device == x.device
+    assert torch.equal(got, eager.int8_linear(x, w, ws, convrot=True))
+
+
 def test_cdna_int8_linear_unaligned_weight_matches_eager():
     hip = _skip_unless_cdna()
     torch.manual_seed(3)
