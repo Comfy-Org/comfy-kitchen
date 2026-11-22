@@ -33,10 +33,10 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
     __bf16* __restrict__ vcT,
     float* __restrict__ ksum,  // [H, NPAD, HD] block K sums (post-rope)
     int8_t* __restrict__ cen8, float* __restrict__ cens,
-    float* __restrict__ qmean,       // [H, NPAD, HD] f32 block means (post-rope)
+    float* __restrict__ qmean,       // [H, NQ, HD] f32 block means (post-rope)
     float* __restrict__ vamax_next,  // [H, HD] atomicMax accumulator
-    const int32_t* __restrict__ blen, float rope_eps, int rot, int t0, int M, int T, int Tp, int H,
-    int NPAD, int NQ) {
+    const int32_t* __restrict__ blen, float rope_eps, int rot, bool split_half, int t0, int M,
+    int T, int Tp, int H, int NPAD, int NQ) {
     __shared__ __attribute__((aligned(16))) __bf16 sT[BLK * kLdTile];
     __shared__ __attribute__((aligned(16))) float sred[HD];
     const int blk_local = blockIdx.x, h = blockIdx.y, tid = threadIdx.x;
@@ -53,20 +53,20 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
     // ---------------- Q phase ----------------
     stage_tile64(sT, rows + static_cast<int64_t>(h) * HD, row_stride, len);
     __syncthreads();
-    norm_rope_rows(sT, kLdTile, len, fab_t0, qw, rope_eps, rot);
+    norm_rope_rows(sT, kLdTile, len, fab_t0, qw, rope_eps, rot, split_half);
     __syncthreads();
     quant_q_rows(sT, len, nrows, qi + (static_cast<size_t>(tb0) * H + h) * HD,
                  qs + static_cast<size_t>(tb0) * H + h, H);
     __syncthreads();
     const size_t qrow = static_cast<size_t>(h) * NQ + nblk;
     const float c = centroid_quant(sT, len, sred, cen8 + qrow * HD, cens + qrow);
-    qmean[(static_cast<size_t>(h) * NPAD + nblk) * HD + tid] = c;
+    qmean[qrow * HD + tid] = c;
     __syncthreads();
 
     // ---------------- K phase ----------------
     stage_tile64(sT, rows + static_cast<int64_t>(H + h) * HD, row_stride, len);
     __syncthreads();
-    norm_rope_rows(sT, kLdTile, len, fab_t0, kw, rope_eps, rot);
+    norm_rope_rows(sT, kLdTile, len, fab_t0, kw, rope_eps, rot, split_half);
     __syncthreads();
     {
         // block K sums (post-rope, uncentered) for the pooled tensors
@@ -124,7 +124,7 @@ void launch_sol_producer(const void* qkv, const void* fab, const void* qw, const
                          void* ksb, void* vT, void* vRow, void* vcT, void* ksum, void* cen8,
                          void* cens,
                          void* qmean, void* vamax_next, const void* blen, float rope_eps, int rot,
-                         int t0, int M, int T, int Tp, int H, int NPAD, int NQ,
+                         bool split_half, int t0, int M, int T, int Tp, int H, int NPAD, int NQ,
                          hipStream_t stream) {
     const int nblocks = (M + BLK - 1) / BLK;
     if (nblocks <= 0) return;
@@ -137,5 +137,5 @@ void launch_sol_producer(const void* qkv, const void* fab, const void* qw, const
         static_cast<__bf16*>(vcT),
         static_cast<float*>(ksum), static_cast<int8_t*>(cen8), static_cast<float*>(cens),
         static_cast<float*>(qmean), static_cast<float*>(vamax_next),
-        static_cast<const int32_t*>(blen), rope_eps, rot, t0, M, T, Tp, H, NPAD, NQ);
+        static_cast<const int32_t*>(blen), rope_eps, rot, split_half, t0, M, T, Tp, H, NPAD, NQ);
 }
