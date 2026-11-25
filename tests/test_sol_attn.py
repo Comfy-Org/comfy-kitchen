@@ -1185,7 +1185,7 @@ def test_key_order_groups_similar_keys():
     key cluster's rows into the same blocks (clusters are ~2 blocks long, so some blocks straddle)."""
     g = torch.Generator().manual_seed(11)
     t, h, start, clusters = 64 * 70 + 30, 3, 128, 32
-    (q, k, v), member = _clustered_keys(t, h, clusters, 0.5, g)
+    (q, k, _), member = _clustered_keys(t, h, clusters, 0.5, g)
     order = cuda_backend.sol_key_order(q, k, start)
     assert order.dtype == torch.int32 and tuple(order.shape) == (1, h, t)
     assert torch.equal(order.long().sort(-1).values, torch.arange(t, device="cuda").expand(1, h, t))
