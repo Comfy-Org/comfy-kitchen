@@ -336,6 +336,13 @@ def sol_attn_common_call_rule(kwargs):
     return ValidationResult.ok()
 
 
+def sol_attn_no_row_order_call_rule(kwargs):
+    """For a ``sol_attn`` backend without row orders (``key_order_from``)."""
+    if kwargs.get("key_order_from") is not None:
+        return ValidationResult.fail("key_order_from", "row orders need the CUDA backend")
+    return ValidationResult.ok()
+
+
 def na3d_common_call_rule(kwargs):
     """Shared ``na3d`` validation (used by every backend's entry).
 

@@ -37,7 +37,8 @@ __global__ void vquant_transpose(const E* __restrict__ v,
                                  const float* __restrict__ vsc,
                                  int8_t* __restrict__ vT, int8_t* __restrict__ vRow,
                                  int T, int Tp, int H,
-                                 int64_t sb, int64_t st, int64_t sh) {
+                                 int64_t sb, int64_t st, int64_t sh,
+                                 const int32_t* __restrict__ ord) {   // [B*H, T] row order, or null
     __shared__ __align__(16) int8_t sV[TT * LDS_PAD];
     const int bh = blockIdx.y, head = bh % H, batch = bh / H;
     const int t0 = blockIdx.x * TT;
@@ -47,8 +48,8 @@ __global__ void vquant_transpose(const E* __restrict__ v,
         const int t = idx / (HD / 16), c16 = (idx % (HD / 16)) * 16;
         __align__(16) int8_t out[16];
         if (t0 + t < T) {
-            const E* src =
-                v + batch * sb + (int64_t)(t0 + t) * st + head * sh + c16;
+            const int64_t row = ord ? ord[(size_t)bh * T + t0 + t] : t0 + t;
+            const E* src = v + batch * sb + row * st + head * sh + c16;
             #pragma unroll
             for (int j = 0; j < 16; ++j)
                 out[j] = q8(to_f32(src[j]), 1.f / vsc[bh * HD + c16 + j]);
@@ -93,13 +94,15 @@ __global__ void vquant_transpose(const E* __restrict__ v,
 void launch_sol_vtranspose(const void* v, const void* vsc, void* vT, void* vRow,
                            int B, int T, int Tp, int H,
                            int64_t sb, int64_t st, int64_t sh,
-                           int elem, cudaStream_t stream) {
+                           int elem, cudaStream_t stream, const void* ord) {
     dim3 grid((T + 255) / 256, B * H);
     if (elem == sol::SOL_FP16)
         vquant_transpose<256, __half><<<grid, NTHREADS, 0, stream>>>(
-            (const __half*)v, (const float*)vsc, (int8_t*)vT, (int8_t*)vRow, T, Tp, H, sb, st, sh);
+            (const __half*)v, (const float*)vsc, (int8_t*)vT, (int8_t*)vRow, T, Tp, H, sb, st, sh,
+            (const int32_t*)ord);
     else
         vquant_transpose<256, __nv_bfloat16><<<grid, NTHREADS, 0, stream>>>(
-            (const __nv_bfloat16*)v, (const float*)vsc, (int8_t*)vT, (int8_t*)vRow, T, Tp, H, sb, st, sh);
+            (const __nv_bfloat16*)v, (const float*)vsc, (int8_t*)vT, (int8_t*)vRow, T, Tp, H, sb, st, sh,
+            (const int32_t*)ord);
 }
 

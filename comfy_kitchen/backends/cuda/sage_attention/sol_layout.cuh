@@ -136,6 +136,20 @@ __device__ __forceinline__ void stage_tile64(
     }
 }
 
+// stage_tile64 through a row table: tile row t is source row rows[t] (src points at row 0).
+template <typename T>
+__device__ __forceinline__ void stage_tile64_rows(
+    T* tile, const T* __restrict__ src, int64_t stride, const int32_t* __restrict__ rows, int len)
+{
+    for (int idx = threadIdx.x; idx < BLOCK * (HEAD_DIM / 8); idx += HEAD_DIM) {
+        const int t = idx / (HEAD_DIM / 8), c8 = (idx % (HEAD_DIM / 8)) * 8;
+        uint4 val = make_uint4(0u, 0u, 0u, 0u);
+        if (t < len)
+            val = *reinterpret_cast<const uint4*>(src + (int64_t)rows[t] * stride + c8);
+        *reinterpret_cast<uint4*>(tile + t * LD_TILE + c8) = val;
+    }
+}
+
 // Per-token absmax scale + perm_d'd int8 row, one thread per token. qiP / qs
 // point at (this tile's first token, this head). Rows [len, nrows) exist in
 // memory but are dead (zero-padded tiles) and get zeros; rows past nrows do

@@ -53,7 +53,9 @@ constexpr int NSTAGE = 2;      // pipeline depth; occupancy beats depth here
 #define SOL_EXACT_BOUNDS __launch_bounds__(NTHREADS)
 #endif
 
-template <typename TOut>
+// ORDERED (carriers in a row order: q rows and output through it, the summary tail's tiles) is its own
+// instantiation: in the one kernel it costs the raster paths ~1%.
+template <typename TOut, bool ORDERED>
 __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const int8_t* __restrict__ qi, const float* __restrict__ qs,
     const int8_t* __restrict__ kiP, const float2* __restrict__ ksb,
@@ -64,7 +66,15 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const int8_t* __restrict__ vRow,          // [B*H,Tp,D] int8, row-major (token tiles)
     const uint32_t* __restrict__ tok_idx, const int32_t* __restrict__ tok_cnt, int n_tok,
     TOut* __restrict__ out,
-    int T, int Tp, int H, int NTB, float scale_log2)
+    int T, int Tp, int H, int NTB, float scale_log2,
+    const int32_t* __restrict__ ord,   // ORDERED: [B*H, T] row order of the carriers (output goes back through it)
+    const int32_t* __restrict__ q_ord, // ORDERED: ord when the q carriers were left in source row order, else null
+    // summary tail (all null without it)
+    const int8_t* __restrict__ sum_k,       // [B*H,NPAD,D] int8 summary keys (perm_d)
+    const float2* __restrict__ sum_sb,      // [B*H,NPAD] (ks, log2 mass)
+    const int8_t* __restrict__ sum_vT,      // [B*H][group][D][64] int8 summary V (vt_at), block n at perm_d(perm_key(n & 63)) of its group
+    const uint32_t* __restrict__ sum_bits,  // [B*H,NQ,ceil(NTB/32)] unrouted blocks per query block
+    int NPAD)
 {
 #if SOL_SM80
     __shared__ __align__(16) int8_t sK[NSTAGE * BK * LDK];
@@ -88,7 +98,8 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     uint32_t qa[KC][4];
     float qsc[2];
     {
-        const int r0 = min(q_row0, T - 1), r1 = min(q_row0 + 8, T - 1);
+        int r0 = min(q_row0, T - 1), r1 = min(q_row0 + 8, T - 1);
+        if (ORDERED && q_ord) { r0 = q_ord[(int64_t)bh * T + r0]; r1 = q_ord[(int64_t)bh * T + r1]; }
         const int8_t* p0 = qi + bh_base + (int64_t)r0 * H * HD;
         const int8_t* p1 = qi + bh_base + (int64_t)r1 * H * HD;
         #pragma unroll
@@ -253,6 +264,38 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         }
     }
 
+    // summary tiles: 64 key blocks per tile, each one virtual key whose bias carries the block's mass,
+    // scored by every row with its own query
+    if (ORDERED && sum_bits) {
+        cp_wait<0>();
+        __syncthreads();
+        float2* sKsb = reinterpret_cast<float2*>(SVT(1));   // as the token tiles: no smem to spare
+        const uint32_t* my_bits = sum_bits + ((int64_t)bh * gridDim.x + q_block) * ((NTB + 31) >> 5);
+        constexpr int VEC = HD / 16;
+        for (int base = 0; base < NTB; base += BK) {
+            const uint32_t w0 = my_bits[base >> 5], w1 = base + 32 < NTB ? my_bits[(base >> 5) + 1] : 0u;
+            if (!(w0 | w1)) continue;   // nothing of this group is in the tail (same for the whole CTA)
+            for (int idx = tid; idx < BK * VEC; idx += NTHREADS) {
+                const int p = idx / VEC, c16 = idx % VEC;
+                cp_async16(SK(0) + p * LDK + ((c16 ^ swz_k(p)) << 4),
+                           sum_k + ((int64_t)bh * NPAD + base + p) * HD + c16 * 16);
+            }
+            for (int idx = tid; idx < HD * 4; idx += NTHREADS) {
+                const int c = idx >> 2, part = idx & 3;
+                cp_async16(SVT(0) + c * LDV + ((part ^ swz_v(c)) << 4),
+                           sum_vT + (int64_t)bh * HD * NPAD + vt_at(base / BK, c) + part * 16);
+            }
+            if (tid < BK)
+                sKsb[tid] = (((tid < 32 ? w0 : w1) >> (tid & 31)) & 1u)
+                    ? sum_sb[(int64_t)bh * NPAD + base + tid] : make_float2(0.f, NEG);
+            cp_commit();
+            cp_wait<0>();
+            __syncthreads();
+            compute_tile(0, sKsb);
+            __syncthreads();
+        }
+    }
+
     // l is zero only when a row got no mass from either branch; zeros are right there
     const float inv0 = 1.f / fmaxf(l_r[0], 1e-30f);
     const float inv1 = 1.f / fmaxf(l_r[1], 1e-30f);
@@ -261,7 +304,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         const int r = q_row0 + rr * 8;
         if (r >= T) continue;
         const float inv = rr ? inv1 : inv0;
-        TOut* orow = out + bh_base + (int64_t)r * H * HD;
+        TOut* orow = out + bh_base + (int64_t)(ORDERED ? ord[(int64_t)bh * T + r] : r) * H * HD;
         #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
             const int c = nt * 8 + qd * 2;
@@ -281,19 +324,27 @@ void launch_sol_exact(
     const void* o_part, const void* m_part, const void* l_part,
     const void* vRow, const void* tok_idx, const void* tok_cnt, int n_tok, void* out,
     int B, int T, int Tp, int H, int NQ, int NTB,
-    float scale_log2, int elem, cudaStream_t stream)
+    float scale_log2, int elem, cudaStream_t stream, const void* ord, const void* q_ord,
+    const void* sum_k, const void* sum_sb, const void* sum_vT, const void* sum_bits, int NPAD)
 {
     dim3 grid(NQ, B * H);
-#define SOLX_LAUNCH(TOut)                                                              \
-    sol_exact_kernel<TOut><<<grid, NTHREADS, 0, stream>>>(                             \
+#define SOLX_LAUNCH(TOut, ORD)                                                         \
+    sol_exact_kernel<TOut, ORD><<<grid, NTHREADS, 0, stream>>>(                        \
         (const int8_t*)qi, (const float*)qs, (const int8_t*)kiP, (const float2*)ksb,   \
         (const int8_t*)vTi, (const float*)vsc,                                         \
         (const uint16_t*)blk_idx, (const int32_t*)blk_cnt,                             \
         (const __nv_bfloat16*)o_part, (const float*)m_part, (const float*)l_part,     \
         (const int8_t*)vRow, (const uint32_t*)tok_idx, (const int32_t*)tok_cnt, n_tok, \
-        (TOut*)out, T, Tp, H, NTB, scale_log2)
-    if (elem == sol::SOL_FP16) SOLX_LAUNCH(__half);
-    else SOLX_LAUNCH(__nv_bfloat16);
+        (TOut*)out, T, Tp, H, NTB, scale_log2, (const int32_t*)ord, (const int32_t*)q_ord, \
+        (const int8_t*)sum_k, (const float2*)sum_sb, (const int8_t*)sum_vT,            \
+        (const uint32_t*)sum_bits, NPAD)
+    if (ord) {
+        if (elem == sol::SOL_FP16) SOLX_LAUNCH(__half, true);
+        else SOLX_LAUNCH(__nv_bfloat16, true);
+    } else {
+        if (elem == sol::SOL_FP16) SOLX_LAUNCH(__half, false);
+        else SOLX_LAUNCH(__nv_bfloat16, false);
+    }
 #undef SOLX_LAUNCH
 }
 

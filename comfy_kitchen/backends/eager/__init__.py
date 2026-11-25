@@ -70,6 +70,7 @@ from comfy_kitchen.constraints import (
     ParamConstraint,
     na3d_common_call_rule,
     sol_attn_common_call_rule,
+    sol_attn_no_row_order_call_rule,
     window_attention_common_call_rule,
     with_out_param,
     with_w4a8_packed_storage,
@@ -684,7 +685,7 @@ def _build_constraints() -> dict:
             "v": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(4),)),
         },
         default_devices=all_devices,
-        call_rules=(sol_attn_common_call_rule,),
+        call_rules=(sol_attn_common_call_rule, sol_attn_no_row_order_call_rule),
     )
     out["na3d"] = FunctionConstraints(
         params={
