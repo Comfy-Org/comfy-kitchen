@@ -45,7 +45,7 @@ constexpr int NSTAGE = 2;      // pipeline depth; occupancy beats depth here
 // qi:  [B,T,H,D] int8
 // qs:  [B,T,H] f32
 // kiP: [B*H,Tp,D] int8 (perm_key + perm_d)   ksb: [B*H,Tp] float2 = (ks, bias)
-// vTi: [B*H,D,Tp] int8 (transposed; perm_d on keys, no perm_key)   vsc: [B*H,D] f32
+// vTi: [B*H][block][D][64] int8 (vt_at; perm_d on keys, no perm_key)   vsc: [B*H,D] f32
 // sm_120 fits 3 blocks/SM without spilling; sm_89 would spill, so Ada is unbounded.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
 #define SOL_EXACT_BOUNDS __launch_bounds__(NTHREADS, 3)
@@ -125,29 +125,46 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         l_r[0] = l_r[1] = l_part[qb_s];
     }
 
-#define SOLX_STAGE(kbi, buf)                                               \
+    // Staging: thread tid copies the 16-byte chunks tid + NTHREADS * i (i < 4) of the K tile and of the V^T
+    // tile. Source and destination both advance at a constant stride (the swizzles repeat every 16 K rows /
+    // 32 V^T rows), so a tile costs two base pointers instead of an index computation per chunk.
+    static_assert(BK * HD / 16 == 4 * NTHREADS && NTHREADS == 128, "staging strides assume 4 chunks per thread");
+    const int sk_off = (tid >> 3) * LDK + (((tid & 7) ^ swz_k(tid >> 3)) << 4);   // + i * 16 * LDK
+    const int sv_off = (tid >> 2) * LDV + (((tid & 3) ^ swz_v(tid >> 2)) << 4);   // + i * 32 * LDV
+    const int8_t* const k_src0 = kiP + kd_base + tid * 16;                        // + block * BK * HD + i * 16 * HD
+    const int8_t* const v_src0 = vTi + vT_base + tid * 16;                        // + block * HD * BK + i * 32 * BK
+    // the four chunks written out: a pragma cannot sit in a macro portably
+#define SOLX_STAGE_K(kbi, buf)   /* kbi is a block id */                   \
     {                                                                      \
-        const int64_t k0_ = (int64_t)(kbi) * BK;   /* kbi is a block id */ \
-        constexpr int VEC = HD / 16;                                       \
-        for (int idx = tid; idx < BK * VEC; idx += NTHREADS) {             \
-            const int p = idx / VEC, c16 = idx % VEC;                      \
-            cp_async16(SK(buf) + p * LDK + ((c16 ^ swz_k(p)) << 4),        \
-                       kiP + kd_base + (k0_ + p) * HD + c16 * 16);         \
-        }                                                                  \
-        for (int idx = tid; idx < HD * 4; idx += NTHREADS) {               \
-            const int c = idx >> 2, part = idx & 3;                        \
-            cp_async16(SVT(buf) + c * LDV + ((part ^ swz_v(c)) << 4),      \
-                       vTi + vT_base + (int64_t)c * Tp + k0_ + part * 16); \
-        }                                                                  \
+        int8_t* kd_ = SK(buf) + sk_off;                                    \
+        const int8_t* ks_ = k_src0 + (int64_t)(kbi) * BK * HD;             \
+        cp_async16(kd_, ks_);                                              \
+        cp_async16(kd_ + 16 * LDK, ks_ + 16 * HD);                         \
+        cp_async16(kd_ + 32 * LDK, ks_ + 32 * HD);                         \
+        cp_async16(kd_ + 48 * LDK, ks_ + 48 * HD);                         \
+    }
+#define SOLX_STAGE_V(kbi, buf)                                             \
+    {                                                                      \
+        int8_t* vd_ = SVT(buf) + sv_off;                                   \
+        const int8_t* vs_ = v_src0 + (int64_t)(kbi) * HD * BK;             \
+        cp_async16(vd_, vs_);                                              \
+        cp_async16(vd_ + 32 * LDV, vs_ + 32 * BK);                         \
+        cp_async16(vd_ + 64 * LDV, vs_ + 64 * BK);                         \
+        cp_async16(vd_ + 96 * LDV, vs_ + 96 * BK);                         \
     }
 
-    #pragma unroll
-    for (int st = 0; st < NSTAGE - 1; ++st) {
-        if (st < n_blocks) {
-            SOLX_STAGE(my_idx[st], st);
-        }
-        cp_commit();
-    }
+    // Split-phase staging. A tile's K is read in its first half (scores) and its V in the second (P.V), so
+    // the K buffer of tile kb is free at mid-tile: K(kb + 2) is requested there and V(kb + 1) at the top,
+    // which gives both one and a half tiles to land. Commit order: K(0), V(0), K(1), then V(kb + 1), K(kb + 2).
+    static_assert(NSTAGE == 2, "split-phase staging alternates two buffers");
+    int kbi0 = n_blocks > 0 ? my_idx[0] : 0;   // block of tile kb
+    int kbi1 = n_blocks > 1 ? my_idx[1] : 0;   // block of tile kb + 1
+    if (n_blocks > 0) { SOLX_STAGE_K(kbi0, 0); }
+    cp_commit();
+    if (n_blocks > 0) { SOLX_STAGE_V(kbi0, 0); }
+    cp_commit();
+    if (n_blocks > 1) { SOLX_STAGE_K(kbi1, 1); }
+    cp_commit();
 
     auto compute_tile = [&](int cur, const float2* kb_src) {
         int32_t s_acc[NKT][4];
@@ -161,19 +178,27 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
 
     for (int kb = 0; kb < n_blocks; ++kb) {
         const int cur = kb % NSTAGE;
-        const int64_t cur_k0 = (int64_t)my_idx[kb] * BK;
-        const int ahead = kb + NSTAGE - 1;
-        if (ahead < n_blocks) {
-            SOLX_STAGE(my_idx[ahead], ahead % NSTAGE);
-        }
+        const int kbi2 = kb + 2 < n_blocks ? my_idx[kb + 2] : 0;   // read half a tile before its use
+        cp_wait<2>();      // K(kb) has landed; V(kb) and K(kb + 1) may still be in flight
+        __syncthreads();   // ... for every thread, and no one still reads the other V buffer
+        int32_t s_acc[NKT][4];
+        tile_qk(SK(cur), qa, g, qd, s_acc);
+        if (kb + 1 < n_blocks) { SOLX_STAGE_V(kbi1, (kb + 1) % NSTAGE); }
         cp_commit();
-        cp_wait<NSTAGE - 1>();
-        __syncthreads();
-
-        compute_tile(cur, ksb + kp_base + cur_k0);
-        __syncthreads();   // next iteration refills `cur`
+        float p_val[NKT][4];
+        float bmax[2] = {m_r[0] - 20.f, m_r[1] - 20.f};   // floor: 2^-20 under the running max
+        bool has[2] = {true, true};                         // routed blocks always hold live keys
+        tile_scores<true>(s_acc, ksb + kp_base + (int64_t)kbi0 * BK, qsc, qd, p_val, bmax);
+        cp_wait<2>();      // V(kb) has landed; K(kb + 1) and V(kb + 1) may still be in flight
+        __syncthreads();   // ... for every thread, and no one still reads this K buffer
+        tile_softmax_pv<false>(p_val, bmax, has, SVT(cur), g, qd, m_r, l_r, c_r, o_acc);
+        if (kb + 2 < n_blocks) { SOLX_STAGE_K(kbi2, cur); }
+        cp_commit();
+        kbi0 = kbi1;
+        kbi1 = kbi2;
     }
-#undef SOLX_STAGE
+#undef SOLX_STAGE_K
+#undef SOLX_STAGE_V
 
     // token tiles: the listed tokens gathered into the block layout
     if (n_tok > 0) {

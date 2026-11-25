@@ -18,7 +18,7 @@
 // Sol-Attn preprocess: post-rope q/k/v -> the workspace carriers
 //   qiP  [B,T,H,D] int8   (perm_d)            qs   [B,T,H] f32
 //   kiP  [B*H,Tp,D] int8  (perm_key + perm_d) ksb  [B*H,Tp] float2 = (ks, bias)
-//   vTi  [B*H,D,Tp] int8  (perm_d on keys)    vsc  [B*H,D] f32  -- sol_attn_vtranspose.cu
+//   vTi  [B*H][block][D][64] int8 (vt_at, perm_d on keys)    vsc  [B*H,D] f32  -- sol_attn_vtranspose.cu
 //   kciP [B*H,NPAD,D] int8 (perm_d)           kcs  [B*H,NPAD] f32
 //   vcT  [B*H,D,NPAD] bf16                    threshold [B*H,NQ] f32
 //   cen8 [B*H,NQ,D] int8  (perm_d)            cens [B*H,NQ] f32

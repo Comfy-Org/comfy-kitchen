@@ -73,7 +73,9 @@ namespace {
 constexpr int HD = sol::HEAD_DIM;
 constexpr int BLK = sol::BLOCK;
 
-inline size_t align16(size_t n) { return (n + 15u) & ~(size_t)15u; }
+// Slots start on 128 B lines (the workspace is a CUDA allocation, so it does too): a tile that starts
+// mid-line costs the exact kernel a fifth fetch and twice the shared-memory writes per copy.
+inline size_t align_slot(size_t n) { return (n + 127u) & ~(size_t)127u; }
 
 // Workspace carve-up, a function of the shape and the token budget; exported by sol_attn_plan.
 struct Plan {
@@ -90,7 +92,7 @@ struct Plan {
         NQ = (T + BLK - 1) / BLK;
         const size_t bh = (size_t)B * H, tok = (size_t)B * T * H;
         size_t o = 0;
-        auto take = [&](size_t bytes) { const size_t s = o; o = align16(o + bytes); return s; };
+        auto take = [&](size_t bytes) { const size_t s = o; o = align_slot(o + bytes); return s; };
         qiP     = take(tok * HD);
         qs      = take(tok * sizeof(float));
         kiP     = take(bh * Tp * HD);

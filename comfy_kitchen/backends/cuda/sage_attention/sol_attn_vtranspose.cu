@@ -15,9 +15,9 @@
  * limitations under the License.
  */
 // V quantize + transpose: the exact kernel's PV B operand needs consecutive
-// KEYS per channel, so V is stored [B*H, D, Tp] int8 via shared memory, with
-// sol::perm_d applied to the key axis per 64-block (on the phase-1 smem row
-// index, which keeps phase 2 a contiguous copy).
+// KEYS per channel, so V is stored [B*H][block][D][64] int8 (sol::vt_at) via
+// shared memory, with sol::perm_d applied to the key axis per 64-block (on the
+// phase-1 smem row index, which keeps phase 2 a plain word copy).
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -64,8 +64,8 @@ __global__ void vquant_transpose(const E* __restrict__ v,
     }
     __syncthreads();
 
-    // phase 2: 4x4 byte register transposes -> coalesced write (T contiguous)
-    int8_t* dst0 = vT + (int64_t)bh * HD * Tp + t0;
+    // phase 2: 4x4 byte register transposes -> each channel's 4 keys as one word of its block's tile
+    int8_t* dst0 = vT + (int64_t)bh * HD * Tp;
     for (int idx = threadIdx.x; idx < (HD / 4) * (TT / 4); idx += NTHREADS) {
         const int cg = idx / (TT / 4), tg = (idx % (TT / 4)) * 4;
         if (t0 + tg >= Tp) continue;
@@ -84,7 +84,7 @@ __global__ void vquant_transpose(const E* __restrict__ v,
         }
         #pragma unroll
         for (int i = 0; i < 4; ++i)
-            *reinterpret_cast<uint32_t*>(dst0 + (int64_t)(cg * 4 + i) * Tp + tg) = w[i];
+            *reinterpret_cast<uint32_t*>(dst0 + vt_at((t0 + tg) >> 6, cg * 4 + i) + (tg & 63)) = w[i];
     }
 }
 

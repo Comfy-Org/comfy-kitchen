@@ -62,10 +62,11 @@ __host__ __device__ __forceinline__ int perm_key_inv(int s) {
     return 16 * (s >> 4) + 8 * ((s >> 1) & 1) + 4 * ((s >> 3) & 1) + 2 * ((s >> 2) & 1) + (s & 1);
 }
 
-// Smem XOR swizzles (K tile 64 x 128 B, V^T tile 128 x 64 B). Verify any
-// change by enumerating both 16-lane LDS.64 phases against 32 banks.
+// Smem XOR swizzles (K tile 64 x 128 B, V^T tile 128 x 64 B). Both move whole 32 B sectors only: a
+// swizzle that also swaps the 16 B halves of a sector doubles the wavefronts of every cp.async into the
+// tile. Verify any change by enumerating both 16-lane LDS.64 phases against 32 banks.
 __device__ __forceinline__ int swz_k(int row) { return (row & 3) * 2; }
-__device__ __forceinline__ int swz_v(int col) { return ((col >> 2) ^ col) & 3; }
+__device__ __forceinline__ int swz_v(int col) { return ((col >> 2) ^ col) & 2; }
 
 // Valid tokens at the FRONT of 64-block n: the caller's per-block table
 // (zero-padded tiles, clamped to [1, rows that exist]) or the plain ragged
@@ -459,6 +460,12 @@ __device__ __forceinline__ void tile_softmax_pv(float (&p_val)[TILE_NKT][4], flo
 __device__ __forceinline__ uint32_t pack_bf2(float lo, float hi) {
     __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);
     return *reinterpret_cast<uint32_t*>(&p);
+}
+
+// Transposed V carriers, [B*H][block][channel][64 keys]: a block's 128 channel rows are one 8 KB run, so a tile
+// copy fetches whole 128 B lines like the K tile's. Offset of (block, channel) within one (b, h).
+__host__ __device__ __forceinline__ int64_t vt_at(int64_t block, int channel) {
+    return (block * HEAD_DIM + channel) * BLOCK;
 }
 
 // ---- cp.async ----
