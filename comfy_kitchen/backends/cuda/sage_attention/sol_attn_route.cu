@@ -117,7 +117,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
             cp_async16_ca(sKc + p * LDK + ((c16 ^ swz_k(p)) << 4),
                           kciP + ((int64_t)bh * NPAD + gs + p) * HD + c16 * 16);
         }
-        for (int idx = tid; idx < HD * (BN / 8); idx += NTHREADS) {
+        for (int idx = tid; idx < HD * (BN / 8) && !scores_only; idx += NTHREADS) {   // the scores never read V
             const int c = idx / (BN / 8), part = idx % (BN / 8);
             cp_async16_ca(sVcT + c * LDV + part * 8,
                           vcT + ((int64_t)bh * HD + c) * NPAD + gs + part * 8);

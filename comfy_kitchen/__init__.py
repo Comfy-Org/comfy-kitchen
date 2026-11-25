@@ -245,8 +245,10 @@ def sol_attn(
             rows are regrouped so that every 64-token block holds similar keys,
             and the blocks a query block leaves out reach each of its rows as
             one weighted summary key per block. Pairs with ``topk_ratio``.
-            CUDA only; needs k and v as long as q and no ``q_offset``,
-            ``block_len``, ``key_bias``, ``coarse_gate`` or ``token_aug``.
+            ``sink_blocks`` and ``sink_q`` count blocks after the regrouping,
+            so they hold their original rows only below this row. CUDA only;
+            needs k and v as long as q and no ``q_offset``, ``block_len``,
+            ``key_bias``, ``coarse_gate`` or ``token_aug``.
 
     Returns:
         ``(B, T, H, 128)`` attention output, one row per query.

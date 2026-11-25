@@ -132,7 +132,7 @@ def sol_attn(
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,   # ignored: no token routing in the reference
     q_offset: int = 0,
-    key_order_from: int | None = None,   # CUDA only: this backend's call rule declines it
+    key_order_from: int | None = None,
 ) -> torch.Tensor:
     """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring.
 
@@ -148,6 +148,8 @@ def sol_attn(
     output rows are unspecified), and ``coarse_gate`` adds VSA's gated coarse
     branch: ``gate * softmax(q_mean k_mean^T * scale) v_mean`` per block.
     """
+    if key_order_from is not None:
+        raise NotImplementedError("sol_attn: row orders (key_order_from) are CUDA-only")
     b, t, h, d = q.shape
     tk = k.shape[1]
     n = (t + BLOCK - 1) // BLOCK                    # query blocks

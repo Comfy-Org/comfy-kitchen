@@ -15,7 +15,6 @@
 import contextlib
 import ctypes
 import importlib.util
-import itertools
 import os
 import sys
 import weakref
@@ -3396,7 +3395,7 @@ def sol_attn_chunked(
         """One chunk to the producer at row t0; ``vsc`` None: its values take their
         own range. Returns the V scale used."""
         nonlocal dtype
-        if t0 % 64 and chunk.shape[-2]:
+        if t0 % 64:
             raise ValueError("sol_attn_chunked: chunk starts must be 64-aligned")
         # bare pointers below: a wrong width reads OOB, a host tensor poisons the context
         if (chunk.shape[-1] != width or chunk.dtype not in (torch.bfloat16, torch.float16)
@@ -3423,6 +3422,8 @@ def sol_attn_chunked(
         t0, scales, rows = 0, [], 0
         for chunk in (chunks if chunks is not None else factory() if factory is not None else qkv_chunks):
             m = chunk.shape[-2]
+            if not m:
+                continue
             # row r takes chunk r // rows's V scale: every chunk before this one was `rows` long
             if vsc is None and scales and (t0 != rows * len(scales) or m > rows):
                 raise ValueError("sol_attn_chunked: a row order needs chunks of one size "
@@ -3430,6 +3431,7 @@ def sol_attn_chunked(
             rows = rows or m
             scales.append(stage(chunk, t0, km, vsc))
             t0 += m
+            del chunk   # gone before the next one is made
         if t0 != t:
             raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")
         return scales, rows
@@ -3443,12 +3445,19 @@ def sol_attn_chunked(
         # chunk's will do; each chunk's values take their own range, and sol_attn_reorder brings
         # them to the common scale as it regroups the rows
         it = iter(factory() if factory is not None else qkv_chunks)
-        first = next(it)
-        m0 = first.shape[-2]
+        head = [next((c for c in it if c.shape[-2]), None)]
+        if head[0] is None:
+            raise ValueError(f"sol_attn_chunked: chunks cover 0 tokens, T={t}")
+        m0 = head[0].shape[-2]
         _C.sol_producer_begin(_wrap_for_dlpack(ws), 1, t, h, stream, token_aug=int(token_aug))
-        stage(first, 0, torch.zeros(h, d, device=dev), torch.ones(h, d, device=dev))
+        stage(head[0], 0, torch.zeros(h, d, device=dev), torch.ones(h, d, device=dev))
         kmean = (_ws_ksums(ws, p, h)[:, :(m0 + 63) // 64].sum(1) / m0).contiguous()
-        scales, vfac_rows = produce(kmean, None, itertools.chain((first,), it))
+
+        def again():   # the first chunk once more, then the rest; popped so nothing else holds it
+            yield head.pop()
+            yield from it
+
+        scales, vfac_rows = produce(kmean, None, again())
         scales = torch.stack(scales)
         vscale = scales.amax(0).contiguous()
         vfac = (scales / vscale).contiguous()

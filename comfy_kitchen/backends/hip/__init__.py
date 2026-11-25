@@ -3134,7 +3134,7 @@ def sol_attn(
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
     q_offset: int = 0,
-    key_order_from: int | None = None,   # CUDA only: the registry rule declines it
+    key_order_from: int | None = None,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors;
     k and v may be longer than q. See sage_attention/sol_attn.hip and the
@@ -3149,6 +3149,8 @@ def sol_attn(
     scores highest, and the remaining tail is exact for the centroid instead of
     pooled per block.
     """
+    if key_order_from is not None:
+        raise NotImplementedError("sol_attn: row orders (key_order_from) are CUDA-only for now")
     batch, t, h, d = q.shape
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise ValueError(f"sol_attn: q/k/v must be bfloat16 or float16, got {q.dtype}")
