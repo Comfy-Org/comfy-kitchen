@@ -22,7 +22,6 @@ from comfy_kitchen.backends import hip as hip_backend
 from comfy_kitchen.backends.eager.sol_attn import sol_attn as sol_attn_eager
 from comfy_kitchen.exceptions import NoCapableBackendError
 
-from .conftest import cuda_backend_available
 
 
 def _fused_backend():
@@ -890,40 +889,13 @@ def test_coarse_gate_batch():
         assert _cos_rows(got[i:i + 1], alone, valid) > 0.9999
 
 
-def test_topk_budget_excludes_sinks():
-    """Sink blocks are always exact, so the top-k budget ranks and counts only
-    the other blocks; a sink range running past n counts only what exists.
-    This is the HIP backend's torch selection (it runs on any device); the CUDA
-    kernels select themselves, see the next test."""
-    from comfy_kitchen.backends.eager.sol_attn import _topk_count
-
-    _topk_from_pooled = hip_backend._topk_from_pooled
-    g = torch.Generator(device="cuda").manual_seed(2)
-    n, bh, d = 32, 3, HD
-    c8 = torch.randint(-127, 128, (bh, n, d), device="cuda", generator=g).float()
-    csc = torch.rand(bh, n, device="cuda", generator=g) + 0.5
-    kc = torch.randn(bh, n, d, device="cuda", generator=g)
-    for sinks, n_eff in (((0, 16), 16), ((28, 40), 28), ((0, 0), 32)):
-        thr = _topk_from_pooled(c8, csc, kc, 0.2, 1.0, sinks)
-        # recompute the kernel-space scores independently
-        ksc = (kc.abs().amax(-1, True) / 127.0).clamp_min(1e-12)
-        s = torch.bmm(c8, torch.round(kc / ksc).clamp(-127, 127).transpose(1, 2))
-        s = s * csc.unsqueeze(-1) * ksc.squeeze(-1).unsqueeze(-2)
-        s[..., sinks[0]:sinks[1]] = float("-inf")
-        kk = _topk_count(n_eff, 0.2)
-        expect = s.topk(kk, dim=-1).values[..., -1]
-        assert torch.allclose(thr, expect, rtol=2e-5), sinks
-        assert (s >= thr.unsqueeze(-1)).sum(-1).eq(kk).all(), sinks   # exactly kk non-sink blocks kept
-
-
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_topk_kernel_budget_excludes_sinks():
-    """The CUDA kernels pick the top-k threshold from their own pooled scores: every query
+    """The fused kernels pick the top-k threshold from their own pooled scores: every query
     block routes its sinks, the budget counted over the other blocks, and at most the three
     always-exact neighbour blocks on top."""
     from comfy_kitchen.backends.eager.sol_attn import _topk_count
 
-    ext, w = cuda_backend._C, _wrap
+    ext, w = backend._C, _wrap
     n, h = 32, 3
     t = 64 * n
     q, k, v = _qkv(1, t, h)
@@ -1088,7 +1060,6 @@ def _scattered(x, order):
     return out
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_order_is_gather_attend_scatter(dtype):
     """order= equals gather -> sol_attn(identity order) -> scatter; the tail's mean query is summed
@@ -1099,18 +1070,17 @@ def test_order_is_gather_attend_scatter(dtype):
     order = _row_order(t, h, 128, g)
     ident = torch.arange(t, dtype=torch.int32, device="cuda").expand(1, h, t).contiguous()
     kw = {"tau": 1.2, "sink_blocks": [0, 2], "sink_q": [1, 2]}
-    got = cuda_backend.sol_attn(q, k, v, order=order, **kw)
-    ref = _scattered(cuda_backend.sol_attn(_gathered(q, order), _gathered(k, order), _gathered(v, order), order=ident, **kw), order)
+    got = backend.sol_attn(q, k, v, order=order, **kw)
+    ref = _scattered(backend.sol_attn(_gathered(q, order), _gathered(k, order), _gathered(v, order), order=ident, **kw), order)
     assert _rel(got, ref) < 1e-3
     exact = {**kw, "tail": False}
-    assert torch.equal(cuda_backend.sol_attn(q, k, v, order=order, **exact),
-                       _scattered(cuda_backend.sol_attn(_gathered(q, order), _gathered(k, order), _gathered(v, order),
+    assert torch.equal(backend.sol_attn(q, k, v, order=order, **exact),
+                       _scattered(backend.sol_attn(_gathered(q, order), _gathered(k, order), _gathered(v, order),
                                                         order=ident, **exact), order))
     with pytest.raises(ValueError, match="token_aug"):
-        cuda_backend.sol_attn(q, k, v, order=order, token_aug=256, **kw)
+        backend.sol_attn(q, k, v, order=order, token_aug=256, **kw)
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_order_topk_selects_over_reordered_blocks():
     """top-k with order= selects over the reordered blocks: equal to the same path on pre-gathered tensors."""
     g = torch.Generator().manual_seed(5)
@@ -1119,15 +1089,14 @@ def test_order_topk_selects_over_reordered_blocks():
     order = _row_order(t, h, 64, g)
     ident = torch.arange(t, dtype=torch.int32, device="cuda").expand(1, h, t).contiguous()
     kw = {"topk_ratio": 0.2, "sink_blocks": [0, 1], "sink_q": [0, 1]}
-    got = cuda_backend.sol_attn(q, k, v, order=order, **kw)
-    ref = _scattered(cuda_backend.sol_attn(_gathered(q, order), _gathered(k, order), _gathered(v, order), order=ident, **kw), order)
+    got = backend.sol_attn(q, k, v, order=order, **kw)
+    ref = _scattered(backend.sol_attn(_gathered(q, order), _gathered(k, order), _gathered(v, order), order=ident, **kw), order)
     assert _rel(got, ref) < 1e-3
     wide = {**kw, "topk_ratio": 0.95}   # random rows: reordered blocks are no worse than raster ones
     dense = _dense(q, k, v)
-    assert _rel(cuda_backend.sol_attn(q, k, v, order=order, **wide), dense) < 1.2 * _rel(cuda_backend.sol_attn(q, k, v, **wide), dense)
+    assert _rel(backend.sol_attn(q, k, v, order=order, **wide), dense) < 1.2 * _rel(backend.sol_attn(q, k, v, **wide), dense)
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_order_tail_is_per_row():
     """Under order= the tail is per row: with keys and values constant inside each block the
     summaries are lossless, so 10% top-k matches dense on unrelated queries, and only with the tail."""
@@ -1139,32 +1108,31 @@ def test_order_tail_is_per_row():
     q = torch.randn(1, t, h, HD, generator=g).bfloat16().cuda()
     ident = torch.arange(t, dtype=torch.int32, device="cuda").expand(1, h, t).contiguous()
     dense = _dense(q, k, v)
-    per_row = _rel(cuda_backend.sol_attn(q, k, v, topk_ratio=0.1, order=ident), dense)
-    no_tail = _rel(cuda_backend.sol_attn(q, k, v, topk_ratio=0.1, order=ident, tail=False), dense)
+    per_row = _rel(backend.sol_attn(q, k, v, topk_ratio=0.1, order=ident), dense)
+    no_tail = _rel(backend.sol_attn(q, k, v, topk_ratio=0.1, order=ident, tail=False), dense)
     assert per_row < 0.05 and no_tail > 3 * per_row, (per_row, no_tail)
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_order_rejects_bad_input():
     g = torch.Generator().manual_seed(1)
     t, h = 512, 2
     q, k, v = (torch.randn(1, t, h, HD, generator=g).bfloat16().cuda() for _ in range(3))
     order = _row_order(t, h, 0, g)
     with pytest.raises(ValueError):   # int64
-        cuda_backend.sol_attn(q, k, v, order=order.long())
+        backend.sol_attn(q, k, v, order=order.long())
     with pytest.raises(ValueError):   # a row outside the sequence
         bad = order.clone()
         bad[0, 1, 7] = t
-        cuda_backend.sol_attn(q, k, v, order=bad)
+        backend.sol_attn(q, k, v, order=bad)
     with pytest.raises(ValueError, match="once per head"):   # a repeated row leaves another one unwritten
         bad = order.clone()
         bad[0, 0, 5] = bad[0, 0, 6]
-        cuda_backend.sol_attn(q, k, v, order=bad)
+        backend.sol_attn(q, k, v, order=bad)
     with pytest.raises(ValueError):   # longer keys
         k2, v2 = (torch.cat([x, x[:, :64]], 1) for x in (k, v))
-        cuda_backend.sol_attn(q, k2, v2, order=order)
+        backend.sol_attn(q, k2, v2, order=order)
     with pytest.raises(ValueError):   # block_len
-        cuda_backend.sol_attn(q, k, v, order=order, block_len=torch.full((t // 64,), 64, dtype=torch.int32, device="cuda"))
+        backend.sol_attn(q, k, v, order=order, block_len=torch.full((t // 64,), 64, dtype=torch.int32, device="cuda"))
 
 
 def _clustered_keys(t, h, clusters, noise, gen):
@@ -1179,18 +1147,17 @@ def _clustered_keys(t, h, clusters, noise, gen):
     return tuple(x.unsqueeze(0).bfloat16().cuda() for x in (q, k, v)), member.cuda()
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_key_order_groups_similar_keys():
     """sol_key_order: a reproducible per-head permutation that leaves the prefix alone and packs a
     key cluster's rows into the same blocks (clusters are ~2 blocks long, so some blocks straddle)."""
     g = torch.Generator().manual_seed(11)
     t, h, start, clusters = 64 * 70 + 30, 3, 128, 32
     (q, k, _), member = _clustered_keys(t, h, clusters, 0.5, g)
-    order = cuda_backend.sol_key_order(q, k, start)
+    order = backend.sol_key_order(q, k, start)
     assert order.dtype == torch.int32 and tuple(order.shape) == (1, h, t)
     assert torch.equal(order.long().sort(-1).values, torch.arange(t, device="cuda").expand(1, h, t))
     assert torch.equal(order[..., :start], torch.arange(start, device="cuda", dtype=torch.int32).expand(1, h, start))
-    assert torch.equal(order, cuda_backend.sol_key_order(q, k, start))
+    assert torch.equal(order, backend.sol_key_order(q, k, start))
     # purity: share of a full block's rows that belong to its most common cluster
     full = (t - start) // 64 * 64
     lab = torch.gather(member, 1, order[0, :, start:start + full].long()).view(h, -1, 64)
@@ -1200,7 +1167,6 @@ def test_key_order_groups_similar_keys():
     assert purity > 0.6 and raster_purity < 0.2, (purity, raster_purity)
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_key_order_lowers_topk_error():
     """On clustered keys in shuffled rows, top-k over regrouped blocks is far closer to dense than over raster ones."""
     g = torch.Generator().manual_seed(12)
@@ -1208,47 +1174,43 @@ def test_key_order_lowers_topk_error():
     (q, k, v), _ = _clustered_keys(t, h, 32, 0.5, g)
     dense = _dense(q, k, v)
     kw = {"topk_ratio": 0.1, "sink_blocks": [0, 1], "sink_q": [0, 1]}
-    raster = _rel(cuda_backend.sol_attn(q, k, v, **kw), dense)
-    grouped = _rel(cuda_backend.sol_attn(q, k, v, order=cuda_backend.sol_key_order(q, k, 64), **kw), dense)
+    raster = _rel(backend.sol_attn(q, k, v, **kw), dense)
+    grouped = _rel(backend.sol_attn(q, k, v, order=backend.sol_key_order(q, k, 64), **kw), dense)
     assert grouped < 0.5 * raster, (grouped, raster)
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_public_key_order_from():
-    """ck.sol_attn(key_order_from=) is the CUDA path under sol_key_order's order; the eager
+    """ck.sol_attn(key_order_from=) is the fused path under sol_key_order's order; the eager
     reference declines it."""
     g = torch.Generator().manual_seed(14)
     t, h = 64 * 30 + 9, 2
     (q, k, v), _ = _clustered_keys(t, h, 16, 0.5, g)
     kw = {"topk_ratio": 0.1, "sink_blocks": [0, 1], "sink_q": [0, 1]}
     got = ck.sol_attn(q, k, v, key_order_from=64, **kw)
-    order = cuda_backend.sol_key_order(q, k, 64)
-    assert torch.equal(got, cuda_backend.sol_attn(q, k, v, order=order, **kw))
+    order = backend.sol_key_order(q, k, 64)
+    assert torch.equal(got, backend.sol_attn(q, k, v, order=order, **kw))
     with pytest.raises(ValueError, match="not both"):
-        cuda_backend.sol_attn(q, k, v, order=order, key_order_from=64, **kw)
+        backend.sol_attn(q, k, v, order=order, key_order_from=64, **kw)
     with pytest.raises(NoCapableBackendError, match="key_order_from"):
         ck.sol_attn(*(x[:, :256].cpu() for x in (q, k, v)), key_order_from=0, **kw)
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_key_order_rejects_bad_start():
     q = torch.randn(1, 512, 2, HD).bfloat16().cuda()
     for bad in (-64, 100, 512):
         with pytest.raises(ValueError):
-            cuda_backend.sol_key_order(q, q, bad)
+            backend.sol_key_order(q, q, bad)
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_key_order_batched_fp16():
     g = torch.Generator().manual_seed(13)
     t, start = 64 * 9 + 5, 64
     q, k = (torch.randn(2, t, 2, HD, generator=g).half().cuda() for _ in range(2))
-    order = cuda_backend.sol_key_order(q, k, start)
+    order = backend.sol_key_order(q, k, start)
     assert torch.equal(order.long().sort(-1).values, torch.arange(t, device="cuda").expand(2, 2, t))
     assert torch.equal(order[..., :start], torch.arange(start, device="cuda", dtype=torch.int32).expand(2, 2, start))
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_key_order_with_constant_queries():
     """A head whose queries are all equal has no query covariance: the planner falls back to the plain
     key metric instead of failing to factorise it, on the direct and on the producer path."""
@@ -1256,37 +1218,35 @@ def test_key_order_with_constant_queries():
     t, h, rot = 64 * 40, 2, 64
     q, k, v = (torch.randn(1, t, h, HD, generator=g).bfloat16().cuda() for _ in range(3))
     q[:, :, 0] = 0
-    order = cuda_backend.sol_key_order(q, k, 64)
+    order = backend.sol_key_order(q, k, 64)
     assert torch.equal(order.long().sort(-1).values, torch.arange(t, device="cuda").expand(1, h, t))
     qkv = torch.cat([x.reshape(t, h * HD) for x in (q, k, v)], 1)
     freqs = torch.eye(2, device="cuda").expand(1, t, 1, rot // 2, 2, 2).contiguous()   # no rotation
     norm = (torch.ones(HD, device="cuda", dtype=torch.bfloat16),) * 2
-    out = cuda_backend.sol_attn_chunked(list(qkv.split(1024)), t, h, freqs, norm, topk_ratio=0.1,
+    out = backend.sol_attn_chunked(list(qkv.split(1024)), t, h, freqs, norm, topk_ratio=0.1,
                                         sink_blocks=[0, 1], sink_q=[0, 1], key_order_from=64)[0]
     assert torch.isfinite(out.float()).all()
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_chunked_order_matches_direct():
     """The producer path under order= against the direct path with the same order."""
     c = _chunked_case(seed=13, rot=64)
     order = _row_order(c["t"], c["h"], 128, torch.Generator().manual_seed(7))
     kw = {"topk_ratio": 0.2, "sink_blocks": [0, 2], "sink_q": [0, 2], "order": order}
-    _, km, vs = cuda_backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], **kw)
-    chunked = lambda **k: cuda_backend.sol_attn_chunked(   # noqa: E731
+    _, km, vs = backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], **kw)
+    chunked = lambda **k: backend.sol_attn_chunked(   # noqa: E731
         c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], kmean=km, vscale=vs, **k)[0]
     everything = {**kw, "topk_ratio": 0.0, "tau": -100.0}   # every block routed: carriers and scatter only
-    assert _cos(chunked(**everything), cuda_backend.sol_attn(c["q"], c["k"], c["v"], **everything)) > 0.9995
+    assert _cos(chunked(**everything), backend.sol_attn(c["q"], c["k"], c["v"], **everything)) > 0.9995
     # routing: block statistics are pooled from int8 rows here, so decisions move at the margin on random rows
-    assert _cos(chunked(**kw), cuda_backend.sol_attn(c["q"], c["k"], c["v"], **kw)) > 0.97
+    assert _cos(chunked(**kw), backend.sol_attn(c["q"], c["k"], c["v"], **kw)) > 0.97
     with pytest.raises(ValueError, match="token_aug"):
         chunked(**kw, token_aug=256)
     with pytest.raises(ValueError):
-        cuda_backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], **kw,
+        backend.sol_attn_chunked(c["chunks"], c["t"], c["h"], c["freqs"], c["norm"], **kw,
                                       block_len=torch.full(((c["t"] + 63) // 64,), 64, dtype=torch.int32, device="cuda"))
 
 
-@pytest.mark.skipif(not cuda_backend_available(), reason="CUDA backend required")
 def test_chunked_key_order_from():
     """key_order_from: the producer path plans its own order from the staged carriers, as good as
     the direct path's sol_key_order on clustered keys in shuffled rows."""
@@ -1299,20 +1259,20 @@ def test_chunked_key_order_from():
     dense = _dense(q, k, v)
     chunks = list(qkv.split(1024))
     kw = {"topk_ratio": 0.1, "sink_blocks": [0, 1], "sink_q": [0, 1]}
-    _, km, vs = cuda_backend.sol_attn_chunked(chunks, t, h, freqs, norm, **kw)
-    raster = _rel(cuda_backend.sol_attn_chunked(chunks, t, h, freqs, norm, kmean=km, vscale=vs, **kw)[0], dense)
-    grouped = _rel(cuda_backend.sol_attn_chunked(chunks, t, h, freqs, norm, kmean=km, vscale=vs,
+    _, km, vs = backend.sol_attn_chunked(chunks, t, h, freqs, norm, **kw)
+    raster = _rel(backend.sol_attn_chunked(chunks, t, h, freqs, norm, kmean=km, vscale=vs, **kw)[0], dense)
+    grouped = _rel(backend.sol_attn_chunked(chunks, t, h, freqs, norm, kmean=km, vscale=vs,
                                                  key_order_from=64, **kw)[0], dense)
-    direct = _rel(cuda_backend.sol_attn(q, k, v, order=cuda_backend.sol_key_order(q, k, 64), **kw), dense)
+    direct = _rel(backend.sol_attn(q, k, v, order=backend.sol_key_order(q, k, 64), **kw), dense)
     assert grouped < 0.5 * raster and grouped < 1.3 * direct, (grouped, raster, direct)
-    again = cuda_backend.sol_attn_chunked(chunks, t, h, freqs, norm, kmean=km, vscale=vs,
+    again = backend.sol_attn_chunked(chunks, t, h, freqs, norm, kmean=km, vscale=vs,
                                           key_order_from=64, **kw)[0]
     assert _rel(again, dense) == grouped
     with pytest.raises(ValueError):
-        cuda_backend.sol_attn_chunked(chunks, t, h, freqs, norm, key_order_from=100, **kw)
+        backend.sol_attn_chunked(chunks, t, h, freqs, norm, key_order_from=100, **kw)
     ident = torch.arange(t, dtype=torch.int32, device="cuda").expand(1, h, t).contiguous()
     with pytest.raises(ValueError, match="not both"):
-        cuda_backend.sol_attn_chunked(chunks, t, h, freqs, norm, key_order_from=64, order=ident, **kw)
+        backend.sol_attn_chunked(chunks, t, h, freqs, norm, key_order_from=64, order=ident, **kw)
     with pytest.raises(ValueError, match="one size"):   # first call: a V scale per chunk needs equal chunks
-        cuda_backend.sol_attn_chunked([qkv[:512], qkv[512:1536], qkv[1536:]], t, h, freqs, norm,
+        backend.sol_attn_chunked([qkv[:512], qkv[512:1536], qkv[1536:]], t, h, freqs, norm,
                                       key_order_from=64, **kw)

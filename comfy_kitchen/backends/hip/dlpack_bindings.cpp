@@ -2561,12 +2561,12 @@ static void sol_check_block_len(const nb::ndarray<>& b, int64_t seq_len, const c
 
 static void sol_need_workspace(const nb::ndarray<>& ws, int64_t batch, int64_t seq_len,
                                int64_t key_len, int64_t num_heads, int64_t token_aug,
-                               const char* fn) {
-    int64_t v[48];
+                               const char* fn, bool reorder = false) {
+    int64_t v[64];
     const int n = sol_attn_plan(static_cast<int>(batch), static_cast<int>(seq_len),
                                 static_cast<int>(key_len), static_cast<int>(num_heads),
-                                static_cast<int>(token_aug), v, 48);
-    if (n > 48 || static_cast<int64_t>(ws.size()) < v[n - 1]) {  // last slot is "total"
+                                static_cast<int>(token_aug), v, 64, reorder);
+    if (n > 64 || static_cast<int64_t>(ws.size()) < v[n - 1]) {  // last slot is "total"
         throw std::runtime_error(std::string(fn) + ": workspace too small for this shape");
     }
     // sol_attn_plan reports byte offsets and the Python layer slices the workspace
@@ -2616,15 +2616,28 @@ static void sol_need_contiguous(const nb::ndarray<>& a, const char* fn, const ch
     }
 }
 
+// Per-head row order: contiguous int32, B*H*T elements.
+static void sol_need_order(const nb::ndarray<>& order, int64_t batch, int64_t seq_len,
+                           int64_t num_heads, const char* fn) {
+    if (order.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        order.dtype().bits != 32 ||
+        static_cast<int64_t>(order.size()) != batch * num_heads * seq_len) {
+        throw std::runtime_error(std::string(fn) +
+                                 ": order must be an int32 array of B*H*T row indices");
+    }
+    sol_need_contiguous(order, fn, "order");
+}
+
 // Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
 // key_len < 0: k/v as long as q.
 nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads,
-                          int64_t token_aug = 0, int64_t key_len = -1) {
-    int64_t v[48];
+                          int64_t token_aug = 0, int64_t key_len = -1, bool reorder = false) {
+    int64_t v[64];
     const int n = sol_attn_plan(static_cast<int>(batch), static_cast<int>(seq_len),
                                 static_cast<int>(key_len < 0 ? seq_len : key_len),
-                                static_cast<int>(num_heads), static_cast<int>(token_aug), v, 48);
-    if (n > 48) throw std::runtime_error("sol_attn_plan: Plan grew past the binding's buffer");
+                                static_cast<int>(num_heads), static_cast<int>(token_aug), v, 64,
+                                reorder);
+    if (n > 64) throw std::runtime_error("sol_attn_plan: Plan grew past the binding's buffer");
     nb::dict d;
     for (int i = 0; i < n && sol_attn_plan_names[i]; ++i) d[sol_attn_plan_names[i]] = v[i];
     return d;
@@ -2634,9 +2647,10 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
               nb::ndarray<> workspace, int64_t batch, int64_t seq_len, int64_t num_heads,
               int64_t head_dim, float tau, float scale, int64_t sink_start, int64_t sink_end,
               int64_t sink_q_start, int64_t sink_q_end, uintptr_t stream_ptr,
-              OptArray key_bias = std::nullopt, OptArray threshold = std::nullopt,
-              OptArray block_len = std::nullopt, bool tail = true, int64_t token_aug = 0,
-              int64_t q_offset = 0) {
+              OptArray key_bias = std::nullopt, OptArray block_len = std::nullopt,
+              int64_t tail = 1,   // 0 none, 1 per query block, 2 per row
+              int64_t token_aug = 0, int64_t q_offset = 0, OptArray order = std::nullopt,
+              int64_t topk_count = -1) {   // >= 0: top-k with this many blocks beyond the sinks
     constexpr const char* kFn = "sol_attn";
     auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
     sol_need_extents(batch, seq_len, num_heads, kFn);
@@ -2648,9 +2662,6 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
     }
     sol_need_sinks(sink_start, sink_end, kFn, "sink_blocks");
     sol_need_sinks(sink_q_start, sink_q_end, kFn, "sink_q");
-    if (threshold) {
-        sol_need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, kFn, "threshold");
-    }
     if (block_len && key_len != seq_len) {
         throw std::runtime_error(std::string(kFn) + ": block_len needs q and k of the same length");
     }
@@ -2667,17 +2678,26 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
     sol_need_contiguous(out, kFn, "out");
     sol_need_workspace(workspace, batch, seq_len, key_len, num_heads, token_aug, kFn);
     if (key_bias) sol_need_elems(*key_bias, batch * key_len, 0, kFn, "key_bias");
+    if (order) {
+        if (key_len != seq_len || q_offset != 0 || block_len || key_bias) {
+            throw std::runtime_error(std::string(kFn) +
+                                     ": order needs q and k of one length and no q_offset, "
+                                     "block_len or key_bias");
+        }
+        sol_need_order(*order, batch, seq_len, num_heads, kFn);
+    }
     // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
     launch_sol_attn(q.data(), k.data(), v.data(), out.data(), workspace.data(),
                     static_cast<int>(batch), static_cast<int>(seq_len),
                     static_cast<int>(key_len), static_cast<int>(num_heads),
                     static_cast<int>(head_dim), elem, tau, scale,
-                    opt_data(key_bias), opt_data(threshold), opt_data(block_len), tail ? 1 : 0,
+                    opt_data(key_bias), opt_data(block_len), static_cast<int>(tail),
                     static_cast<int>(sink_start), static_cast<int>(sink_end),
                     static_cast<int>(sink_q_start), static_cast<int>(sink_q_end),
                     static_cast<int>(q_offset), q.stride(0),
                     q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
-                    v.stride(1), v.stride(2), static_cast<int>(token_aug), stream);
+                    v.stride(1), v.stride(2), static_cast<int>(token_aug), stream,
+                    opt_data(order), static_cast<int>(topk_count));
     check_hip_launch();
 }
 
@@ -2697,7 +2717,7 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
                            nb::ndarray<> vscale, float rope_eps, int64_t rot_dim, int64_t t0,
                            int64_t m, int64_t batch, int64_t seq_len, int64_t num_heads,
                            uintptr_t stream_ptr, OptArray block_len = std::nullopt,
-                           int64_t token_aug = 0, bool split_half = true) {
+                           int64_t token_aug = 0, bool split_half = true, bool reorder = false) {
     constexpr const char* kFn = "sol_producer_chunk";
     sol_need_extents(batch, seq_len, num_heads, kFn);
     if (batch != 1) throw std::runtime_error(std::string(kFn) + ": the producer path is B=1 only");
@@ -2711,7 +2731,7 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
             ": chunk [t0, t0 + m) must lie in [0, seq_len] with a 64-aligned start");
     }
     if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
-    sol_need_workspace(workspace, batch, seq_len, seq_len, num_heads, token_aug, kFn);
+    sol_need_workspace(workspace, batch, seq_len, seq_len, num_heads, token_aug, kFn, reorder);
     sol_need_elems(qkv, m * 3 * num_heads * 128, 2, kFn, "qkv");
     sol_need_elems(fab, seq_len * rot_dim * 2, 0, kFn, "fab");
     sol_need_elems(qw, 128, 2, kFn, "qw");
@@ -2723,7 +2743,72 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
                        static_cast<int>(rot_dim), split_half, static_cast<int>(t0),
                        static_cast<int>(m), static_cast<int>(batch), static_cast<int>(seq_len),
                        static_cast<int>(num_heads), static_cast<int>(token_aug),
-                       reinterpret_cast<hipStream_t>(stream_ptr));
+                       reinterpret_cast<hipStream_t>(stream_ptr), reorder);
+    check_hip_launch();
+}
+
+void sol_group_features_py(nb::ndarray<> workspace, nb::ndarray<> dir8, nb::ndarray<> dsc,
+                           nb::ndarray<> doff, nb::ndarray<> feat, int64_t batch, int64_t seq_len,
+                           int64_t num_heads, int64_t b0, int64_t nblocks, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "sol_group_features";
+    sol_need_extents(batch, seq_len, num_heads, kFn);
+    sol_need_workspace(workspace, batch, seq_len, seq_len, num_heads, 0, kFn, true);
+    const int64_t bh = batch * num_heads;
+    if (b0 < 0 || nblocks <= 0) {
+        throw std::runtime_error(std::string(kFn) + ": b0 and nblocks must select whole blocks");
+    }
+    sol_need_elems(dir8, bh * 16 * 128, 4, kFn, "dir8");
+    sol_need_elems(dsc, bh * 16, 0, kFn, "dsc");
+    sol_need_elems(doff, bh * 16, 0, kFn, "doff");
+    sol_need_elems(feat, bh * (nblocks * 64 + 1) * 16, 2, kFn, "feat");
+    sol_group_features(workspace.data(), dir8.data(), dsc.data(), doff.data(), feat.data(),
+                       static_cast<int>(batch), static_cast<int>(seq_len),
+                       static_cast<int>(num_heads), static_cast<int>(b0),
+                       static_cast<int>(nblocks), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void sol_group_leaves_py(nb::ndarray<> feat, nb::ndarray<> perm, int64_t bh, int64_t n,
+                         int64_t size, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "sol_group_leaves";
+    const int64_t total = bh > 0 ? static_cast<int64_t>(perm.size()) / bh : 0;
+    if (bh <= 0 || size <= 0 || size > 1024 || total < n || total % size ||
+        static_cast<int64_t>(perm.size()) != bh * total ||
+        perm.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        perm.dtype().bits != 32) {
+        throw std::runtime_error(std::string(kFn) +
+                                 ": feat bfloat16 [B*H, n + 1, 16], perm int32 [B*H, nodes * size], "
+                                 "size <= 1024");
+    }
+    sol_need_elems(feat, bh * (n + 1) * 16, 2, kFn, "feat");
+    sol_need_contiguous(perm, kFn, "perm");
+    sol_group_leaves(feat.data(), perm.data(), static_cast<int>(bh), static_cast<int>(n),
+                     static_cast<int>(size), static_cast<int>(total),
+                     reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void sol_attn_reorder_py(nb::ndarray<> workspace, nb::ndarray<> order, nb::ndarray<> kmean,
+                         nb::ndarray<> vscale, int64_t batch, int64_t seq_len, int64_t num_heads,
+                         uintptr_t stream_ptr, OptArray vfac = std::nullopt,
+                         int64_t vfac_rows = 0) {
+    constexpr const char* kFn = "sol_attn_reorder";
+    sol_need_extents(batch, seq_len, num_heads, kFn);
+    sol_need_workspace(workspace, batch, seq_len, seq_len, num_heads, 0, kFn, true);
+    if (vfac) {
+        if (vfac_rows <= 0) {
+            throw std::runtime_error(std::string(kFn) + ": vfac_rows must be positive with vfac");
+        }
+        sol_need_elems(*vfac, ((seq_len + vfac_rows - 1) / vfac_rows) * batch * num_heads * 128, 0,
+                       kFn, "vfac");
+    }
+    sol_need_order(order, batch, seq_len, num_heads, kFn);
+    sol_need_elems(kmean, batch * num_heads * 128, 0, kFn, "kmean");
+    sol_need_elems(vscale, batch * num_heads * 128, 0, kFn, "vscale");
+    sol_attn_reorder(workspace.data(), order.data(), kmean.data(), vscale.data(),
+                     static_cast<int>(batch), static_cast<int>(seq_len),
+                     static_cast<int>(num_heads), reinterpret_cast<hipStream_t>(stream_ptr),
+                     opt_data(vfac), static_cast<int>(vfac_rows));
     check_hip_launch();
 }
 
@@ -2731,9 +2816,10 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
                       nb::ndarray<> kmean_next, nb::ndarray<> vamax_out, int64_t batch,
                       int64_t seq_len, int64_t num_heads, float tau, float scale,
                       int64_t sink_start, int64_t sink_end, int64_t sink_q_start,
-                      int64_t sink_q_end, uintptr_t stream_ptr, OptArray threshold = std::nullopt,
-                      OptArray block_len = std::nullopt, bool tail = true,
-                      int64_t token_aug = 0) {
+                      int64_t sink_q_end, uintptr_t stream_ptr, OptArray block_len = std::nullopt,
+                      int64_t tail = 1,   // 0 none, 1 per query block, 2 per row
+                      int64_t token_aug = 0, OptArray order = std::nullopt,
+                      int64_t topk_count = -1) {
     constexpr const char* kFn = "sol_attn_core";
     sol_need_extents(batch, seq_len, num_heads, kFn);
     sol_need_sinks(sink_start, sink_end, kFn, "sink_blocks");
@@ -2742,20 +2828,18 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
     sol_need_elems(vscale, stats, 0, kFn, "vscale");
     sol_need_elems(kmean_next, stats, 0, kFn, "kmean_next");
     sol_need_elems(vamax_out, stats, 0, kFn, "vamax_out");
-    if (threshold) {
-        sol_need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, kFn, "threshold");
-    }
     if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
     sol_need_workspace(workspace, batch, seq_len, seq_len, num_heads, token_aug, kFn);
     sol_need_elems(out, batch * seq_len * num_heads * 128, 2, kFn, "out");
+    if (order) sol_need_order(*order, batch, seq_len, num_heads, kFn);
     launch_sol_attn_core(workspace.data(), out.data(), vscale.data(), kmean_next.data(),
-                         vamax_out.data(), opt_data(block_len), tail ? 1 : 0,
+                         vamax_out.data(), opt_data(block_len), static_cast<int>(tail),
                          static_cast<int>(batch), static_cast<int>(seq_len),
-                         static_cast<int>(num_heads), tau, scale, opt_data(threshold),
+                         static_cast<int>(num_heads), tau, scale,
                          static_cast<int>(sink_start), static_cast<int>(sink_end),
                          static_cast<int>(sink_q_start), static_cast<int>(sink_q_end),
-                         static_cast<int>(token_aug),
-                         reinterpret_cast<hipStream_t>(stream_ptr));
+                         static_cast<int>(token_aug), reinterpret_cast<hipStream_t>(stream_ptr),
+                         opt_data(order), static_cast<int>(topk_count));
     check_hip_launch();
 }
 
@@ -3367,16 +3451,16 @@ NB_MODULE(_C, m) {
     m.def("sol_attn_plan", &sol_attn_plan_py,
           "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("token_aug") = 0, nb::arg("key_len") = -1);
+          nb::arg("token_aug") = 0, nb::arg("key_len") = -1, nb::arg("reorder") = false);
     m.def("sol_attn", &sol_attn,
           "Sol-Attn training-free sparse attention (BF16 or FP16 in/out, head_dim 128)",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"), nb::arg("workspace"),
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"), nb::arg("head_dim"),
           nb::arg("tau"), nb::arg("scale"), nb::arg("sink_start"), nb::arg("sink_end"),
           nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
-          nb::arg("key_bias") = nb::none(), nb::arg("threshold") = nb::none(),
-          nb::arg("block_len") = nb::none(), nb::arg("tail") = true,
-          nb::arg("token_aug") = 0, nb::arg("q_offset") = 0);
+          nb::arg("key_bias") = nb::none(), nb::arg("block_len") = nb::none(),
+          nb::arg("tail") = 1, nb::arg("token_aug") = 0, nb::arg("q_offset") = 0,
+          nb::arg("order") = nb::none(), nb::arg("topk_count") = -1);
     m.def("sol_producer_begin", &sol_producer_begin_py,
           nb::arg("workspace"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("stream_ptr"), nb::arg("token_aug") = 0);
@@ -3385,14 +3469,28 @@ NB_MODULE(_C, m) {
           nb::arg("kmean"), nb::arg("vscale"), nb::arg("rope_eps"), nb::arg("rot_dim"),
           nb::arg("t0"), nb::arg("m"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(),
-          nb::arg("token_aug") = 0, nb::arg("split_half") = true);
+          nb::arg("token_aug") = 0, nb::arg("split_half") = true, nb::arg("reorder") = false);
+    m.def("sol_group_features", &sol_group_features_py,
+          "Sol-Attn producer path: row-order planner features of the staged int8 keys",
+          nb::arg("workspace"), nb::arg("dir8"), nb::arg("dsc"), nb::arg("doff"), nb::arg("feat"),
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"), nb::arg("b0"),
+          nb::arg("nblocks"), nb::arg("stream_ptr"));
+    m.def("sol_group_leaves", &sol_group_leaves_py,
+          "Sol-Attn row-order planner: the last levels of the grouping tree, in place on perm",
+          nb::arg("feat"), nb::arg("perm"), nb::arg("bh"), nb::arg("n"), nb::arg("size"),
+          nb::arg("stream_ptr"));
+    m.def("sol_attn_reorder", &sol_attn_reorder_py,
+          "Sol-Attn producer path: regroup the staged raster carriers into a per-head row order",
+          nb::arg("workspace"), nb::arg("order"), nb::arg("kmean"), nb::arg("vscale"),
+          nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"), nb::arg("stream_ptr"),
+          nb::arg("vfac") = nb::none(), nb::arg("vfac_rows") = 0);
     m.def("sol_attn_core", &sol_attn_core_py,
           nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"), nb::arg("kmean_next"),
           nb::arg("vamax_out"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("tau"), nb::arg("scale"), nb::arg("sink_start"), nb::arg("sink_end"),
           nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
-          nb::arg("threshold") = nb::none(), nb::arg("block_len") = nb::none(),
-          nb::arg("tail") = true, nb::arg("token_aug") = 0);
+          nb::arg("block_len") = nb::none(), nb::arg("tail") = 1, nb::arg("token_aug") = 0,
+          nb::arg("order") = nb::none(), nb::arg("topk_count") = -1);
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8);
     m.def("dequantize_per_tensor_fp8", &dequantize_per_tensor_fp8);
     m.def("stochastic_round_fp8", &stochastic_round_fp8);

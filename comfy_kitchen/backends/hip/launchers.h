@@ -111,25 +111,34 @@ void launch_w4a8_int8_gemm_chunked_kernel(const void* xq, const void* qw, const 
 // runs over one caller-allocated workspace whose carve-up sol_attn_plan reports.
 extern const char* const sol_attn_plan_names[];  // null-terminated
 int sol_attn_plan(int batch, int seq_len, int key_len, int num_heads, int n_tok, int64_t* out,
-                  int cap);
+                  int cap, bool reorder);
 void sol_producer_begin(void* workspace, int batch, int seq_len, int num_heads, int n_tok,
                         hipStream_t stream);
 void sol_producer_chunk(void* workspace, const void* qkv, const void* fab, const void* qw,
                         const void* kw, const void* kmean, const void* vscale, const void* blen,
                         float rope_eps, int rot_dim, bool split_half, int t0, int M, int batch,
-                        int seq_len, int num_heads, int n_tok, hipStream_t stream);
+                        int seq_len, int num_heads, int n_tok, hipStream_t stream, bool reorder);
+void sol_attn_reorder(void* workspace, const void* order, const void* kmean, const void* vscale,
+                      int batch, int seq_len, int num_heads, hipStream_t stream, const void* vfac,
+                      int vfac_rows);
+void sol_group_features(void* workspace, const void* dir8, const void* dsc, const void* doff,
+                        void* feat, int batch, int seq_len, int num_heads, int b0, int nblocks,
+                        hipStream_t stream);
+void sol_group_leaves(const void* feat, void* perm, int bh, int n, int size, int total,
+                      hipStream_t stream);
 void launch_sol_attn_core(void* workspace, void* out, const void* vscale, void* kmean_next,
                           void* vamax_out, const void* blen, int tail, int batch, int seq_len,
-                          int num_heads, float tau, float scale, const void* ext_threshold,
-                          int sink_start, int sink_end, int sink_q_start, int sink_q_end,
-                          int n_tok, hipStream_t stream);
+                          int num_heads, float tau, float scale, int sink_start, int sink_end,
+                          int sink_q_start, int sink_q_end, int n_tok, hipStream_t stream,
+                          const void* order, int topk_count);
 void launch_sol_attn(const void* q, const void* k, const void* v, void* out, void* workspace,
                      int batch, int seq_len, int key_len, int num_heads, int head_dim, int elem,
                      float tau, float scale,
-                     const void* key_bias, const void* ext_threshold, const void* blen, int tail,
+                     const void* key_bias, const void* blen, int tail,
                      int sink_start, int sink_end, int sink_q_start, int sink_q_end, int q_offset,
                      int64_t qs_b,
                      int64_t qs_t, int64_t qs_h, int64_t ks_b, int64_t ks_t, int64_t ks_h,
-                     int64_t vs_b, int64_t vs_t, int64_t vs_h, int n_tok, hipStream_t stream);
+                     int64_t vs_b, int64_t vs_t, int64_t vs_h, int n_tok, hipStream_t stream,
+                     const void* order, int topk_count);
 
 }  // extern "C"

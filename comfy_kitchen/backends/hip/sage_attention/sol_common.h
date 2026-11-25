@@ -128,6 +128,28 @@ __forceinline__ __device__ void stage_tile64(T* tile, const T* __restrict__ src,
     }
 }
 
+// Transposed V carriers, [B*H][block][channel][64 keys]: a block's 128 channel rows are one
+// 8 KB run, so a tile copy reads whole cache lines instead of 128 half lines Tp apart.
+// Offset of (block, channel) within one (b, h).
+__host__ __device__ __forceinline__ int64_t vt_at(int64_t block, int channel) {
+    return (block * kHeadDim + channel) * kBlock;
+}
+
+// stage_tile64 through a row table: tile row t is source row rows[t] (src points at row 0).
+template <typename T>
+__forceinline__ __device__ void stage_tile64_rows(T* tile, const T* __restrict__ src,
+                                                  int64_t stride, const int32_t* __restrict__ rows,
+                                                  int len) {
+    for (int idx = threadIdx.x; idx < kBlock * (kHeadDim / 8); idx += kHeadDim) {
+        const int t = idx / (kHeadDim / 8), c8 = (idx % (kHeadDim / 8)) * 8;
+        uint4 val = make_uint4(0u, 0u, 0u, 0u);
+        if (t < len) {
+            val = *reinterpret_cast<const uint4*>(src + static_cast<int64_t>(rows[t]) * stride + c8);
+        }
+        *reinterpret_cast<uint4*>(tile + t * kLdTile + c8) = val;
+    }
+}
+
 // Per-token absmax scale and INT8 row, one thread per token. qi / qs point at
 // (this tile's first token, this head). Rows [len, nrows) exist in memory but are
 // dead (zero-padded tiles) and get zeros; rows past nrows do not exist.

@@ -224,8 +224,7 @@ __global__ __launch_bounds__(kThreads) void sol_token_kernel(
             for (int idx = tid; idx < HD * (BK / 8); idx += kThreads) {
                 const int c = idx / (BK / 8), part = (idx % (BK / 8)) * 8;
                 *reinterpret_cast<uint2*>(sVt + c * kStrideV + part) =
-                    *reinterpret_cast<const uint2*>(vT + vT_base + static_cast<int64_t>(c) * Tp +
-                                                    k0 + part);
+                    *reinterpret_cast<const uint2*>(vT + vT_base + vt_at(k0 / BK, c) + part);
             }
         }
         __syncthreads();

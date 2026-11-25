@@ -246,7 +246,7 @@ def sol_attn(
             and the blocks a query block leaves out reach each of its rows as
             one weighted summary key per block. Pairs with ``topk_ratio``.
             ``sink_blocks`` and ``sink_q`` count blocks after the regrouping,
-            so they hold their original rows only below this row. CUDA only;
+            so they hold their original rows only below this row. CUDA and HIP;
             needs k and v as long as q and no ``q_offset``, ``block_len``,
             ``key_bias``, ``coarse_gate`` or ``token_aug``.
 

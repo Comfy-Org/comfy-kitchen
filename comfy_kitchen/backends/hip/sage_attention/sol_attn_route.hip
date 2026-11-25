@@ -54,7 +54,8 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
     const int32_t* __restrict__ blen, int tail, int T, int NTB,   // T: key tokens
     int NPAD, int NQ, int sink_s, int sink_e, int sink_qs, int sink_qe,
     int diag_lo, int diag_span,   // always-exact band: diag_lo <= b - qb <= diag_lo + diag_span
-    float scale_log2) {
+    float scale_log2,
+    int scores_only) {   // top-k pass 1: only write each row's pooled scores (fp16) into blk_idx
     __shared__ __attribute__((aligned(16))) int8_t sKc[BN * kStrideKc];
     __shared__ __attribute__((aligned(16))) __bf16 sVcT[HD * kStrideVc];
     __shared__ float sLen[BN];
@@ -89,7 +90,7 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
     const int sink_lo = imax(0, sink_s);
     const int S = imax(0, imin(sink_e, NTB) - sink_lo);
     int cnt = live ? S : 0;
-    if (live) {
+    if (live && !scores_only) {
         for (int i = half; i < S; i += 2) my_row[i] = static_cast<uint16_t>(sink_lo + i);
     }
 
@@ -110,7 +111,7 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
             *reinterpret_cast<uint2*>(sKc + p * kStrideKc + c8) = *reinterpret_cast<const uint2*>(
                 kci + (static_cast<int64_t>(bh) * NPAD + gs + p) * HD + c8);
         }
-        for (int idx = tid; idx < HD * (BN / 8); idx += kThreads) {
+        for (int idx = tid; idx < HD * (BN / 8) && !scores_only; idx += kThreads) {   // the scores never read V
             const int c = idx / (BN / 8), part = (idx % (BN / 8)) * 8;
             *reinterpret_cast<uint4*>(sVcT + c * kStrideVc + part) = *reinterpret_cast<const uint4*>(
                 vcT + (static_cast<int64_t>(bh) * HD + c) * NPAD + gs + part);
@@ -132,6 +133,22 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
                     MmaInt8::load_aligned(sKc, kt * 16 + r, dt * 16, kStrideKc, lane),
                     cen_frag[dt], s_acc[kt]);
             }
+        }
+
+        if (scores_only) {
+#pragma unroll
+            for (int kt = 0; kt < KT; ++kt) {
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    const int slot = kt * 16 + acc_row(lane, e);
+                    const int b = gs + slot;
+                    if (live && b < NTB) {   // the same expression the routing pass compares
+                        reinterpret_cast<_Float16*>(blk_idx)[(static_cast<size_t>(bh) * NQ + qb) * NTB + b] =
+                            static_cast<_Float16>(static_cast<float>(s_acc[kt][e]) * qsc * sKcs[slot]);
+                    }
+                }
+            }
+            continue;
         }
 
         // Routing decision, and the pooled score of every block that stays in the tail.
@@ -175,7 +192,8 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
         if (cand_bits) {
             const uint32_t peer = __shfl_xor(unr, 1, 32);
             const int peer_live = __shfl_xor(static_cast<int>(live), 1, 32);
-            tokb = unr & (peer_live ? peer : 0xffffffffu);
+            // tail 2: the row's own unrouted blocks, for the exact kernel's summary keys
+            tokb = tail == 2 ? unr : unr & (peer_live ? peer : 0xffffffffu);
         }
         // exact-routed, sink and token-routed blocks leave the tail; tail == 0 hands
         // the exact kernel an empty state (softmax over the routed blocks only)
@@ -247,7 +265,7 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
         l_add += swap_half_wave(l_add);
         l_r = l_r * alpha + l_add;
 
-        if (!tail) continue;
+        if (tail != 1) continue;   // only the per-block tail accumulates here
         typename MmaBf16::Frag p_frag[KT];
 #pragma unroll
         for (int kt = 0; kt < KT; ++kt) p_frag[kt] = pack_prob_frag_bf16(pv[kt], lane);
@@ -264,6 +282,7 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
         }
     }
 
+    if (scores_only) return;
     refm = fmaxf(refm, swap_half_wave(refm));
     if (!live) return;
     const size_t qs = static_cast<size_t>(bh) * NQ + qb;
@@ -288,6 +307,63 @@ __global__ __launch_bounds__(kThreads) void sol_route_kernel(
     }
 }
 
+// Top-k threshold per query block from the scores pass: the k-th largest fp16 score outside
+// the sinks, as the fp32 bound just below it. Order-preserving fp16 codes, selected with two
+// 256-bin histograms.
+__global__ __launch_bounds__(256) void sol_topk_threshold_kernel(
+    const uint16_t* __restrict__ scores, float* __restrict__ thr, int NTB, int NQ, int k,
+    int sink_s, int sink_e) {
+    __shared__ uint32_t hist[256];
+    __shared__ int s_hi, s_left;
+    const int qb = blockIdx.x, bh = blockIdx.y, tid = threadIdx.x;
+    const uint16_t* row = scores + (static_cast<size_t>(bh) * NQ + qb) * NTB;
+    if (k <= 0) {   // nothing beyond the forced blocks
+        if (tid == 0) thr[static_cast<size_t>(bh) * NQ + qb] = 3.0e38f;
+        return;
+    }
+    if (tid == 0) s_hi = 0;
+    for (int level = 0; level < 2; ++level) {
+        for (int i = tid; i < 256; i += blockDim.x) hist[i] = 0u;
+        __syncthreads();
+        const int hi = s_hi;   // level 1: the high byte level 0 settled on
+        for (int b = tid; b < NTB; b += blockDim.x) {
+            if (b >= sink_s && b < sink_e) continue;
+            const uint32_t u = row[b];
+            const uint32_t c = (u & 0x8000u) ? (~u & 0xffffu) : (u | 0x8000u);
+            if (level == 0) {
+                atomicAdd(&hist[c >> 8], 1u);
+            } else if (static_cast<int>(c >> 8) == hi) {
+                atomicAdd(&hist[c & 255u], 1u);
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            const int want = level == 0 ? k : s_left;
+            int above = 0, bin = 0;
+            for (int i = 255; i >= 0; --i) {
+                if (above + static_cast<int>(hist[i]) >= want) {
+                    bin = i;
+                    break;
+                }
+                above += static_cast<int>(hist[i]);
+            }
+            if (level == 0) {
+                s_hi = bin;
+                s_left = want - above;
+            } else {
+                const uint32_t c = (static_cast<uint32_t>(hi) << 8) | static_cast<uint32_t>(bin);
+                const uint32_t below = c ? c - 1 : 0;
+                auto value = [](uint32_t cc) {
+                    const uint16_t u = static_cast<uint16_t>((cc & 0x8000u) ? (cc ^ 0x8000u) : (~cc & 0xffffu));
+                    return static_cast<float>(__builtin_bit_cast(_Float16, u));
+                };
+                thr[static_cast<size_t>(bh) * NQ + qb] = 0.5f * (value(c) + value(below));
+            }
+        }
+        __syncthreads();
+    }
+}
+
 }  // namespace
 }  // namespace comfy::hip_backend::sol
 
@@ -301,7 +377,7 @@ void launch_sol_route(const void* cen8, const void* cens, const void* kci, const
                       // when the keys carry rows the queries leave out (a conditioning prefix)
                       const void* blen, int tail, int B, int T, int H, int NTB, int NPAD, int NQ,
                       int sink_s, int sink_e, int sink_qs, int sink_qe, int diag_lo,
-                      int diag_span, float scale_log2, hipStream_t stream) {
+                      int diag_span, float scale_log2, hipStream_t stream, int scores_only) {
     dim3 grid((NQ + BQ - 1) / BQ, B * H);
     sol_route_kernel<<<grid, kThreads, 0, stream>>>(
         static_cast<const int8_t*>(cen8), static_cast<const float*>(cens),
@@ -311,5 +387,11 @@ void launch_sol_route(const void* cen8, const void* cens, const void* kci, const
         static_cast<int32_t*>(blk_cnt), static_cast<__bf16*>(o_part), static_cast<float*>(m_part),
         static_cast<float*>(l_part), static_cast<float*>(tok_ref),
         static_cast<uint32_t*>(cand_bits), static_cast<const int32_t*>(blen), tail, T, NTB, NPAD,
-        NQ, sink_s, sink_e, sink_qs, sink_qe, diag_lo, diag_span, scale_log2);
+        NQ, sink_s, sink_e, sink_qs, sink_qe, diag_lo, diag_span, scale_log2, scores_only);
+}
+
+void launch_sol_topk_threshold(const void* scores, void* thr, int BH, int NTB, int NQ, int k,
+                               int sink_s, int sink_e, hipStream_t stream) {
+    sol_topk_threshold_kernel<<<dim3(NQ, BH), 256, 0, stream>>>(
+        static_cast<const uint16_t*>(scores), static_cast<float*>(thr), NTB, NQ, k, sink_s, sink_e);
 }
