@@ -3,7 +3,7 @@ import torch
 
 import comfy_kitchen as ck
 
-from .conftest import requires_cuda_backend
+from .conftest import requires_gpu_backend, requires_hip_backend
 
 
 def _reference(nbr, cap, s_cap, t_cap, relabel_every=64):
@@ -83,7 +83,7 @@ def _check(nbr, cap, s_cap, t_cap):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 @pytest.mark.parametrize("shape", [(1, 1, 1), (4, 4, 4), (24, 24, 24), (40, 40, 40)])
 def test_grid(shape):
     gen = torch.Generator(device="cuda").manual_seed(sum(shape))
@@ -101,7 +101,7 @@ def test_grid(shape):
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_terminals_everywhere():
     # every node touches both terminals: the cut is decided per node by the terminal capacities
     gen = torch.Generator(device="cuda").manual_seed(7)
@@ -113,7 +113,7 @@ def test_terminals_everywhere():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_no_terminals_and_isolated():
     gen = torch.Generator(device="cuda").manual_seed(3)
     nbr, cap = _grid_graph(6, 6, 6, "cuda", gen)
@@ -129,7 +129,7 @@ def test_no_terminals_and_isolated():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_int64_neighbours_and_repeatable():
     gen = torch.Generator(device="cuda").manual_seed(11)
     nbr, cap = _grid_graph(20, 20, 20, "cuda", gen)
@@ -143,7 +143,7 @@ def test_int64_neighbours_and_repeatable():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_no_neighbour_slots():
     # terminal edges only: a node stays on the source side unless its sink capacity is larger
     gen = torch.Generator(device="cuda").manual_seed(5)
@@ -154,7 +154,7 @@ def test_no_neighbour_slots():
 
 
 @pytest.mark.cuda
-@requires_cuda_backend
+@requires_gpu_backend
 def test_rejects_bad_input():
     gen = torch.Generator(device="cuda").manual_seed(9)
     nbr, cap = _grid_graph(4, 4, 4, "cuda", gen)
@@ -170,3 +170,59 @@ def test_rejects_bad_input():
     bad[0, 0] = n
     with pytest.raises(ValueError, match="nbr must lie"):
         ck.min_cut(bad, cap, zero, zero)
+
+
+@pytest.mark.cuda
+@requires_hip_backend
+def test_hip_rejects_bad_arguments():
+    from comfy_kitchen.backends import hip
+
+    nbr = torch.tensor([[1], [0]]).cuda()
+    cap = torch.ones(2, 1).cuda()
+    s_cap = torch.tensor([1.0, 0.0]).cuda()
+    t_cap = torch.tensor([0.0, 1.0]).cuda()
+    for relabel_every in (0, -1):
+        with pytest.raises(ValueError, match="relabel_every"):
+            hip.min_cut(nbr, cap, s_cap, t_cap, relabel_every=relabel_every)
+    with pytest.raises(ValueError, match="cap must be on"):
+        hip.min_cut(nbr, cap.cpu(), s_cap, t_cap)
+    with pytest.raises(ValueError, match="neighbour twice"):
+        hip.min_cut(torch.tensor([[1, 1], [0, 0]]).cuda(), torch.ones(2, 2).cuda(), s_cap, t_cap)
+    # repeated -1 only marks empty slots; the flow saturates the sink edge, so both stay on the maximal source side
+    unused = torch.tensor([[1, -1, -1], [0, -1, -1]]).cuda()
+    assert hip.min_cut(unused, torch.ones(2, 3).cuda(), s_cap, t_cap).tolist() == [True, True]
+
+
+@pytest.mark.cuda
+@requires_hip_backend
+@pytest.mark.parametrize("name", ["cap", "s_cap", "t_cap"])
+@pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf")])
+def test_hip_rejects_invalid_capacities(name, bad):
+    from comfy_kitchen.backends import hip
+
+    args = {"cap": torch.ones(2, 1).cuda(), "s_cap": torch.ones(2).cuda(), "t_cap": torch.ones(2).cuda()}
+    args[name][0] = bad
+    with pytest.raises(ValueError, match=f"{name} must be finite and non-negative"):
+        hip.min_cut(torch.tensor([[1], [0]]).cuda(), **args)
+
+
+@pytest.mark.cuda
+@requires_hip_backend
+def test_hip_bindings_reject_undersized_and_wrong_dtype_buffers():
+    from comfy_kitchen.backends import hip
+
+    w, c = hip._dl, hip._C
+    stream = torch.cuda.current_stream().cuda_stream
+    nbr = torch.tensor([[1], [0]], dtype=torch.int32).cuda()
+    cap = torch.ones(2, 1).cuda()
+    rev = torch.empty((2, 1), dtype=torch.int8).cuda()
+    with pytest.raises(RuntimeError, match="r has 1 elements"):
+        c.min_cut_init(2, 1, w(nbr), w(cap), w(cap[:1]), w(rev), stream)
+    with pytest.raises(RuntimeError, match="rev has the wrong dtype"):
+        c.min_cut_init(2, 1, w(nbr), w(cap), w(cap), w(nbr), stream)
+    with pytest.raises(RuntimeError, match="nbr has 2 elements"):
+        c.min_cut_init(-2, -1, w(nbr), w(cap), w(cap), w(rev), stream)
+    e = torch.empty(2).cuda()
+    h = torch.empty(2, dtype=torch.int32).cuda()
+    with pytest.raises(RuntimeError, match="count has 0 elements"):
+        c.min_cut_rebuild_active(2, w(e), w(h), 0.0, 4, w(h), w(h[:0]), w(h), stream)

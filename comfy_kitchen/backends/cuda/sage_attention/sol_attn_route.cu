@@ -48,8 +48,10 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
     float* __restrict__ tok_ref,       // token routing: best unrouted pooled score per query block, or null
     uint32_t* __restrict__ cand_bits,  // token routing: [B*H, NQ, ceil(NTB/32)] unrouted-block bitmap, or null
     const int32_t* __restrict__ blen, int tail,
-    int T, int NTB, int NPAD, int NQ,
-    int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2) {
+    int T, int NTB, int NPAD, int NQ,   // T: key tokens
+    int sink_s, int sink_e, int sink_qs, int sink_qe,
+    int diag_lo, int diag_span,         // always-exact band: diag_lo <= b - q <= diag_lo + diag_span
+    float scale_log2) {
 #if SOL_SM80
     __shared__ __align__(16) int8_t sKc[BN * LDK];
     __shared__ __align__(16) __nv_bfloat16 sVcT[HD * LDV];
@@ -159,7 +161,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
                         ? (float)s_acc[nt][rr * 2 + cc] * qsc[rr] * (cc ? ks1 : ks0)
                         : NEG;
                     const bool routed = valid[cc] &&
-                        ((score[cc] >= thr[rr]) || abs(qr[rr] - b) <= 1);
+                        ((score[cc] >= thr[rr]) || (unsigned)(b - qr[rr] - diag_lo) <= (unsigned)diag_span);
                     cand[cc] = !pre[cc] && (q_in_sink[rr] ? valid[cc] : routed);
                 }
 
@@ -309,12 +311,12 @@ void launch_sol_route(
     const void* cen8, const void* cens, const void* kciP, const void* kcs,
     const void* vcT, const void* vsc, const void* threshold,
     void* blk_idx, void* blk_cnt, void* o_part, void* m_part, void* l_part, void* tok_ref, void* cand_bits,
-    // NQ (query blocks) and NTB (key blocks) coincide today; kept separate so
-    // a query prefix (LTX-2 guide attention) needs no kernel change
+    // NQ (query blocks) and NTB (key blocks, of T key tokens) differ when the
+    // keys carry rows the queries leave out (a conditioning prefix)
     const void* blen, int tail,
     int B, int T, int H, int NTB, int NPAD, int NQ,
-    int sink_s, int sink_e, int sink_qs, int sink_qe, float scale_log2,
-    cudaStream_t stream)
+    int sink_s, int sink_e, int sink_qs, int sink_qe, int diag_lo, int diag_span,
+    float scale_log2, cudaStream_t stream)
 {
     dim3 grid((NQ + BQ - 1) / BQ, B * H);
     sol_route_kernel<<<grid, NTHREADS, 0, stream>>>(
@@ -323,6 +325,6 @@ void launch_sol_route(
         (const float*)threshold,
         (uint16_t*)blk_idx, (int32_t*)blk_cnt, (__nv_bfloat16*)o_part,
         (float*)m_part, (float*)l_part, (float*)tok_ref, (uint32_t*)cand_bits, (const int32_t*)blen, tail,
-        T, NTB, NPAD, NQ, sink_s, sink_e, sink_qs, sink_qe,
+        T, NTB, NPAD, NQ, sink_s, sink_e, sink_qs, sink_qe, diag_lo, diag_span,
         scale_log2);
 }
