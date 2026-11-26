@@ -34,9 +34,9 @@
 //  - Row kernel: one block covers 16..64 queries along W at a fixed (t, h),
 //    16 per warp. T/H windows are scalar per block, so only W needs
 //    per-element masking, and n8 key tiles outside a warp's span are skipped.
-//  - Patch kernel, for four query heads sharing a kv head: one warp per head
-//    over the same 4x4 query patch, all reading one staged key list, the
-//    flattened union of the patch's windows.
+//  - Patch kernels: one warp over a 4x4 spatial patch, or four query heads
+//    sharing a kv head over the same patch. Stages the flattened union of
+//    spatial windows; the single warp uses one buffer to reduce shared memory.
 //
 // Requires sm80+ (bf16 mma / f32 accumulators). head_dim in {16,32,48,64,128}.
 // Layout: q/out are contiguous (B, Tq, H, W, NH, HD), k/v (B, Tk, H, W, KVH, HD).
@@ -167,7 +167,7 @@ __device__ inline void load_q(const T* __restrict__ q, int64_t row0, int64_t row
 // One staged key tile for one warp: S = Q.K^T over the active n8 tiles, masked
 // online softmax, O += P.V. visible(row, key) says whether this thread's row
 // (0: g, 1: g+8) sees key `key` of the tile.
-template <typename T, int HD, int BK, typename Visible>
+template <typename T, int HD, int BK, bool MATRIX_K = false, typename Visible>
 __device__ inline void attend_tile(const T* tK, const T* tV, const uint32_t (&qa)[HD / 16][4], const bool (&active)[BK / 8],
                                    const Visible& visible, float scale, float (&m_r)[2], float (&l_r)[2],
                                    float (&o_acc)[HD / 8][4], int lane) {
@@ -182,13 +182,26 @@ __device__ inline void attend_tile(const T* tK, const T* tV, const uint32_t (&qa
     for (int nt = 0; nt < TILES; ++nt) {
         s_acc[nt][0] = 0.f; s_acc[nt][1] = 0.f; s_acc[nt][2] = 0.f; s_acc[nt][3] = 0.f;
         if (active[nt]) {
-            const T* krow = tK + (nt * 8 + g) * LD;
-            #pragma unroll
-            for (int kc = 0; kc < HD / 16; ++kc) {
-                uint32_t kb[2];
-                kb[0] = *reinterpret_cast<const uint32_t*>(krow + kc * 16 + qd * 2);
-                kb[1] = *reinterpret_cast<const uint32_t*>(krow + kc * 16 + qd * 2 + 8);
-                MmaTraits<T>::mma(s_acc[nt], qa[kc], kb);
+            if constexpr (MATRIX_K) {
+                const T* krow = tK + (nt * 8 + (lane & 7)) * LD + (lane >> 3) * 8;
+                #pragma unroll
+                for (int kc = 0; kc < HD / 16; kc += 2) {
+                    uint32_t kb[4];
+                    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(krow + kc * 16));
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(kb[0]), "=r"(kb[1]), "=r"(kb[2]), "=r"(kb[3]) : "r"(addr));
+                    MmaTraits<T>::mma(s_acc[nt], qa[kc], kb);
+                    MmaTraits<T>::mma(s_acc[nt], qa[kc + 1], kb + 2);
+                }
+            } else {
+                const T* krow = tK + (nt * 8 + g) * LD;
+                #pragma unroll
+                for (int kc = 0; kc < HD / 16; ++kc) {
+                    uint32_t kb[2];
+                    kb[0] = *reinterpret_cast<const uint32_t*>(krow + kc * 16 + qd * 2);
+                    kb[1] = *reinterpret_cast<const uint32_t*>(krow + kc * 16 + qd * 2 + 8);
+                    MmaTraits<T>::mma(s_acc[nt], qa[kc], kb);
+                }
             }
         }
     }
@@ -202,6 +215,7 @@ __device__ inline void attend_tile(const T* tK, const T* tV, const uint32_t (&qa
         for (int e = 0; e < 4; ++e) {
             const int row = e >> 1;          // c0,c1 -> row g; c2,c3 -> row g+8
             const bool vis = active[nt] && visible(row, nt * 8 + qd * 2 + (e & 1));
+            // Keep finite logits in their original units until the row max is subtracted.
             const float s = vis ? s_acc[nt][e] * scale : NEG_INF;
             s_acc[nt][e] = s;
             m_new[row] = fmaxf(m_new[row], s);
@@ -504,12 +518,21 @@ __device__ inline void load_patch_tile(T* sK, T* sV, int* sY, int* sX, const Par
     const T* k;
     const T* v;
     plane_kv(p, s.t, batch, kv_head, k, v);
+    const unsigned recip = NTHREADS == 32 ? 0xffffffffu / s.cols + 1u : 0;
     for (int idx = tid; idx < BK * VECS; idx += NTHREADS) {
         const int r = idx / VECS, c8 = idx % VECS;
         const int key = s.j + r;
         const bool valid = key < s.count;
-        const int ky = s.y_lo + key / s.cols;
-        const int kx = s.x_lo + key % s.cols;
+        int row;
+        if constexpr (NTHREADS == 32) {
+            // Ceil reciprocal division is exact after correcting a possible +1.
+            unsigned q = s.cols == 1 ? key : __umulhi((unsigned)key, recip);
+            row = q - (q * s.cols > (unsigned)key);
+        } else {
+            row = key / s.cols;
+        }
+        const int ky = s.y_lo + row;
+        const int kx = s.x_lo + key - row * s.cols;
         const int64_t off = valid ? (int64_t)ky * p.k_h + (int64_t)kx * p.k_w + c8 * 8 : 0;
         cp_async16(sK + r * LD + c8 * 8, k + off, valid);
         cp_async16(sV + r * LD + c8 * 8, v + off, valid);
@@ -520,23 +543,24 @@ __device__ inline void load_patch_tile(T* sK, T* sV, int* sY, int* sX, const Par
     }
 }
 
-template <typename T, int HD>
-__global__ void __launch_bounds__(128) window_patch_kernel(
+template <typename T, int HD, int WQ>
+__global__ void __launch_bounds__(WQ * 32, WQ == 1 ? 16 : 1) window_patch_kernel(
     const T* __restrict__ q,
     T* __restrict__ out,
     const Params p)
 {
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
-    constexpr int BK = keys_for(HD);
+    constexpr int BK = WQ == 1 ? 32 : keys_for(HD);
+    constexpr int BUFS = WQ == 1 ? 1 : 2;
     constexpr int TILES = BK / 8;
     constexpr int NT = HD / 8;
     constexpr int LD = HD + 8;
-    constexpr int NTHREADS = 128;
+    constexpr int NTHREADS = WQ * 32;
 
-    __shared__ alignas(16) T sK[2][BK * LD];
-    __shared__ alignas(16) T sV[2][BK * LD];
-    __shared__ int sY[2][BK];
-    __shared__ int sX[2][BK];
+    __shared__ alignas(16) T sK[BUFS][BK * LD];
+    __shared__ alignas(16) T sV[BUFS][BK * LD];
+    __shared__ int sY[BUFS][BK];
+    __shared__ int sX[BUFS][BK];
 
     const int tid = threadIdx.x;
     const int warp = tid >> 5;  // query head within the block's group of four
@@ -549,9 +573,9 @@ __global__ void __launch_bounds__(128) window_patch_kernel(
     const int t_q = blockIdx.y / patch_rows;
     const int y0 = (blockIdx.y % patch_rows) * 4;
     const int x0 = blockIdx.x * 4;
-    const int head_blocks = p.num_heads / 4;
+    const int head_blocks = p.num_heads / WQ;
     const int batch = blockIdx.z / head_blocks;
-    const int head0 = (blockIdx.z % head_blocks) * 4;
+    const int head0 = (blockIdx.z % head_blocks) * WQ;
     const int64_t q_base = (int64_t)batch * p.q_b + (int64_t)(head0 + warp) * p.q_n;
     const int kv_head = head0 / p.group;
 
@@ -582,19 +606,28 @@ __global__ void __launch_bounds__(128) window_patch_kernel(
     PatchSweep ld, cp;
     enter_patch_plane(p, t_lo, y_first, y_last, x_first, x_last, ld);
     cp = ld;
-    load_patch_tile<T, HD, BK, NTHREADS>(sK[0], sV[0], sY[0], sX[0], p, batch, kv_head, ld, tid);
-    cp_async_commit();
-    bool more = advance_patch<BK>(p, t_hi, y_first, y_last, x_first, x_last, ld);
+    bool more = false;
+    if constexpr (WQ > 1) {
+        load_patch_tile<T, HD, BK, NTHREADS>(sK[0], sV[0], sY[0], sX[0], p, batch, kv_head, ld, tid);
+        cp_async_commit();
+        more = advance_patch<BK>(p, t_hi, y_first, y_last, x_first, x_last, ld);
+    }
 
     // Per-thread windows of the compute sweep's plane.
     int plane = -1;
     int ylo[2], yhi[2], xlo, xhi;
     int buf = 0;
     while (true) {
-        if (more)
-            load_patch_tile<T, HD, BK, NTHREADS>(sK[buf ^ 1], sV[buf ^ 1], sY[buf ^ 1], sX[buf ^ 1], p, batch, kv_head, ld, tid);
-        cp_async_commit();
-        cp_async_wait_one();
+        if constexpr (WQ == 1) {
+            load_patch_tile<T, HD, BK, NTHREADS>(sK[0], sV[0], sY[0], sX[0], p, batch, kv_head, cp, tid);
+            cp_async_commit();
+            asm volatile("cp.async.wait_group 0;" ::: "memory");
+        } else {
+            if (more)
+                load_patch_tile<T, HD, BK, NTHREADS>(sK[buf ^ 1], sV[buf ^ 1], sY[buf ^ 1], sX[buf ^ 1], p, batch, kv_head, ld, tid);
+            cp_async_commit();
+            cp_async_wait_one();
+        }
         __syncthreads();
 
         if (cp.t != plane) {
@@ -621,9 +654,11 @@ __global__ void __launch_bounds__(128) window_patch_kernel(
         __syncthreads();
         if (!advance_patch<BK>(p, t_hi, y_first, y_last, x_first, x_last, cp))
             break;
-        if (more)
-            more = advance_patch<BK>(p, t_hi, y_first, y_last, x_first, x_last, ld);
-        buf ^= 1;
+        if constexpr (WQ > 1) {
+            if (more)
+                more = advance_patch<BK>(p, t_hi, y_first, y_last, x_first, x_last, ld);
+            buf ^= 1;
+        }
     }
 
     const bool in_x = x0 + g % 4 < w_size;
@@ -631,6 +666,201 @@ __global__ void __launch_bounds__(128) window_patch_kernel(
     store_rows<T, HD>(out, rows, valid, o_acc, l_r, qd);
 #endif  // __CUDA_ARCH__ >= 800 (bf16 mma; dispatch constraints require sm80+)
 }
+
+// Encode KxK spatial visibility as bits instead of per-key coordinates.
+template <int K, int WORD>
+__host__ __device__ constexpr uint64_t neighborhood_bits() {
+    uint64_t bits = 0;
+    for (int y = 0; y < K; ++y)
+        for (int x = 0; x < K; ++x) {
+            const int bit = y * (K + 3) + x - WORD * 64;
+            if (bit >= 0 && bit < 64)
+                bits |= uint64_t(1) << bit;
+        }
+    return bits;
+}
+
+// RTX benefits from sharing 7x7 keys across two patches; DC keeps one warp.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 890 || (__CUDA_ARCH__ >= 1200 && __CUDA_ARCH__ < 1300))
+#define NA3D_PATCH_WARPS(K) ((K) == 7 ? 2 : 1)
+#else
+#define NA3D_PATCH_WARPS(K) 1
+#endif
+
+template <typename T, int K, bool TEMPORAL = false>
+__global__ void __launch_bounds__(32 * (TEMPORAL ? 2 : NA3D_PATCH_WARPS(K)), TEMPORAL ? 8 : 16 / NA3D_PATCH_WARPS(K)) masked_patch_kernel(
+    const T* __restrict__ q, T* __restrict__ out, const Params p)
+{
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+    // Share keys across two time slices or adjacent spatial patches.
+    constexpr int WQ = TEMPORAL ? 2 : NA3D_PATCH_WARPS(K), PH = TEMPORAL ? 4 : 4 * WQ;
+    constexpr int HD = 64, BK = 32, LD = HD + 8, COLS = K + 3;
+    constexpr int COUNT = COLS * (K + PH - 1), STEPS = (COUNT + BK - 1) / BK;
+    __shared__ alignas(16) T sK[WQ][BK * LD], sV[WQ][BK * LD];
+    const int tid = threadIdx.x;
+    const int lane = WQ == 1 ? tid : tid & 31, warp = WQ == 1 ? 0 : tid >> 5;
+    const int g = lane >> 2, qd = lane & 3;
+    const int patch_rows = (p.h_size + PH - 1) / PH;
+    const int tile_t = (blockIdx.y / patch_rows) * (TEMPORAL ? 2 : 1);
+    const int raw_t = tile_t + (TEMPORAL ? warp : 0), tq = TEMPORAL ? imin(raw_t, p.tq - 1) : raw_t;
+    const int y0 = (blockIdx.y % patch_rows) * PH, x0 = blockIdx.x * 4;
+    const int warp_y = TEMPORAL ? 0 : warp * 4;
+    const int batch = blockIdx.z / p.num_heads, head = blockIdx.z % p.num_heads;
+    const int py = WQ == 1 ? imin(imax(y0 - K / 2, 0), p.h_size - COLS)
+                           : imax(imin(y0 - K / 2, p.h_size - (K + PH - 1)), 0);
+    const int px = imin(imax(x0 - K / 2, 0), p.w_size - COLS);
+    const int qy[2] = {imin(y0 + warp_y + g / 4, p.h_size - 1),
+                       imin(y0 + warp_y + g / 4 + 2, p.h_size - 1)};
+    const int qx = imin(x0 + g % 4, p.w_size - 1);
+    const int64_t base = (int64_t)batch * p.q_b + (int64_t)tq * p.q_t + (int64_t)head * p.q_n + (int64_t)qx * p.q_w;
+    const int64_t rows[2] = {base + (int64_t)qy[0] * p.q_h, base + (int64_t)qy[1] * p.q_h};
+    uint32_t qa[HD / 16][4];
+    load_q<T, HD>(q, rows[0], rows[1], qd, qa);
+
+    int ylo, yhi, xlo, xhi, unused;
+    if constexpr (WQ > 1) {
+        axis_window(imin(y0, p.h_size - 1), K, p.h_size, false, true, ylo, unused);
+        axis_window(imin(y0 + PH - 1, p.h_size - 1), K, p.h_size, false, true, unused, yhi);
+        axis_window(imin(x0, p.w_size - 1), K, p.w_size, false, true, xlo, unused);
+        axis_window(imin(x0 + 3, p.w_size - 1), K, p.w_size, false, true, unused, xhi);
+    }
+    constexpr uint64_t BLO = neighborhood_bits<K, 0>(), BHI = neighborhood_bits<K, 1>();
+    uint64_t lo[2], hi[2];
+    uint32_t tail[2];
+    #pragma unroll
+    for (int row = 0; row < 2; ++row) {
+        const int yl = imin(imax(qy[row] - K / 2, 0), p.h_size - K);
+        const int xl = imin(imax(qx - K / 2, 0), p.w_size - K);
+        const int shift = (yl - py) * COLS + xl - px;
+        if constexpr (WQ == 1 || TEMPORAL) {
+            lo[row] = BLO << shift;
+            hi[row] = (BHI << shift) | (shift ? BLO >> (64 - shift) : 0);
+        } else if (shift < 64) {
+            lo[row] = BLO << shift;
+            hi[row] = (BHI << shift) | (shift ? BLO >> (64 - shift) : 0);
+            tail[row] = shift ? uint32_t(BHI >> (64 - shift)) : 0;
+        } else {
+            const int n = shift - 64;
+            lo[row] = 0;
+            hi[row] = BLO << n;
+            tail[row] = uint32_t((BHI << n) | (n ? BLO >> (64 - n) : 0));
+        }
+    }
+    uint64_t fragment_mask = 0;
+    if constexpr (TEMPORAL) {
+        // Pack each lane's four score bits per n8 tile once, across all stages.
+        auto compact = [](uint32_t x) {
+            x &= 0x03030303u;
+            x = (x | (x >> 4)) & 0x00330033u;
+            return (x | (x >> 8)) & 0x00003333u;
+        };
+        #pragma unroll
+        for (int stage = 0; stage < STEPS; ++stage) {
+            const uint32_t a = uint32_t((stage < 2 ? lo[0] : hi[0]) >> ((stage & 1) * 32));
+            const uint32_t b = uint32_t((stage < 2 ? lo[1] : hi[1]) >> ((stage & 1) * 32));
+            fragment_mask |= uint64_t(compact(a >> (qd * 2)) | (compact(b >> (qd * 2)) << 2)) << (stage * 16);
+        }
+    }
+    float acc[HD / 8][4] = {}, m[2] = {NEG_INF, NEG_INF}, l[2] = {0.f, 0.f};
+    int t_lo, t_hi;
+    axis_window(tq + p.t_offset, p.kt, p.tk, p.causal_t, true, t_lo, t_hi);
+    const int warp_t_lo = t_lo, warp_t_hi = t_hi;
+    if constexpr (TEMPORAL) {
+        axis_window(tile_t + p.t_offset, p.kt, p.tk, p.causal_t, true, t_lo, unused);
+        axis_window(imin(tile_t + 1, p.tq - 1) + p.t_offset, p.kt, p.tk, p.causal_t, true, unused, t_hi);
+    }
+    auto load_tile = [&](int t, int stage, int buf, uint32_t unionword) {
+        if (t < t_hi) {
+            const T *k, *v;
+            plane_kv(p, t, batch, head, k, v);
+            const int row0 = tid / 8, dim = (tid % 8) * 8;
+            int key = stage * BK + row0, ky = py + key / COLS, col = key % COLS;
+            int64_t off = (int64_t)ky * p.k_h + (int64_t)(px + col) * p.k_w + dim;
+            const int64_t step = (4 * WQ) * p.k_w, wrap = p.k_h - COLS * p.k_w;
+            const int count = WQ == 1 ? COUNT : imin(K + PH - 1, p.h_size - py) * COLS;
+            #pragma unroll
+            for (int i = 0; i < BK / (4 * WQ); ++i) {
+                const bool valid = key < count && (WQ == 1
+                    ? ((unionword >> (row0 + 4 * i)) & 1u)
+                    : ky >= ylo && ky < yhi && col >= xlo - px && col < xhi - px);
+                cp_async16(sK[buf] + (row0 + 4 * WQ * i) * LD + dim, k + (valid ? off : 0), valid);
+                cp_async16(sV[buf] + (row0 + 4 * WQ * i) * LD + dim, v + (valid ? off : 0), valid);
+                key += 4 * WQ;
+                col += 4 * WQ;
+                off += step;
+                if (col >= COLS) {
+                    col -= COLS;
+                    if constexpr (WQ > 1) ++ky;
+                    off += wrap;
+                }
+            }
+        }
+        cp_async_commit();
+    };
+    if constexpr (TEMPORAL) load_tile(t_lo, 0, 0, 0);
+    int buf = 0;
+    for (int t = t_lo; t < t_hi; ++t) {
+        #pragma unroll 1
+        for (int stage = 0; stage < STEPS; ++stage) {
+            if constexpr (WQ > 1 && !TEMPORAL) {
+                const int first_key = (ylo - py) * COLS + xlo - px;
+                const int end_key = (yhi - py - 1) * COLS + xhi - px;
+                if (stage * BK + BK <= first_key || stage * BK >= end_key)
+                    continue;
+            }
+            uint32_t score_bits = 0, unionword;
+            uint32_t word0 = 0, word1 = 0;
+            if constexpr (TEMPORAL) {
+                score_bits = uint32_t(fragment_mask >> (stage * 16)) & 0xffffu;
+                unionword = __reduce_or_sync(0xffffffffu, score_bits);
+            } else {
+                if constexpr (WQ == 1) {
+                    word0 = uint32_t((stage < 2 ? lo[0] : hi[0]) >> ((stage & 1) * 32));
+                    word1 = uint32_t((stage < 2 ? lo[1] : hi[1]) >> ((stage & 1) * 32));
+                } else {
+                    word0 = stage < 4 ? uint32_t((stage < 2 ? lo[0] : hi[0]) >> ((stage & 1) * 32)) : tail[0];
+                    word1 = stage < 4 ? uint32_t((stage < 2 ? lo[1] : hi[1]) >> ((stage & 1) * 32)) : tail[1];
+                }
+                unionword = __reduce_or_sync(0xffffffffu, word0 | word1);
+            }
+            if constexpr (WQ == 1) {
+                if (!unionword)
+                    continue;
+            }
+            if constexpr (TEMPORAL) {
+                // Retire previous readers before reusing the alternate buffer.
+                __syncthreads();
+                asm volatile("cp.async.wait_group 0;" ::: "memory");
+                __syncthreads();
+                load_tile(t + (stage + 1) / STEPS, (stage + 1) % STEPS, buf ^ 1, 0);
+            } else {
+                load_tile(t, stage, buf, unionword);
+                asm volatile("cp.async.wait_group 0;" ::: "memory");
+                if constexpr (WQ == 1) __syncwarp(); else __syncthreads();
+            }
+            if ((WQ == 1 || unionword) && (!TEMPORAL || (raw_t < p.tq && t >= warp_t_lo && t < warp_t_hi))) {
+                bool active[BK / 8];
+                #pragma unroll
+                for (int n = 0; n < BK / 8; ++n)
+                    active[n] = TEMPORAL ? ((unionword >> (n * 4)) & 0xfu) : ((unionword >> (n * 8)) & 0xffu);
+                const auto visible = [&](int row, int c) {
+                    if constexpr (TEMPORAL) return (score_bits >> ((c / 8) * 4 + row * 2 + (c & 1))) & 1u;
+                    else return ((row ? word1 : word0) >> c) & 1u;
+                };
+                attend_tile<T, HD, BK, TEMPORAL>(sK[buf], sV[buf], qa, active, visible, p.scale, m, l, acc, lane);
+            }
+            // Spatial tiles retire prior readers at the next load barrier.
+            if constexpr (WQ == 1) __syncwarp(); else buf ^= 1;
+        }
+    }
+    const bool in_x = x0 + g % 4 < p.w_size;
+    const bool valid[2] = {(!TEMPORAL || raw_t < p.tq) && in_x && y0 + warp_y + g / 4 < p.h_size,
+                         (!TEMPORAL || raw_t < p.tq) && in_x && y0 + warp_y + g / 4 + 2 < p.h_size};
+    store_rows<T, HD>(out, rows, valid, acc, l, qd);
+#endif
+}
+
+#undef NA3D_PATCH_WARPS
 
 // ---------------------------------------------------------------------------
 // Launch
@@ -673,7 +903,7 @@ void launch_patches(const void* q, void* out, const Params& p, int batch, int he
 {
     const dim3 grid((p.w_size + 3) / 4, p.tq * ((p.h_size + 3) / 4), batch * (p.num_heads / 4));
 #define NA3D_LAUNCH(HD_)                                                                    \
-    window_patch_kernel<T, HD_><<<grid, 128, 0, stream>>>(                                  \
+    window_patch_kernel<T, HD_, 4><<<grid, 128, 0, stream>>>(                                  \
         reinterpret_cast<const T*>(q), reinterpret_cast<T*>(out), p)
     NA3D_HEAD_DIMS(NA3D_LAUNCH)
 #undef NA3D_LAUNCH
@@ -682,6 +912,48 @@ void launch_patches(const void* q, void* out, const Params& p, int batch, int he
 template <typename T>
 void launch_typed(const void* q, void* out, const Params& p, int batch, int head_dim, cudaStream_t stream)
 {
+    if (head_dim == 64 && p.group == 1 && p.n_windows == 1 && p.clamp &&
+        !p.causal_h && !p.causal_w && p.kh[0] == p.kw[0] &&
+        (p.kw[0] == 5 || p.kw[0] == 7) && p.h_size >= p.kw[0] + 3 && p.w_size >= p.kw[0] + 3) {
+        // Short sequences retain spatial sharing to avoid temporal fringe overhead.
+        if (p.kt > 1 && p.tq / p.kt >= 4) {
+            const dim3 grid((p.w_size + 3) / 4, ((p.tq + 1) / 2) * ((p.h_size + 3) / 4), batch * p.num_heads);
+            if (p.kw[0] == 5)
+                masked_patch_kernel<T, 5, true><<<grid, 64, 0, stream>>>(
+                    reinterpret_cast<const T*>(q), reinterpret_cast<T*>(out), p);
+            else
+                masked_patch_kernel<T, 7, true><<<grid, 64, 0, stream>>>(
+                    reinterpret_cast<const T*>(q), reinterpret_cast<T*>(out), p);
+            return;
+        }
+        int threads = 32;
+        if (p.kw[0] == 7) {
+            // Follow the loaded kernel, including architecture-specific bounds
+            // after PTX JIT, rather than duplicating its policy in host code.
+            cudaFuncAttributes attr;
+            if (cudaFuncGetAttributes(&attr, masked_patch_kernel<T, 7>) != cudaSuccess)
+                throw std::runtime_error("na3d: kernel attribute query failed");
+            threads = attr.maxThreadsPerBlock;
+        }
+        const int ph = threads / 8;
+        const dim3 grid((p.w_size + 3) / 4, p.tq * ((p.h_size + ph - 1) / ph), batch * p.num_heads);
+        if (p.kw[0] == 5)
+            masked_patch_kernel<T, 5><<<grid, 32, 0, stream>>>(
+                reinterpret_cast<const T*>(q), reinterpret_cast<T*>(out), p);
+        else
+            masked_patch_kernel<T, 7><<<grid, threads, 0, stream>>>(
+                reinterpret_cast<const T*>(q), reinterpret_cast<T*>(out), p);
+        return;
+    }
+    // A 4x4 spatial patch reuses keys across query rows. Keep the model's
+    // 64-wide heads to two new instantiations (FP16/BF16); wider windows use rows.
+    if (head_dim == 64 && p.group == 1 && p.n_windows == 1 &&
+        p.kh[0] >= 3 && p.kh[0] <= 7 && p.kw[0] >= 3 && p.kw[0] <= 7) {
+        const dim3 grid((p.w_size + 3) / 4, p.tq * ((p.h_size + 3) / 4), batch * p.num_heads);
+        window_patch_kernel<T, 64, 1><<<grid, 32, 0, stream>>>(
+            reinterpret_cast<const T*>(q), reinterpret_cast<T*>(out), p);
+        return;
+    }
     // Four query heads sharing a kv head stage each key tile once for all four.
     if (p.group % 4 == 0) {
         launch_patches<T>(q, out, p, batch, head_dim, stream);

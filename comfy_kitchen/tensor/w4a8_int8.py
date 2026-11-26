@@ -3,7 +3,9 @@
 """Grouped W4A8 / W6A8 weights executed through the shared INT8 linear operation.
 
 Weights are ConvRot-rotated and quantized per ``group_size``. The default (``bits=4``)
-uses a symmetric Lloyd-Max codebook and FP8 group scales; ``bits=6`` stores uniform
+uses a symmetric Lloyd-Max codebook and FP8 group scales; ``bits=3`` an 8-entry
+codebook (3K/8-byte rows of a 2-bit and a 1-bit plane); ``bits=5`` uniform -15..15 levels
+(5K/8-byte rows: nibble plane + 1-bit plane); ``bits=6`` stores uniform
 6-bit codes (no codebook) in a 3K/4-byte row, at ~3x lower weight error for 1.5x the
 bytes. The bit depth is implied by the packed row width, so one layout class and one
 checkpoint format cover both. The tensor layout owns only metadata and operator
@@ -17,6 +19,7 @@ from dataclasses import dataclass
 
 import torch
 
+from comfy_kitchen._rope_utils import _tensors_overlap
 from comfy_kitchen.registry import registry
 
 from .base import (
@@ -26,11 +29,7 @@ from .base import (
     dequantize_args,
     register_layout_op,
 )
-from .w4a8_packed import (
-    _mma_bits,
-    default_w4a8_codebook,
-    unpack_w4a8_mma_weight,
-)
+from .w4a8_packed import _mma_bits, resolve_mma_codebook, unpack_w4a8_mma_weight
 
 
 def quantize_w4a8_int8_weight(
@@ -56,9 +55,9 @@ def quantize_w4a8_int8_weight(
     ``codebook_tensor`` reuses a previously decided table (e.g. on LoRA requantize) so the
     codebook decision -- kurtosis probe and any k-means -- is skipped. ``stochastic_rounding``
     > 0 seeds stochastic rounding of the level assignment so a merged LoRA below the int4 step
-    is preserved instead of rounded away. ``bits=6`` selects uniform, codebook-free 6-bit
-    storage; ``scale_search`` (6-bit only) runs the grid-aware group-scale search at quantize
-    time, which the requantize path skips.
+    is preserved instead of rounded away. ``bits`` picks the width: 4 (default) or 3 use a
+    codebook, 6 or 5 uniform codebook-free levels; ``scale_search`` (5/6-bit only) runs the
+    grid-aware group-scale search at quantize time, which the requantize path skips.
     """
     if scale_dtype not in (torch.float32, torch.float8_e4m3fn):
         raise ValueError(f"scale_dtype must be float32 or float8_e4m3fn, got {scale_dtype}")
@@ -120,6 +119,7 @@ def w4a8_int8_linear(
     input_act_eps: float = 0.0,
     residual: torch.Tensor | None = None,
     residual_scale: torch.Tensor | None = None,
+    decode_lut: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute ``x @ W.T + bias`` with the selected W4A8 backend.
 
@@ -149,6 +149,8 @@ def w4a8_int8_linear(
         "residual_scale": residual_scale,
     }
     operation = "w4a8_packed_linear" if mma_packed else "w4a8_int8_linear"
+    if mma_packed:
+        kwargs["decode_lut"] = decode_lut
     impl = registry.get_implementation(operation, kwargs=kwargs)
     return impl(**kwargs)
 
@@ -167,9 +169,11 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         codebook: torch.Tensor | None = None
         group_size: int = 16
         convrot_groupsize: int = 256
-        # Packed qdata interleaves codes and group scales; scale is then empty.
+        # Packed qdata interleaves codes and group scales; scale is then empty, and
+        # decode_lut holds the CUDA stream's [256, levels] int8 table of codebook.
         mma_packed: bool = False
         transposed: bool = False
+        decode_lut: torch.Tensor | None = None
 
         def _tensor_fields(self) -> list[str]:
             fields = ["scale", "s_channel"]
@@ -177,7 +181,18 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                 fields.append("correction")
             if self.codebook is not None:
                 fields.append("codebook")
+            if self.decode_lut is not None:
+                fields.append("decode_lut")
             return fields
+
+        def copy_from(self, src: BaseLayoutParams, non_blocking: bool = False) -> None:
+            # decode_lut is the backend's cached table, shared by every weight with the same
+            # codebook: take src's by reference instead of writing through ours.
+            lut = src.decode_lut  # read before clearing ours: src may be self
+            object.__setattr__(self, "decode_lut", None)
+            super().copy_from(src, non_blocking=non_blocking)
+            if lut is not None:
+                object.__setattr__(self, "decode_lut", lut.to(self.s_channel.device))
 
         def _validate_tensor_fields(self):
             if len(self.orig_shape) != 2:
@@ -210,9 +225,9 @@ class AsymW4A8Int8Layout(QuantizedLayout):
                 raise ValueError(
                     f"correction must have shape {(groups, n)}, got {tuple(self.correction.shape)}"
                 )
-            if self.codebook is not None and tuple(self.codebook.shape) != (16,):
+            if self.codebook is not None and tuple(self.codebook.shape) not in ((16,), (8,)):
                 raise ValueError(
-                    f"codebook must have shape (16,), got {tuple(self.codebook.shape)}"
+                    f"codebook must have shape (16,) or (8,), got {tuple(self.codebook.shape)}"
                 )
 
     @classmethod
@@ -269,16 +284,26 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         ):
             return weight
         n, k = params.orig_shape
-        if params.codebook is None:
-            # 6-bit codes are uniform; 4-bit without a codebook is not what the kernel decodes
-            codebook_ok = qdata.shape[1] * 8 == k * 6
-        else:
-            codebook_ok = torch.equal(params.codebook.float().cpu(), default_w4a8_codebook())
+        if n == 0 or k == 0 or params.convrot_groupsize != 256:
+            return weight
+        # The codebook has to match the stored width before anything is rewritten in place:
+        # 3/4-bit codes index an 8/16-entry table (the stream's decode table is built from it
+        # below), 5/6-bit codes are uniform and carry none.
+        bits = qdata.shape[1] * 8 // k
+        levels = None if params.codebook is None else params.codebook.numel()
+        codebook_ok = (
+            bits in (3, 4, 5, 6) and qdata.shape[1] * 8 == k * bits
+            and levels == (1 << bits if bits in (3, 4) else None)
+        )
         if (
             n % 16 != 0 or k % 256 != 0
             or params.group_size != 16
             or params.correction is not None
             or params.scale.dtype != torch.float8_e4m3fn
+            or not params.scale.is_contiguous()
+            or not params.s_channel.is_contiguous()
+            or not qdata.is_contiguous()
+            or qdata.data_ptr() % 16 != 0
             or not codebook_ok
         ):
             return weight
@@ -290,26 +315,38 @@ class AsymW4A8Int8Layout(QuantizedLayout):
         if start < 0 or scale_start < start + qdata.nbytes or end > storage.nbytes:
             return weight
         # Import only on the eligible CUDA path; the backend imports this layout.
-        from comfy_kitchen.backends.cuda import pack_w4a8_mma_weight_
+        from comfy_kitchen.backends.cuda import _w4a8_decode_lut, pack_w4a8_mma_weight_
 
         dest = storage[start:start + qdata.nbytes + params.scale.nbytes].view(qdata.dtype)
+        if _tensors_overlap(dest, params.s_channel) or (
+            params.codebook is not None and _tensors_overlap(dest, params.codebook)
+        ):
+            return weight
+        codebook, decode_lut = params.codebook, None
+        if codebook is not None:
+            decode_lut = _w4a8_decode_lut(qdata.device, codebook)
+            # copy_ updates this buffer in place, including between graph replays.
+            # The canonical codebook may be shared by several independent weights.
+            codebook = codebook.to(device=qdata.device, dtype=torch.float32, copy=True,
+                                   memory_format=torch.contiguous_format)
         pack_w4a8_mma_weight_(dest, params.scale)
         params = dataclasses.replace(
-            params, scale=params.scale.new_empty(0), mma_packed=True
+            params, scale=params.scale.new_empty(0), mma_packed=True, codebook=codebook, decode_lut=decode_lut
         )
         return QuantizedTensor(dest, weight._layout_cls, params)
 
     @classmethod
     def dequantize(cls, qdata: torch.Tensor, params: Params) -> torch.Tensor:
-        s_rel = params.scale
+        s_rel, codebook = params.scale, params.codebook
         if params.mma_packed:
             n, k = params.orig_shape[::-1] if params.transposed else params.orig_shape
             qdata, s_rel = unpack_w4a8_mma_weight(qdata, n, k)
+            codebook = resolve_mma_codebook(qdata, k, codebook)
         return dequantize_w4a8_int8_weight(
             qdata,
             s_rel,
             params.s_channel,
-            codebook=params.codebook,
+            codebook=codebook,
             correction=params.correction,
             group_size=params.group_size,
             convrot_groupsize=params.convrot_groupsize,
@@ -349,7 +386,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
             group_size=params.group_size, convrot_groupsize=params.convrot_groupsize,
             out_dtype=params.orig_dtype, mma_packed=params.mma_packed,
             input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
-            residual=residual, residual_scale=residual_scale,
+            residual=residual, residual_scale=residual_scale, decode_lut=params.decode_lut,
         )
 
     @classmethod
@@ -369,7 +406,7 @@ class AsymW4A8Int8Layout(QuantizedLayout):
 
     @classmethod
     def bits(cls, qtensor: QuantizedTensor) -> int:
-        """Code width implied by the packed row: K/2 bytes at 4 bits, 3K/4 at 6."""
+        """Code width implied by the packed row: 3K/8, K/2, 5K/8 or 3K/4 bytes at 3, 4, 5, 6 bits."""
         from comfy_kitchen.backends.eager.w4a8_int8 import _w4a8_geometry
 
         params = qtensor._params
@@ -424,6 +461,7 @@ def _w4a8_int8_forward(
         convrot_groupsize=params.convrot_groupsize,
         out_dtype=out_dtype,
         mma_packed=params.mma_packed,
+        decode_lut=params.decode_lut,
     )
 
 

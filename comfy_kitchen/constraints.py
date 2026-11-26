@@ -258,17 +258,27 @@ def validate_function_call(
 
 def sol_attn_common_call_rule(kwargs):
     """Shared ``sol_attn`` validation. The fused backends size everything from
-    ``q`` and reach ``k``/``v`` as bare pointers, so a mismatch becomes an
-    out-of-bounds read; head_dim 128 is baked into the kernels' layout."""
+    ``q`` and ``k`` and reach the tensors as bare pointers, so a mismatch becomes
+    an out-of-bounds read; head_dim 128 is baked into the kernels' layout.
+    ``k``/``v`` share one length, at least ``q``'s."""
     q = kwargs.get("q")
     if q is not None:
+        k = kwargs.get("k")
+        key_len = k.shape[1] if k is not None and k.dim() == 4 else q.shape[1]
+        if q.shape[1] < 1:   # plans zero blocks
+            return ValidationResult.fail("q", "needs at least one token")
+        if key_len < q.shape[1]:   # a query block past the keys has no always-exact band
+            return ValidationResult.fail(
+                "k", f"needs at least as many rows as q ({q.shape[1]}), got shape {tuple(k.shape)}")
+        want = (q.shape[0], key_len, *q.shape[2:])
         for name in ("k", "v"):
             other = kwargs.get(name)
             if other is None:
                 continue
-            if tuple(other.shape) != tuple(q.shape):
+            if tuple(other.shape) != want:
                 return ValidationResult.fail(
-                    name, f"must have the same shape as q {tuple(q.shape)}, got {tuple(other.shape)}"
+                    name, f"must have shape {want} (q's, at the length k and v share), "
+                          f"got {tuple(other.shape)}"
                 )
             if other.dtype != q.dtype:
                 return ValidationResult.fail(
@@ -280,6 +290,9 @@ def sol_attn_common_call_rule(kwargs):
                 )
         if q.shape[-1] != 128:
             return ValidationResult.fail("q", "head_dim must be 128")
+        for name in ("block_len", "coarse_gate"):   # they describe query and key blocks alike
+            if key_len != q.shape[1] and kwargs.get(name) is not None:
+                return ValidationResult.fail(name, "needs q and k of the same length")
         block_len = kwargs.get("block_len")
         if block_len is not None:
             n = (q.shape[1] + 63) // 64
@@ -295,6 +308,11 @@ def sol_attn_common_call_rule(kwargs):
                     "coarse_gate", f"must have q's shape {tuple(q.shape)}, got {tuple(coarse_gate.shape)}")
             if coarse_gate.device != q.device:
                 return ValidationResult.fail("coarse_gate", f"must be on {q.device}, got {coarse_gate.device}")
+        # query i is key q_offset + i: past this the always-exact band leaves the keys
+        q_offset, room = kwargs.get("q_offset") or 0, key_len - q.shape[1]
+        if not 0 <= q_offset <= room:
+            return ValidationResult.fail(
+                "q_offset", f"must be in [0, {room}] so the queries sit inside the keys, got {q_offset}")
     # Both sinks are half-open [start, end) block ranges.
     for name in ("sink_blocks", "sink_q"):
         value = kwargs.get(name)
