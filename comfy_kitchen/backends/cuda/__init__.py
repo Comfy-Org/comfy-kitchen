@@ -29,7 +29,7 @@ from comfy_kitchen._rope_utils import (
     detect_rms_rope_bnhd,
     trim_rope_freqs,
 )
-from comfy_kitchen.allocation import allocation_context
+from comfy_kitchen.allocation import allocation_context, has_allocation_context
 
 __all__ = [
     "na3d",
@@ -556,14 +556,18 @@ def get_cublas_workspace_size_bytes() -> int:
 def get_cublas_workspace() -> torch.Tensor:
     """Returns workspace for cublas."""
     device_index = torch.cuda.current_device()
-    workspace = _cublas_workspaces.get(device_index)
+    # With a compiler allocation context, keep scratch call-local and recorded
+    # instead of pausing allocation tracking or retaining it in the eager cache.
+    ephemeral = has_allocation_context()
+    workspace = None if ephemeral else _cublas_workspaces.get(device_index)
     if workspace is None:
         workspace = torch.empty(
             get_cublas_workspace_size_bytes(),
             dtype=torch.uint8,
             device=device_index,
         )
-        _cublas_workspaces[device_index] = workspace
+        if not ephemeral:
+            _cublas_workspaces[device_index] = workspace
     return workspace
 
 

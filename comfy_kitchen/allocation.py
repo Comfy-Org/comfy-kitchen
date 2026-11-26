@@ -1,6 +1,6 @@
 import contextlib
 
-_context = contextlib.nullcontext()
+_context = None
 
 
 # Some Kitchen APIs do their own internal allocations. These persist outside
@@ -8,8 +8,12 @@ _context = contextlib.nullcontext()
 # general management.
 def set_allocation_context(context):
     global _context
-    _context = contextlib.nullcontext() if context is None else context
+    _context = context
 
 
 def allocation_context():
-    return _context
+    return contextlib.nullcontext() if _context is None else _context
+
+
+def has_allocation_context():
+    return _context is not None
