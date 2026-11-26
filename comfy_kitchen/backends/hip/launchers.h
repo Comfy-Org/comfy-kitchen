@@ -20,6 +20,14 @@ void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, 
                         int kh, int kw, int causal_t, int causal_h, int causal_w, float scale,
                         int dtype_code, hipStream_t stream);
 
+// Window attention of (B, Tq, H, W, NH, HD) queries over (B, Tk, H, W, KVH, HD) key
+// planes, n_windows (kh, kw) pairs. See ops/na3d.hip.
+void launch_window_attention_kernel(const void* q, const void* k, const void* v, void* out,
+                                    int batch, int tq, int tk, int h_size, int w_size,
+                                    int num_heads, int kv_heads, int head_dim, const int* kh,
+                                    const int* kw, int n_windows, int temporal_window, int clamp,
+                                    float scale, int dtype_code, hipStream_t stream);
+
 // BF16 decode attention over a fixed-capacity KV cache. The rows of one KV head
 // are a (group, step) grid of query_length = groups * steps rows; `causal` gives
 // row (g, s) the slot limit kv_lengths[b] - steps + s + 1. head_dim is 128 or
@@ -51,12 +59,13 @@ void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* 
                              int bias_code, int M, int N, int K, int ldc, int out_code,
                              hipStream_t stream);
 
-// A is physically [M_tile, K_tile, 128, 128]; B is row-major.
+// A is physically [M_tile, K_tile, 128, 128]; B is row-major, or when
+// b_tiled is set, [N/256, K/64, 256, 64] (bf16 output, per-channel scale, no bias).
 void launch_int8_gemm_a_tiled128_kernel(
     const void* a, const void* b, void* c, const void* scale_a,
     const void* scale_b, int scale_b_stride, const void* bias,
     int bias_code, int M, int N, int K, int ldc, int out_code,
-    hipStream_t stream);
+    int b_tiled, hipStream_t stream);
 
 // Exact BF16 RMSNorm followed by gate multiplication and residual add.
 void launch_rms_gated_residual_bf16_kernel(
@@ -101,22 +110,25 @@ void launch_w4a8_int8_gemm_chunked_kernel(const void* xq, const void* qw, const 
 // Sol-Attn sparse attention -- see sage_attention/sol_attn.hip. The whole pipeline
 // runs over one caller-allocated workspace whose carve-up sol_attn_plan reports.
 extern const char* const sol_attn_plan_names[];  // null-terminated
-int sol_attn_plan(int batch, int seq_len, int num_heads, int n_tok, int64_t* out, int cap);
+int sol_attn_plan(int batch, int seq_len, int key_len, int num_heads, int n_tok, int64_t* out,
+                  int cap);
 void sol_producer_begin(void* workspace, int batch, int seq_len, int num_heads, int n_tok,
                         hipStream_t stream);
 void sol_producer_chunk(void* workspace, const void* qkv, const void* fab, const void* qw,
                         const void* kw, const void* kmean, const void* vscale, const void* blen,
-                        float rope_eps, int rot_dim, int t0, int M, int batch, int seq_len,
-                        int num_heads, int n_tok, hipStream_t stream);
+                        float rope_eps, int rot_dim, bool split_half, int t0, int M, int batch,
+                        int seq_len, int num_heads, int n_tok, hipStream_t stream);
 void launch_sol_attn_core(void* workspace, void* out, const void* vscale, void* kmean_next,
                           void* vamax_out, const void* blen, int tail, int batch, int seq_len,
                           int num_heads, float tau, float scale, const void* ext_threshold,
                           int sink_start, int sink_end, int sink_q_start, int sink_q_end,
                           int n_tok, hipStream_t stream);
 void launch_sol_attn(const void* q, const void* k, const void* v, void* out, void* workspace,
-                     int batch, int seq_len, int num_heads, int head_dim, int elem, float tau, float scale,
+                     int batch, int seq_len, int key_len, int num_heads, int head_dim, int elem,
+                     float tau, float scale,
                      const void* key_bias, const void* ext_threshold, const void* blen, int tail,
-                     int sink_start, int sink_end, int sink_q_start, int sink_q_end, int64_t qs_b,
+                     int sink_start, int sink_end, int sink_q_start, int sink_q_end, int q_offset,
+                     int64_t qs_b,
                      int64_t qs_t, int64_t qs_h, int64_t ks_b, int64_t ks_t, int64_t ks_h,
                      int64_t vs_b, int64_t vs_t, int64_t vs_h, int n_tok, hipStream_t stream);
 
