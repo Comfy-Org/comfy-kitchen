@@ -42,6 +42,14 @@ def _dtype_code(dtype: torch.dtype) -> int:
         raise ValueError(f"Unsupported INT8 output dtype: {dtype}") from None
 
 
+def _row_major(qdata: torch.Tensor, params) -> torch.Tensor:
+    """Row-major (N, K) codes; a copy when the resident weight is in the tiled B order."""
+    if not params.tiled:
+        return qdata
+    n, k = qdata.shape
+    return qdata.view(n // 256, k // 64, 256, 64).transpose(1, 2).reshape(n, k)
+
+
 def _has_native_fusion(func_name: str, kwargs: dict) -> bool:
     """Whether ``func_name`` would dispatch to a native kernel for ``kwargs``.
 
@@ -89,6 +97,10 @@ class TensorWiseINT8Layout(QuantizedLayout):
         convrot: bool = False
         convrot_groupsize: int = 256
         transposed: bool = False
+        # qdata bytes are in the HIP big-tile GEMM's B order ([N/256][K/64][256][64])
+        # instead of row-major; the tensor keeps its logical (N, K) shape.
+        tiled: bool = False
+
         def _tensor_fields(self) -> list[str]:
             return ["scale"]
 
@@ -178,6 +190,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
             Dequantized tensor.
         """
         output_dtype_code = _INT8_DEQUANT_DTYPE_TO_CODE.get(params.orig_dtype, 0)
+        qdata = _row_major(qdata, params)
         if getattr(params, "convrot", False):
             result = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype(
                 qdata, params.scale, params.convrot_groupsize, output_dtype_code
@@ -196,7 +209,7 @@ class TensorWiseINT8Layout(QuantizedLayout):
         output_dtype_code = _INT8_DEQUANT_DTYPE_TO_CODE.get(params.orig_dtype, 0)
         group_size = params.convrot_groupsize if getattr(params, "convrot", False) else 0
         result = torch.ops.comfy_kitchen.dequantize_int8_embedding(
-            qdata, params.scale, indices, group_size, output_dtype_code
+            qdata, params.scale, indices, group_size, output_dtype_code, params.tiled
         )
         return result.to(params.orig_dtype)
 
@@ -208,9 +221,53 @@ class TensorWiseINT8Layout(QuantizedLayout):
             qtensor: Quantized tensor.
 
         Returns:
-            Tuple of (quantized_data, scale).
+            Tuple of (row-major quantized_data, scale).
         """
-        return qtensor._qdata, qtensor._params.scale
+        return _row_major(qtensor._qdata, qtensor._params), qtensor._params.scale
+
+    @classmethod
+    def optimize_for_gemm(cls, weight: QuantizedTensor, storage: torch.Tensor) -> QuantizedTensor:
+        """Reorder a resident per-channel weight into the HIP big-tile GEMM's B layout.
+
+        The relayout is in place: every 256-row group occupies the same bytes before
+        and after, so the caller's buffer and neighbours are untouched. The tiled
+        weight uses small-M or large-M kernels at execution time; other callers
+        can obtain a row-major copy from get_plain_tensors."""
+        qdata, params = weight._qdata, weight._params
+        if (
+            params.tiled
+            or params.transposed
+            or not params.is_weight
+            or params.orig_dtype != torch.bfloat16
+            or qdata.ndim != 2
+            or qdata.numel() == 0
+            or not qdata.is_cuda
+            or torch.version.hip is None
+            or not registry.is_available("hip")
+        ):
+            return weight
+        n, k = qdata.shape
+        if (
+            n % 256 != 0 or k % 128 != 0
+            or (params.convrot and params.convrot_groupsize != 256)
+            or not qdata.is_contiguous()
+        ):
+            return weight
+        from comfy_kitchen.backends.hip import _has_nonduplicated_wmma
+
+        if not _has_nonduplicated_wmma(qdata.device):
+            return weight
+        if storage.dtype != torch.uint8 or storage.ndim != 1 or not storage.is_contiguous() or storage.device != qdata.device:
+            raise ValueError("resident storage must be a contiguous byte buffer on the weight's device")
+        start = qdata.data_ptr() - storage.data_ptr()
+        if start < 0 or start + qdata.nbytes > storage.nbytes:
+            return weight
+        rows = qdata.view(n // 256, 256, k // 64, 64)
+        groups = max(1, (16 << 20) // (256 * k))
+        for g in range(0, n // 256, groups):
+            src = rows[g:g + groups].clone()
+            rows[g:g + groups].view(-1, k // 64, 256, 64).copy_(src.transpose(1, 2))
+        return QuantizedTensor(qdata, weight._layout_cls, dataclasses.replace(params, tiled=True))
 
     @classmethod
     def _fusion_operand(cls, weight: QuantizedTensor):
@@ -218,10 +275,10 @@ class TensorWiseINT8Layout(QuantizedLayout):
         if not isinstance(weight, QuantizedTensor) or weight._layout_cls != cls.__name__:
             return None
         params = weight._params
-        if getattr(params, "transposed", False):
+        if params.transposed or params.tiled:
             return None
         return (
-            weight._qdata.contiguous(),
+            cls.get_plain_tensors(weight)[0].contiguous(),
             params.scale,
             bool(getattr(params, "convrot", False)),
             int(getattr(params, "convrot_groupsize", 256)),
@@ -267,12 +324,11 @@ class TensorWiseINT8Layout(QuantizedLayout):
         params = weight._params
         if params.transposed:
             return NotImplemented
-        qdata, scale = cls.get_plain_tensors(weight)
         return ck.int8_linear(
-            x, qdata, scale, bias, x.dtype,
+            x, weight._qdata, params.scale, bias, x.dtype,
             convrot=params.convrot, convrot_groupsize=params.convrot_groupsize,
             input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
-            residual=residual, residual_scale=residual_scale,
+            residual=residual, residual_scale=residual_scale, weight_tiled=params.tiled,
         )
 
     @classmethod
@@ -286,6 +342,8 @@ class TensorWiseINT8Layout(QuantizedLayout):
         Returns:
             Dictionary mapping suffix to tensor.
         """
+        if params.tiled:
+            raise ValueError("GEMM-optimized weights are resident-only; save the canonical layout")
         return {
             "": qdata,
             "_scale": params.scale,
@@ -351,20 +409,18 @@ def _handle_int8_linear_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    params = weight._params
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
-
-    convrot = getattr(weight._params, "convrot", False)
-    convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
 
     return torch.ops.comfy_kitchen.int8_linear(
         input_tensor.contiguous(),
-        weight_qdata.contiguous(),
-        weight_scale,
+        weight._qdata.contiguous(),
+        params.scale,
         bias,
         _dtype_code(out_dtype),
-        convrot,
-        convrot_groupsize,
+        params.convrot,
+        params.convrot_groupsize,
+        weight_tiled=params.tiled,
     )
 
 
@@ -381,20 +437,21 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    params = weight._params
+    weight_scale = params.scale
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
     convrot = getattr(weight._params, "convrot", False)
     convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
 
-    if getattr(weight._params, "transposed", False):
+    if params.transposed:
         # Common decomposition: linear(x, W) -> mm(x, W.t()). Storage is still
         # W [N, K], and logical RHS is W.T [K, N].
-        int8_weight = weight_qdata.contiguous()
+        int8_weight = weight._qdata.contiguous()
     elif weight_scale.numel() == 1 and not convrot:
         # A directly quantized RHS [K, N] with a scalar scale can be represented
         # as the [N, K] weight expected by int8_linear.
-        int8_weight = weight_qdata.t().contiguous()
+        int8_weight = TensorWiseINT8Layout.get_plain_tensors(weight)[0].t().contiguous()
     else:
         # Per-row scales belong to the rows of the logical RHS, not output
         # columns, so transposing qdata alone would apply the wrong scales.
@@ -408,6 +465,7 @@ def _handle_int8_mm_tensorwise(qt, args, kwargs):
         _dtype_code(out_dtype),
         convrot,
         convrot_groupsize,
+        weight_tiled=params.tiled and params.transposed,
     )
 
 
@@ -424,16 +482,17 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
     if isinstance(input_tensor, QuantizedTensor):
         input_tensor = input_tensor.dequantize()
 
-    weight_qdata, weight_scale = TensorWiseINT8Layout.get_plain_tensors(weight)
+    params = weight._params
+    weight_scale = params.scale
     out_dtype = kwargs.get("out_dtype", input_tensor.dtype)
 
     convrot = getattr(weight._params, "convrot", False)
     convrot_groupsize = getattr(weight._params, "convrot_groupsize", 256)
 
-    if getattr(weight._params, "transposed", False):
-        int8_weight = weight_qdata.contiguous()
+    if params.transposed:
+        int8_weight = weight._qdata.contiguous()
     elif weight_scale.numel() == 1 and not convrot:
-        int8_weight = weight_qdata.t().contiguous()
+        int8_weight = TensorWiseINT8Layout.get_plain_tensors(weight)[0].t().contiguous()
     else:
         return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
 
@@ -445,4 +504,5 @@ def _handle_int8_addmm_tensorwise(qt, args, kwargs):
         _dtype_code(out_dtype),
         convrot,
         convrot_groupsize,
+        weight_tiled=params.tiled and params.transposed,
     )
