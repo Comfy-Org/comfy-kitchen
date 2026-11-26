@@ -227,8 +227,12 @@ __global__ __launch_bounds__(kNaThreads) void na3d_kernel(
                 const typename Mma::Frag pa = load_frag_16bit<Mma>(sP + r * LD, lane);
                 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
-                    o_acc[nt] = Mma::mma(
-                        pa, load_frag_16bit<Mma>(sVt + (nt * 16 + r) * LD, lane), o_acc[nt]);
+                    // Keep the alpha scale outside the MMA. Folding it into the accumulator
+                    // crashes gfx1010 isel: "Cannot select: f32 = Constant<-1>" (LLVM 24).
+                    const typename Mma::Acc partial = Mma::mma(
+                        pa, load_frag_16bit<Mma>(sVt + (nt * 16 + r) * LD, lane), Mma::zero());
+                    #pragma unroll
+                    for (int e = 0; e < 8; ++e) o_acc[nt][e] += partial[e];
                 }
                 __syncthreads();
             }
