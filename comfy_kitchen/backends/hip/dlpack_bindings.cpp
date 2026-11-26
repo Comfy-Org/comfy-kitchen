@@ -148,6 +148,59 @@ void launch_rms_rope_kernel(const void*, const void*, const void*, const void*, 
                             int, float, bool, hipStream_t);
 int64_t memmove_flag_count(int64_t);
 void launch_memmove(void*, const void*, int64_t, void*, hipStream_t);
+
+// 3D Delaunay steps, looped from Python, see ops/delaunay3d.hip.
+void launch_delaunay_vote(const void* pt_tet, const void* pt_prio, int n_pts, void* vote, hipStream_t stream);
+void launch_delaunay_split(int n_tets, const void* vote, const void* split_rank, const void* prio_to_pt,
+                           void* tet_v, void* tet_opp, void* alive, void* pt_tet, void* active, hipStream_t stream);
+void launch_delaunay_relocate_split(int n_pts, const void* vote, const void* split_rank, int base_new,
+                                    const void* tet_v, const void* points, void* pt_tet, hipStream_t stream);
+void launch_delaunay_flip_detect(int n_active, const void* active_list, const void* active_flag,
+                                 const void* tet_v, const void* tet_opp, const void* points, void* cand_info,
+                                 void* cand_n, void* cand_m, void* owner, void* retry, hipStream_t stream);
+void launch_delaunay_flip_decide(int n_cand, const void* active_list, const void* cand_info, const void* cand_n,
+                                 const void* cand_m, const void* owner, void* exec, void* active_next,
+                                 hipStream_t stream);
+void launch_delaunay_flip_execute(int n_cand, const void* active_list, const void* exec, const void* cand_n,
+                                  const void* cand_m, const void* slot_rank, const void* run_rank, int base_new,
+                                  const void* points, void* tet_v, void* tet_opp, void* alive, void* flipped,
+                                  void* redirect, void* pend, void* new_tets, void* active_next,
+                                  hipStream_t stream);
+void launch_delaunay_flip_fixup(int n_run, const void* new_tets, const void* flipped, const void* redirect,
+                                void* tet_opp, void* pend, hipStream_t stream);
+void launch_delaunay_relocate_flip(int n_pts, const void* flipped, const void* new_tets, const void* tet_v,
+                                   const void* points, void* pt_tet, hipStream_t stream);
+void launch_delaunay_compact(int n_tets, const void* alive, const void* new_index, const void* tet_v,
+                             const void* tet_opp, void* out_tets, void* out_nbr, hipStream_t stream);
+
+// Triangle BVH and closest-point queries, see ops/mesh_bvh.hip.
+void launch_mesh_bvh_build(const void* codes, const void* tris, int n_leaves, void* child, void* parent,
+                           void* visits, void* box, hipStream_t stream);
+void launch_closest_point_on_mesh(const void* points, int n_points, const void* tris, const void* tri_index,
+                                  int n_leaves, const void* child, const void* box, float max_dist, void* dist,
+                                  void* closest, void* face, hipStream_t stream);
+void launch_closest_hit_on_mesh(const void* origins, const void* directions, int n_rays, const void* tris,
+                                const void* tri_index, int n_leaves, const void* child, const void* box, float tmin,
+                                float tmax, bool cull_backface, void* t, void* face, hipStream_t stream);
+
+// Union-find connected components, see ops/connected_components.hip.
+void launch_connected_components(const void* edges, int64_t n_edges, bool edges_int64, int n_nodes,
+                                 void* parent, void* labels, hipStream_t stream);
+
+// Edge-collapse checks, see ops/edge_collapse.hip.
+void launch_edge_collapse_checks(const void* verts, const void* faces, const void* offsets, void* cursor, void* fan,
+                                 const void* edges, const void* positions, int n_corners, int n_edges,
+                                 float cos_threshold, void* flips, void* skinny, void* link_ok, hipStream_t stream);
+
+// Push-relabel min cut on bounded-degree graphs, see ops/min_cut.hip.
+void launch_min_cut_init(int n, int K, const void* nbr, const void* cap, void* r, void* rev, hipStream_t stream);
+void launch_min_cut_global_relabel(int n, int K, const void* nbr, const void* rev, const void* r, const void* rt,
+                                   float tol, int big, void* h, void* lists, void* counts, hipStream_t stream);
+void launch_min_cut_rebuild_active(int n, const void* e, const void* h, float tol, int big, void* list, void* count,
+                                   void* queued, hipStream_t stream);
+void launch_min_cut_iterate(int n, int K, const void* nbr, const void* rev, void* r, void* e, void* rt, void* h,
+                            void* inc, void* hn, float tol, int big, const void* list, const void* count,
+                            void* list_out, void* count_out, void* queued, void* active, hipStream_t stream);
 }
 
 static void check_hip_launch() {
@@ -446,7 +499,8 @@ void rms_gated_residual_bf16(
 void int8_gemm_a_tiled128(
     nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c,
     nb::ndarray<> scale_a, nb::ndarray<> scale_b, int scale_b_stride,
-    OptArray bias, int M, int N, int K, int out_code, uintptr_t stream_ptr) {
+    OptArray bias, int M, int N, int K, int out_code, uintptr_t stream_ptr,
+    int b_tiled) {
     constexpr const char* kFn = "int8_gemm_a_tiled128";
     if (scale_b_stride != 0 && scale_b_stride != 1) {
         throw std::runtime_error(std::string(kFn) +
@@ -459,6 +513,10 @@ void int8_gemm_a_tiled128(
         throw std::runtime_error(
             std::string(kFn) +
             ": requires positive N/K and K divisible by 128");
+    }
+    if (b_tiled && N % 256 != 0) {
+        throw std::runtime_error(
+            std::string(kFn) + ": tiled B requires N divisible by 256");
     }
     require_dtype(a, 4, 4, kFn, "a");
     require_dtype(b, 4, 4, kFn, "b");
@@ -476,7 +534,7 @@ void int8_gemm_a_tiled128(
     launch_int8_gemm_a_tiled128_kernel(
         a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
         scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N,
-        out_code, reinterpret_cast<hipStream_t>(stream_ptr));
+        out_code, b_tiled, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -909,9 +967,9 @@ void unpack_int4(nb::ndarray<> q, nb::ndarray<> out, int64_t nbytes, uintptr_t s
 
 // scale_code names the s_rel storage: 0 float32, 5 e4m3 (crossing as uint8, as
 // elsewhere). codebook is optional; without it the levels are uniform.
-// Fused ConvRot + W4A8/W6A8 requantize from the raw weight [N, K]: packed codes
-// [N, K*bits/8], raw e4m3 s_rel [N, K/group_size] and f32 s_channel [N] in one launch.
-// codebook is 16 floats at 4 bits and ignored at 6. The rotation reads 16-byte
+// Fused ConvRot + W4A8/W6A8 (and 3/5-bit) requantize from the raw weight [N, K]: packed
+// codes [N, K*bits/8], raw e4m3 s_rel [N, K/group_size] and f32 s_channel [N] in one launch.
+// codebook is 16 floats at 4 bits, 8 at 3, and ignored at 5/6. The rotation reads 16-byte
 // vectors, so the weight has to start 16-byte aligned.
 void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
                                  nb::ndarray<> packed, nb::ndarray<> s_rel,
@@ -920,10 +978,11 @@ void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
     constexpr const char* kFn = "quantize_wxa8_convrot_fused";
     require_nonneg(N, kFn, "N");
     require_nonneg(K, kFn, "K");
-    if (!((bits == 4 && group_size == 16) ||
-          (bits == 6 && (group_size == 16 || group_size == 32 || group_size == 64)))) {
+    const bool codebook_bits = bits == 4 || bits == 3, uniform_bits = bits == 6 || bits == 5;
+    if (!((codebook_bits && group_size == 16) ||
+          (uniform_bits && (group_size == 16 || group_size == 32 || group_size == 64)))) {
         throw std::runtime_error(std::string(kFn) +
-                                 ": bits/group_size must be 4/16 or 6/{16,32,64}");
+                                 ": bits/group_size must be 4/16, 3/16, 6/{16,32,64} or 5/{16,32,64}");
     }
     if (K % 256 != 0 || K % group_size != 0) {
         throw std::runtime_error(std::string(kFn) +
@@ -933,8 +992,8 @@ void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
     require_dtype(packed, 4, 4, kFn, "packed");
     require_dtype(s_rel, 3, 3, kFn, "s_rel");
     require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
-    if (bits == 4) {
-        require_scale_len(codebook, 16, kFn, "codebook");
+    if (codebook_bits) {
+        require_scale_len(codebook, bits == 4 ? 16 : 8, kFn, "codebook");
     }
     require_len(weight, static_cast<int64_t>(N) * K, kFn, "weight");
     require_len(packed, static_cast<int64_t>(N) * K * bits / 8, kFn, "packed");
@@ -944,7 +1003,7 @@ void quantize_wxa8_convrot_fused(nb::ndarray<> weight, nb::ndarray<> codebook,
     }
 
     launch_quantize_wxa8_convrot_fused_kernel(
-        weight.data(), bits == 4 ? codebook.data() : nullptr, packed.data(), s_rel.data(),
+        weight.data(), codebook_bits ? codebook.data() : nullptr, packed.data(), s_rel.data(),
         s_channel.data(), N, K, bits, group_size, map_dtype_to_code(weight.dtype()), stochastic,
         seed, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
@@ -993,17 +1052,21 @@ static int w4a8_bits(const nb::ndarray<>& qdata, int N, int K, int group_size,
         return 4;
     }
     const int64_t bits = cols * 8 / K;
-    if ((bits != 4 && bits != 6) || cols * 8 != static_cast<int64_t>(K) * bits) {
+    if ((bits != 3 && bits != 4 && bits != 5 && bits != 6) || cols * 8 != static_cast<int64_t>(K) * bits) {
         throw std::runtime_error(std::string(fn) +
-                                 ": packed width must be K/2 (4-bit) or 3K/4 (6-bit)");
+                                 ": packed width must be 3K/8, K/2, 5K/8 or 3K/4 (3/4/5/6-bit)");
     }
-    if (bits == 6 && (K % 32 != 0 || group_size < 16 || group_size % 16 != 0)) {
-        throw std::runtime_error(std::string(fn) +
-                                 ": 6-bit storage needs K % 32 == 0 and group_size a "
-                                 "multiple of 16");
+    const int64_t k_align = bits == 6 ? 32 : 64;
+    if (bits != 4 && (K % k_align != 0 || group_size < 16 || group_size % 16 != 0)) {
+        throw std::runtime_error(std::string(fn) + ": " + std::to_string(bits) +
+                                 "-bit storage needs K % " + std::to_string(k_align) +
+                                 " == 0 and group_size a multiple of 16");
     }
-    if (bits == 6 && has_codebook) {
-        throw std::runtime_error(std::string(fn) + ": 6-bit storage has no codebook");
+    if ((bits == 5 || bits == 6) && has_codebook) {
+        throw std::runtime_error(std::string(fn) + ": " + std::to_string(bits) + "-bit storage has no codebook");
+    }
+    if (bits == 3 && !has_codebook) {
+        throw std::runtime_error(std::string(fn) + ": 3-bit storage needs its 8-entry codebook");
     }
     return static_cast<int>(bits);
 }
@@ -1029,7 +1092,7 @@ void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int 
     require_len(out, static_cast<int64_t>(N) * K, kFn, "out");
     require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
     if (codebook.has_value()) {
-        require_scale_len(*codebook, 16, kFn, "codebook");
+        require_scale_len(*codebook, bits == 3 ? 8 : 16, kFn, "codebook");
     }
 
     launch_dequant_int4_grouped_to_int8_kernel(
@@ -1076,7 +1139,7 @@ void w4a8_int8_gemm_chunked(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<>
     require_scale_len(xs, static_cast<size_t>(M), kFn, "xs");
     require_bias(bias, N, kFn);
     if (codebook.has_value()) {
-        require_scale_len(*codebook, 16, kFn, "codebook");
+        require_scale_len(*codebook, bits == 3 ? 8 : 16, kFn, "codebook");
     }
 
     launch_w4a8_int8_gemm_chunked_kernel(
@@ -1118,7 +1181,7 @@ bool w4a8_codebook_gemv(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<> s_r
     require_scale_len(xs, static_cast<size_t>(M), kFn, "xs");
     require_bias(bias, N, kFn);
     if (codebook.has_value()) {
-        require_scale_len(*codebook, 16, kFn, "codebook");
+        require_scale_len(*codebook, bits == 3 ? 8 : 16, kFn, "codebook");
     }
 
     const bool used = launch_w4a8_codebook_gemv_kernel(
@@ -2497,10 +2560,12 @@ static void sol_check_block_len(const nb::ndarray<>& b, int64_t seq_len, const c
 }
 
 static void sol_need_workspace(const nb::ndarray<>& ws, int64_t batch, int64_t seq_len,
-                               int64_t num_heads, int64_t token_aug, const char* fn) {
+                               int64_t key_len, int64_t num_heads, int64_t token_aug,
+                               const char* fn) {
     int64_t v[48];
     const int n = sol_attn_plan(static_cast<int>(batch), static_cast<int>(seq_len),
-                                static_cast<int>(num_heads), static_cast<int>(token_aug), v, 48);
+                                static_cast<int>(key_len), static_cast<int>(num_heads),
+                                static_cast<int>(token_aug), v, 48);
     if (n > 48 || static_cast<int64_t>(ws.size()) < v[n - 1]) {  // last slot is "total"
         throw std::runtime_error(std::string(fn) + ": workspace too small for this shape");
     }
@@ -2552,10 +2617,12 @@ static void sol_need_contiguous(const nb::ndarray<>& a, const char* fn, const ch
 }
 
 // Workspace dims and slot byte offsets, from the C++ Plan (the one definition).
+// key_len < 0: k/v as long as q.
 nb::dict sol_attn_plan_py(int64_t batch, int64_t seq_len, int64_t num_heads,
-                          int64_t token_aug = 0) {
+                          int64_t token_aug = 0, int64_t key_len = -1) {
     int64_t v[48];
     const int n = sol_attn_plan(static_cast<int>(batch), static_cast<int>(seq_len),
+                                static_cast<int>(key_len < 0 ? seq_len : key_len),
                                 static_cast<int>(num_heads), static_cast<int>(token_aug), v, 48);
     if (n > 48) throw std::runtime_error("sol_attn_plan: Plan grew past the binding's buffer");
     nb::dict d;
@@ -2568,35 +2635,47 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
               int64_t head_dim, float tau, float scale, int64_t sink_start, int64_t sink_end,
               int64_t sink_q_start, int64_t sink_q_end, uintptr_t stream_ptr,
               OptArray key_bias = std::nullopt, OptArray threshold = std::nullopt,
-              OptArray block_len = std::nullopt, bool tail = true, int64_t token_aug = 0) {
+              OptArray block_len = std::nullopt, bool tail = true, int64_t token_aug = 0,
+              int64_t q_offset = 0) {
     constexpr const char* kFn = "sol_attn";
     auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
     sol_need_extents(batch, seq_len, num_heads, kFn);
+    // k and v may be longer than q (seq_len is q's length)
+    const int64_t key_len = k.ndim() == 4 ? static_cast<int64_t>(k.shape(1)) : seq_len;
+    if (q_offset < 0 || q_offset > key_len - seq_len) {  // also k shorter than q
+        throw std::runtime_error(std::string(kFn) +
+                                 ": q_offset must leave the queries inside the keys");
+    }
     sol_need_sinks(sink_start, sink_end, kFn, "sink_blocks");
     sol_need_sinks(sink_q_start, sink_q_end, kFn, "sink_q");
     if (threshold) {
         sol_need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, kFn, "threshold");
     }
+    if (block_len && key_len != seq_len) {
+        throw std::runtime_error(std::string(kFn) + ": block_len needs q and k of the same length");
+    }
     if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
     const int elem = sol_elem_code(q);
     if (elem < 0) throw std::runtime_error(std::string(kFn) + ": q must be bfloat16 or float16");
     sol_need_bthd(q, batch, seq_len, num_heads, head_dim, elem, kFn, "q");
-    sol_need_bthd(k, batch, seq_len, num_heads, head_dim, elem, kFn, "k");
-    sol_need_bthd(v, batch, seq_len, num_heads, head_dim, elem, kFn, "v");
+    sol_need_bthd(k, batch, key_len, num_heads, head_dim, elem, kFn, "k");
+    sol_need_bthd(v, batch, key_len, num_heads, head_dim, elem, kFn, "v");
     sol_need_bthd(out, batch, seq_len, num_heads, head_dim, elem, kFn, "out");
     sol_need_staging_layout(q, kFn, "q");
     sol_need_staging_layout(k, kFn, "k");
     sol_need_staging_layout(v, kFn, "v");
     sol_need_contiguous(out, kFn, "out");
-    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
-    if (key_bias) sol_need_elems(*key_bias, batch * seq_len, 0, kFn, "key_bias");
+    sol_need_workspace(workspace, batch, seq_len, key_len, num_heads, token_aug, kFn);
+    if (key_bias) sol_need_elems(*key_bias, batch * key_len, 0, kFn, "key_bias");
     // Explicit strides: only the last dim must be contiguous (BHND views go in as-is).
     launch_sol_attn(q.data(), k.data(), v.data(), out.data(), workspace.data(),
                     static_cast<int>(batch), static_cast<int>(seq_len),
-                    static_cast<int>(num_heads), static_cast<int>(head_dim), elem, tau, scale,
+                    static_cast<int>(key_len), static_cast<int>(num_heads),
+                    static_cast<int>(head_dim), elem, tau, scale,
                     opt_data(key_bias), opt_data(threshold), opt_data(block_len), tail ? 1 : 0,
                     static_cast<int>(sink_start), static_cast<int>(sink_end),
-                    static_cast<int>(sink_q_start), static_cast<int>(sink_q_end), q.stride(0),
+                    static_cast<int>(sink_q_start), static_cast<int>(sink_q_end),
+                    static_cast<int>(q_offset), q.stride(0),
                     q.stride(1), q.stride(2), k.stride(0), k.stride(1), k.stride(2), v.stride(0),
                     v.stride(1), v.stride(2), static_cast<int>(token_aug), stream);
     check_hip_launch();
@@ -2605,7 +2684,8 @@ void sol_attn(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> o
 void sol_producer_begin_py(nb::ndarray<> workspace, int64_t batch, int64_t seq_len,
                            int64_t num_heads, uintptr_t stream_ptr, int64_t token_aug = 0) {
     sol_need_extents(batch, seq_len, num_heads, "sol_producer_begin");
-    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, "sol_producer_begin");
+    sol_need_workspace(workspace, batch, seq_len, seq_len, num_heads, token_aug,
+                       "sol_producer_begin");
     sol_producer_begin(workspace.data(), static_cast<int>(batch), static_cast<int>(seq_len),
                        static_cast<int>(num_heads), static_cast<int>(token_aug),
                        reinterpret_cast<hipStream_t>(stream_ptr));
@@ -2617,7 +2697,7 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
                            nb::ndarray<> vscale, float rope_eps, int64_t rot_dim, int64_t t0,
                            int64_t m, int64_t batch, int64_t seq_len, int64_t num_heads,
                            uintptr_t stream_ptr, OptArray block_len = std::nullopt,
-                           int64_t token_aug = 0) {
+                           int64_t token_aug = 0, bool split_half = true) {
     constexpr const char* kFn = "sol_producer_chunk";
     sol_need_extents(batch, seq_len, num_heads, kFn);
     if (batch != 1) throw std::runtime_error(std::string(kFn) + ": the producer path is B=1 only");
@@ -2631,7 +2711,7 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
             ": chunk [t0, t0 + m) must lie in [0, seq_len] with a 64-aligned start");
     }
     if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
-    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
+    sol_need_workspace(workspace, batch, seq_len, seq_len, num_heads, token_aug, kFn);
     sol_need_elems(qkv, m * 3 * num_heads * 128, 2, kFn, "qkv");
     sol_need_elems(fab, seq_len * rot_dim * 2, 0, kFn, "fab");
     sol_need_elems(qw, 128, 2, kFn, "qw");
@@ -2640,8 +2720,8 @@ void sol_producer_chunk_py(nb::ndarray<> workspace, nb::ndarray<> qkv, nb::ndarr
     sol_need_elems(vscale, batch * num_heads * 128, 0, kFn, "vscale");
     sol_producer_chunk(workspace.data(), qkv.data(), fab.data(), qw.data(), kw.data(),
                        kmean.data(), vscale.data(), opt_data(block_len), rope_eps,
-                       static_cast<int>(rot_dim), static_cast<int>(t0), static_cast<int>(m),
-                       static_cast<int>(batch), static_cast<int>(seq_len),
+                       static_cast<int>(rot_dim), split_half, static_cast<int>(t0),
+                       static_cast<int>(m), static_cast<int>(batch), static_cast<int>(seq_len),
                        static_cast<int>(num_heads), static_cast<int>(token_aug),
                        reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
@@ -2666,7 +2746,7 @@ void sol_attn_core_py(nb::ndarray<> workspace, nb::ndarray<> out, nb::ndarray<> 
         sol_need_elems(*threshold, batch * num_heads * ((seq_len + 63) / 64), 0, kFn, "threshold");
     }
     if (block_len) sol_check_block_len(*block_len, seq_len, kFn);
-    sol_need_workspace(workspace, batch, seq_len, num_heads, token_aug, kFn);
+    sol_need_workspace(workspace, batch, seq_len, seq_len, num_heads, token_aug, kFn);
     sol_need_elems(out, batch * seq_len * num_heads * 128, 2, kFn, "out");
     launch_sol_attn_core(workspace.data(), out.data(), vscale.data(), kmean_next.data(),
                          vamax_out.data(), opt_data(block_len), tail ? 1 : 0,
@@ -2964,13 +3044,330 @@ bool deltanet_conv_deferred(nb::ndarray<> proj, nb::ndarray<> proj_buf, nb::ndar
 
 void register_int8_decode(nb::module_& m);
 
+// Geometry ops. The buffers are owned by Python; the arrays are device-typed, so a host
+// operand is rejected before its pointer reaches a kernel.
+using rocm_array = nb::ndarray<nb::device::rocm>;
+
+static constexpr auto kInt = nb::dlpack::dtype_code::Int;
+static constexpr auto kUInt = nb::dlpack::dtype_code::UInt;
+static constexpr auto kFloat = nb::dlpack::dtype_code::Float;
+static constexpr auto kBool = nb::dlpack::dtype_code::Bool;
+
+// Negative, so require_len rejects it, when either factor is negative.
+static int64_t extent(int64_t a, int64_t b) { return a < 0 || b < 0 ? -1 : a * b; }
+
+// need bounds what the launch extents determine; a buffer indexed through another buffer's values passes 0,
+// and those values are checked in the Python wrappers.
+static void require_buf(const rocm_array& a, nb::dlpack::dtype_code code, int bits, int64_t need, const char* fn,
+                        const char* name) {
+    const nb::ndarray<> t(a);
+    if (t.dtype().code != static_cast<uint8_t>(code) || t.dtype().bits != bits) {
+        throw std::runtime_error(std::string(fn) + ": " + name + " has the wrong dtype, expected " +
+                                 std::to_string(bits) + "-bit");
+    }
+    require_len(t, need, fn, name);
+    if (t.size() != 0) require_packed_contiguous(t, fn, name);  // an empty array's strides mean nothing
+}
+
+void delaunay_vote(rocm_array pt_tet, rocm_array pt_prio, int n_pts, rocm_array vote, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "delaunay_vote";
+    require_buf(pt_tet, kInt, 32, n_pts, kFn, "pt_tet");
+    require_buf(pt_prio, kInt, 32, n_pts, kFn, "pt_prio");
+    require_buf(vote, kInt, 32, 0, kFn, "vote");
+    launch_delaunay_vote(pt_tet.data(), pt_prio.data(), n_pts, vote.data(),
+                         reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void delaunay_split(int n_tets, rocm_array vote, rocm_array split_rank, rocm_array prio_to_pt, rocm_array tet_v,
+                    rocm_array tet_opp, rocm_array alive, rocm_array pt_tet, rocm_array active, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "delaunay_split";
+    require_buf(vote, kInt, 32, n_tets, kFn, "vote");
+    require_buf(split_rank, kInt, 32, n_tets, kFn, "split_rank");
+    require_buf(prio_to_pt, kInt, 32, 0, kFn, "prio_to_pt");
+    require_buf(tet_v, kInt, 32, extent(4, n_tets), kFn, "tet_v");
+    require_buf(tet_opp, kInt, 32, extent(4, n_tets), kFn, "tet_opp");
+    require_buf(alive, kUInt, 8, n_tets, kFn, "alive");
+    require_buf(pt_tet, kInt, 32, 0, kFn, "pt_tet");
+    require_buf(active, kUInt, 8, n_tets, kFn, "active");
+    launch_delaunay_split(n_tets, vote.data(), split_rank.data(), prio_to_pt.data(), tet_v.data(), tet_opp.data(),
+                          alive.data(), pt_tet.data(), active.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void delaunay_relocate_split(int n_pts, rocm_array vote, rocm_array split_rank, int base_new, rocm_array tet_v,
+                             rocm_array points, rocm_array pt_tet, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "delaunay_relocate_split";
+    require_buf(vote, kInt, 32, 0, kFn, "vote");
+    require_buf(split_rank, kInt, 32, 0, kFn, "split_rank");
+    require_buf(tet_v, kInt, 32, extent(4, base_new), kFn, "tet_v");
+    require_buf(points, kFloat, 64, extent(3, n_pts), kFn, "points");
+    require_buf(pt_tet, kInt, 32, n_pts, kFn, "pt_tet");
+    launch_delaunay_relocate_split(n_pts, vote.data(), split_rank.data(), base_new, tet_v.data(), points.data(),
+                                   pt_tet.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void delaunay_flip_detect(int n_active, rocm_array active_list, rocm_array active_flag, rocm_array tet_v,
+                          rocm_array tet_opp, rocm_array points, rocm_array cand_info, rocm_array cand_n,
+                          rocm_array cand_m, rocm_array owner, rocm_array retry, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "delaunay_flip_detect";
+    require_buf(active_list, kInt, 32, n_active, kFn, "active_list");
+    require_buf(active_flag, kUInt, 8, 0, kFn, "active_flag");
+    require_buf(tet_v, kInt, 32, 0, kFn, "tet_v");
+    require_buf(tet_opp, kInt, 32, 0, kFn, "tet_opp");
+    require_buf(points, kFloat, 64, 0, kFn, "points");
+    require_buf(cand_info, kInt, 32, extent(4, n_active), kFn, "cand_info");
+    require_buf(cand_n, kInt, 32, extent(4, n_active), kFn, "cand_n");
+    require_buf(cand_m, kInt, 32, extent(4, n_active), kFn, "cand_m");
+    require_buf(owner, kInt, 32, 0, kFn, "owner");
+    require_buf(retry, kUInt, 8, 0, kFn, "retry");
+    launch_delaunay_flip_detect(n_active, active_list.data(), active_flag.data(), tet_v.data(), tet_opp.data(),
+                                points.data(), cand_info.data(), cand_n.data(), cand_m.data(), owner.data(),
+                                retry.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void delaunay_flip_decide(int n_cand, rocm_array active_list, rocm_array cand_info, rocm_array cand_n,
+                          rocm_array cand_m, rocm_array owner, rocm_array exec, rocm_array active_next,
+                          uintptr_t stream_ptr) {
+    constexpr const char* kFn = "delaunay_flip_decide";
+    require_buf(active_list, kInt, 32, (static_cast<int64_t>(n_cand) + 3) / 4, kFn, "active_list");
+    require_buf(cand_info, kInt, 32, n_cand, kFn, "cand_info");
+    require_buf(cand_n, kInt, 32, n_cand, kFn, "cand_n");
+    require_buf(cand_m, kInt, 32, n_cand, kFn, "cand_m");
+    require_buf(owner, kInt, 32, 0, kFn, "owner");
+    require_buf(exec, kInt, 32, n_cand, kFn, "exec");
+    require_buf(active_next, kUInt, 8, 0, kFn, "active_next");
+    launch_delaunay_flip_decide(n_cand, active_list.data(), cand_info.data(), cand_n.data(), cand_m.data(),
+                                owner.data(), exec.data(), active_next.data(),
+                                reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void delaunay_flip_execute(int n_cand, rocm_array active_list, rocm_array exec, rocm_array cand_n,
+                           rocm_array cand_m, rocm_array slot_rank, rocm_array run_rank, int base_new,
+                           rocm_array points, rocm_array tet_v, rocm_array tet_opp, rocm_array alive,
+                           rocm_array flipped, rocm_array redirect, rocm_array pend, rocm_array new_tets,
+                           rocm_array active_next, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "delaunay_flip_execute";
+    require_buf(active_list, kInt, 32, (static_cast<int64_t>(n_cand) + 3) / 4, kFn, "active_list");
+    require_buf(exec, kInt, 32, n_cand, kFn, "exec");
+    require_buf(cand_n, kInt, 32, n_cand, kFn, "cand_n");
+    require_buf(cand_m, kInt, 32, n_cand, kFn, "cand_m");
+    require_buf(slot_rank, kInt, 32, n_cand, kFn, "slot_rank");
+    require_buf(run_rank, kInt, 32, n_cand, kFn, "run_rank");
+    require_buf(points, kFloat, 64, 0, kFn, "points");
+    require_buf(tet_v, kInt, 32, extent(4, base_new), kFn, "tet_v");
+    require_buf(tet_opp, kInt, 32, extent(4, base_new), kFn, "tet_opp");
+    require_buf(alive, kUInt, 8, base_new, kFn, "alive");
+    require_buf(flipped, kInt, 32, base_new, kFn, "flipped");
+    require_buf(redirect, kInt, 32, extent(4, base_new), kFn, "redirect");
+    require_buf(pend, kUInt, 8, extent(4, base_new), kFn, "pend");
+    require_buf(new_tets, kInt, 32, 0, kFn, "new_tets");
+    require_buf(active_next, kUInt, 8, base_new, kFn, "active_next");
+    launch_delaunay_flip_execute(n_cand, active_list.data(), exec.data(), cand_n.data(), cand_m.data(),
+                                 slot_rank.data(), run_rank.data(), base_new, points.data(), tet_v.data(),
+                                 tet_opp.data(), alive.data(), flipped.data(), redirect.data(), pend.data(),
+                                 new_tets.data(), active_next.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void delaunay_flip_fixup(int n_run, rocm_array new_tets, rocm_array flipped, rocm_array redirect, rocm_array tet_opp,
+                         rocm_array pend, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "delaunay_flip_fixup";
+    require_buf(new_tets, kInt, 32, extent(3, n_run), kFn, "new_tets");
+    require_buf(flipped, kInt, 32, 0, kFn, "flipped");
+    require_buf(redirect, kInt, 32, 0, kFn, "redirect");
+    require_buf(tet_opp, kInt, 32, 0, kFn, "tet_opp");
+    require_buf(pend, kUInt, 8, 0, kFn, "pend");
+    launch_delaunay_flip_fixup(n_run, new_tets.data(), flipped.data(), redirect.data(), tet_opp.data(), pend.data(),
+                               reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void delaunay_relocate_flip(int n_pts, rocm_array flipped, rocm_array new_tets, rocm_array tet_v, rocm_array points,
+                            rocm_array pt_tet, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "delaunay_relocate_flip";
+    require_buf(flipped, kInt, 32, 0, kFn, "flipped");
+    require_buf(new_tets, kInt, 32, 0, kFn, "new_tets");
+    require_buf(tet_v, kInt, 32, 0, kFn, "tet_v");
+    require_buf(points, kFloat, 64, extent(3, n_pts), kFn, "points");
+    require_buf(pt_tet, kInt, 32, n_pts, kFn, "pt_tet");
+    launch_delaunay_relocate_flip(n_pts, flipped.data(), new_tets.data(), tet_v.data(), points.data(), pt_tet.data(),
+                                  reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void delaunay_compact(int n_tets, rocm_array alive, rocm_array new_index, rocm_array tet_v, rocm_array tet_opp,
+                      rocm_array out_tets, rocm_array out_nbr, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "delaunay_compact";
+    require_buf(alive, kUInt, 8, n_tets, kFn, "alive");
+    require_buf(new_index, kInt, 32, n_tets, kFn, "new_index");
+    require_buf(tet_v, kInt, 32, extent(4, n_tets), kFn, "tet_v");
+    require_buf(tet_opp, kInt, 32, extent(4, n_tets), kFn, "tet_opp");
+    require_buf(out_tets, kInt, 32, 0, kFn, "out_tets");
+    require_buf(out_nbr, kInt, 32, 0, kFn, "out_nbr");
+    launch_delaunay_compact(n_tets, alive.data(), new_index.data(), tet_v.data(), tet_opp.data(), out_tets.data(),
+                            out_nbr.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void mesh_bvh_build(rocm_array codes, rocm_array tris, int n_leaves, rocm_array child, rocm_array parent,
+                    rocm_array visits, rocm_array box, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "mesh_bvh_build";
+    require_positive(n_leaves, kFn, "n_leaves");
+    const int64_t nodes = 2 * static_cast<int64_t>(n_leaves) - 1;
+    require_buf(codes, kInt, 64, n_leaves, kFn, "codes");
+    require_buf(tris, kFloat, 32, extent(9, n_leaves), kFn, "tris");
+    require_buf(child, kInt, 32, extent(2, n_leaves - 1), kFn, "child");
+    require_buf(parent, kInt, 32, nodes, kFn, "parent");
+    require_buf(visits, kInt, 32, n_leaves - 1, kFn, "visits");
+    require_buf(box, kFloat, 32, extent(6, nodes), kFn, "box");
+    launch_mesh_bvh_build(codes.data(), tris.data(), n_leaves, child.data(), parent.data(), visits.data(), box.data(),
+                          reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void closest_point_on_mesh(rocm_array points, int n_points, rocm_array tris, rocm_array tri_index, int n_leaves,
+                           rocm_array child, rocm_array box, float max_dist, rocm_array dist, rocm_array closest,
+                           rocm_array face, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "closest_point_on_mesh";
+    require_positive(n_leaves, kFn, "n_leaves");
+    require_buf(points, kFloat, 32, extent(3, n_points), kFn, "points");
+    require_buf(tris, kFloat, 32, extent(9, n_leaves), kFn, "tris");
+    require_buf(tri_index, kInt, 32, n_leaves, kFn, "tri_index");
+    require_buf(child, kInt, 32, extent(2, n_leaves - 1), kFn, "child");
+    require_buf(box, kFloat, 32, extent(6, 2 * static_cast<int64_t>(n_leaves) - 1), kFn, "box");
+    require_buf(dist, kFloat, 32, n_points, kFn, "dist");
+    require_buf(closest, kFloat, 32, extent(3, n_points), kFn, "closest");
+    require_buf(face, kInt, 64, n_points, kFn, "face");
+    launch_closest_point_on_mesh(points.data(), n_points, tris.data(), tri_index.data(), n_leaves, child.data(),
+                                 box.data(), max_dist, dist.data(), closest.data(), face.data(),
+                                 reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void closest_hit_on_mesh(rocm_array origins, rocm_array directions, int n_rays, rocm_array tris, rocm_array tri_index,
+                         int n_leaves, rocm_array child, rocm_array box, float tmin, float tmax, bool cull_backface,
+                         rocm_array t, rocm_array face, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "closest_hit_on_mesh";
+    require_positive(n_leaves, kFn, "n_leaves");
+    require_buf(origins, kFloat, 32, extent(3, n_rays), kFn, "origins");
+    require_buf(directions, kFloat, 32, extent(3, n_rays), kFn, "directions");
+    require_buf(tris, kFloat, 32, extent(9, n_leaves), kFn, "tris");
+    require_buf(tri_index, kInt, 32, n_leaves, kFn, "tri_index");
+    require_buf(child, kInt, 32, extent(2, n_leaves - 1), kFn, "child");
+    require_buf(box, kFloat, 32, extent(6, 2 * static_cast<int64_t>(n_leaves) - 1), kFn, "box");
+    require_buf(t, kFloat, 32, n_rays, kFn, "t");
+    require_buf(face, kInt, 64, n_rays, kFn, "face");
+    launch_closest_hit_on_mesh(origins.data(), directions.data(), n_rays, tris.data(), tri_index.data(), n_leaves,
+                               child.data(), box.data(), tmin, tmax, cull_backface, t.data(), face.data(),
+                               reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void connected_components(rocm_array edges, int64_t n_edges, bool edges_int64, int n_nodes, rocm_array parent,
+                          rocm_array labels, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "connected_components";
+    require_buf(edges, kInt, edges_int64 ? 64 : 32, extent(2, n_edges), kFn, "edges");
+    require_buf(parent, kInt, 32, n_nodes, kFn, "parent");
+    require_buf(labels, kInt, 64, n_nodes, kFn, "labels");
+    launch_connected_components(edges.data(), n_edges, edges_int64, n_nodes, parent.data(), labels.data(),
+                                reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void edge_collapse_checks(rocm_array verts, rocm_array faces, rocm_array offsets, rocm_array cursor, rocm_array fan,
+                          rocm_array edges, rocm_array positions, int n_corners, int n_edges, float cos_threshold,
+                          rocm_array flips, rocm_array skinny, rocm_array link_ok, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "edge_collapse_checks";
+    const int64_t n_verts = static_cast<int64_t>(verts.size() / 3);
+    require_buf(verts, kFloat, 32, 0, kFn, "verts");
+    require_buf(faces, kInt, 32, n_corners, kFn, "faces");
+    require_buf(offsets, kInt, 32, n_verts + 1, kFn, "offsets");
+    require_buf(cursor, kInt, 32, n_verts, kFn, "cursor");
+    require_buf(fan, kInt, 32, n_corners, kFn, "fan");
+    require_buf(edges, kInt, 32, extent(2, n_edges), kFn, "edges");
+    require_buf(positions, kFloat, 32, extent(3, n_edges), kFn, "positions");
+    require_buf(flips, kInt, 32, n_edges, kFn, "flips");
+    require_buf(skinny, kFloat, 32, n_edges, kFn, "skinny");
+    require_buf(link_ok, kBool, 8, n_edges, kFn, "link_ok");
+    launch_edge_collapse_checks(verts.data(), faces.data(), offsets.data(), cursor.data(), fan.data(), edges.data(),
+                                positions.data(), n_corners, n_edges, cos_threshold, flips.data(), skinny.data(),
+                                link_ok.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void min_cut_init(int n, int K, rocm_array nbr, rocm_array cap, rocm_array r, rocm_array rev, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "min_cut_init";
+    require_buf(nbr, kInt, 32, extent(n, K), kFn, "nbr");
+    require_buf(cap, kFloat, 32, extent(n, K), kFn, "cap");
+    require_buf(r, kFloat, 32, extent(n, K), kFn, "r");
+    require_buf(rev, kInt, 8, extent(n, K), kFn, "rev");
+    launch_min_cut_init(n, K, nbr.data(), cap.data(), r.data(), rev.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void min_cut_global_relabel(int n, int K, rocm_array nbr, rocm_array rev, rocm_array r, rocm_array rt, float tol, int big,
+                            rocm_array h, rocm_array lists, rocm_array counts, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "min_cut_global_relabel";
+    require_buf(nbr, kInt, 32, extent(n, K), kFn, "nbr");
+    require_buf(rev, kInt, 8, extent(n, K), kFn, "rev");
+    require_buf(r, kFloat, 32, extent(n, K), kFn, "r");
+    require_buf(rt, kFloat, 32, n, kFn, "rt");
+    require_buf(h, kInt, 32, n, kFn, "h");
+    require_buf(lists, kInt, 32, extent(2, n), kFn, "lists");
+    require_buf(counts, kInt, 32, 2, kFn, "counts");
+    launch_min_cut_global_relabel(n, K, nbr.data(), rev.data(), r.data(), rt.data(), tol, big, h.data(), lists.data(),
+                                  counts.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void min_cut_rebuild_active(int n, rocm_array e, rocm_array h, float tol, int big, rocm_array list, rocm_array count,
+                            rocm_array queued, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "min_cut_rebuild_active";
+    require_buf(e, kFloat, 32, n, kFn, "e");
+    require_buf(h, kInt, 32, n, kFn, "h");
+    require_buf(list, kInt, 32, n, kFn, "list");
+    require_buf(count, kInt, 32, 1, kFn, "count");
+    require_buf(queued, kInt, 32, n, kFn, "queued");
+    launch_min_cut_rebuild_active(n, e.data(), h.data(), tol, big, list.data(), count.data(), queued.data(),
+                                  reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void min_cut_iterate(int n, int K, rocm_array nbr, rocm_array rev, rocm_array r, rocm_array e, rocm_array rt, rocm_array h,
+                     rocm_array inc, rocm_array hn, float tol, int big, rocm_array list, rocm_array count,
+                     rocm_array list_out, rocm_array count_out, rocm_array queued, rocm_array active, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "min_cut_iterate";
+    require_buf(nbr, kInt, 32, extent(n, K), kFn, "nbr");
+    require_buf(rev, kInt, 8, extent(n, K), kFn, "rev");
+    require_buf(r, kFloat, 32, extent(n, K), kFn, "r");
+    require_buf(e, kFloat, 32, n, kFn, "e");
+    require_buf(rt, kFloat, 32, n, kFn, "rt");
+    require_buf(h, kInt, 32, n, kFn, "h");
+    require_buf(inc, kFloat, 32, extent(n, K), kFn, "inc");
+    require_buf(hn, kInt, 32, n, kFn, "hn");
+    require_buf(list, kInt, 32, n, kFn, "list");
+    require_buf(count, kInt, 32, 1, kFn, "count");
+    require_buf(list_out, kInt, 32, n, kFn, "list_out");
+    require_buf(count_out, kInt, 32, 1, kFn, "count_out");
+    require_buf(queued, kInt, 32, n, kFn, "queued");
+    require_buf(active, kInt, 32, 1, kFn, "active");
+    launch_min_cut_iterate(n, K, nbr.data(), rev.data(), r.data(), e.data(), rt.data(), h.data(), inc.data(), hn.data(),
+                           tol, big, list.data(), count.data(), list_out.data(), count_out.data(), queued.data(),
+                           active.data(), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 NB_MODULE(_C, m) {
     m.doc() = "ComfyKitchen HIP backend native operations (RDNA2-RDNA4, WMMA on gfx11/gfx12)";
     register_int8_decode(m);
     m.def("sol_attn_plan", &sol_attn_plan_py,
           "Workspace dims, slot byte offsets and total bytes for this shape and token budget",
           nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
-          nb::arg("token_aug") = 0);
+          nb::arg("token_aug") = 0, nb::arg("key_len") = -1);
     m.def("sol_attn", &sol_attn,
           "Sol-Attn training-free sparse attention (BF16 or FP16 in/out, head_dim 128)",
           nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("out"), nb::arg("workspace"),
@@ -2979,7 +3376,7 @@ NB_MODULE(_C, m) {
           nb::arg("sink_q_start"), nb::arg("sink_q_end"), nb::arg("stream_ptr"),
           nb::arg("key_bias") = nb::none(), nb::arg("threshold") = nb::none(),
           nb::arg("block_len") = nb::none(), nb::arg("tail") = true,
-          nb::arg("token_aug") = 0);
+          nb::arg("token_aug") = 0, nb::arg("q_offset") = 0);
     m.def("sol_producer_begin", &sol_producer_begin_py,
           nb::arg("workspace"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("stream_ptr"), nb::arg("token_aug") = 0);
@@ -2988,7 +3385,7 @@ NB_MODULE(_C, m) {
           nb::arg("kmean"), nb::arg("vscale"), nb::arg("rope_eps"), nb::arg("rot_dim"),
           nb::arg("t0"), nb::arg("m"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
           nb::arg("stream_ptr"), nb::arg("block_len") = nb::none(),
-          nb::arg("token_aug") = 0);
+          nb::arg("token_aug") = 0, nb::arg("split_half") = true);
     m.def("sol_attn_core", &sol_attn_core_py,
           nb::arg("workspace"), nb::arg("out"), nb::arg("vscale"), nb::arg("kmean_next"),
           nb::arg("vamax_out"), nb::arg("batch"), nb::arg("seq_len"), nb::arg("num_heads"),
@@ -3002,7 +3399,11 @@ NB_MODULE(_C, m) {
     m.def("scaled_mm_fp8", &scaled_mm_fp8);
     m.def("int8_gemm", &int8_gemm);
     m.def("rms_gated_residual_bf16", &rms_gated_residual_bf16);
-    m.def("int8_gemm_a_tiled128", &int8_gemm_a_tiled128);
+    m.def("int8_gemm_a_tiled128", &int8_gemm_a_tiled128,
+          nb::arg("a"), nb::arg("b"), nb::arg("c"), nb::arg("scale_a"),
+          nb::arg("scale_b"), nb::arg("scale_b_stride"), nb::arg("bias"),
+          nb::arg("M"), nb::arg("N"), nb::arg("K"), nb::arg("out_code"),
+          nb::arg("stream_ptr"), nb::arg("b_tiled") = 0);
     m.def("convrot_w4a4_gemm", &convrot_w4a4_gemm);
     m.def("fp16_gemm", &fp16_gemm, nb::arg("a"), nb::arg("b"), nb::arg("d"),
           nb::arg("bias").none(), nb::arg("rscale").none(), nb::arg("resid").none(), nb::arg("M"),
@@ -3111,4 +3512,63 @@ NB_MODULE(_C, m) {
     m.def("svdquant_lora_down", &svdquant_lora_down);
     m.def("svdquant_quantize", &svdquant_quantize);
     m.def("svdquant_gemm", &svdquant_gemm);
+    m.def("delaunay_vote", &delaunay_vote, "Delaunay: each tet with uninserted points picks one",
+          nb::arg("pt_tet"), nb::arg("pt_prio"), nb::arg("n_pts"), nb::arg("vote"), nb::arg("stream_ptr"));
+    m.def("delaunay_split", &delaunay_split, "Delaunay: 1-4 split of the voting tets",
+          nb::arg("n_tets"), nb::arg("vote"), nb::arg("split_rank"), nb::arg("prio_to_pt"), nb::arg("tet_v"),
+          nb::arg("tet_opp"), nb::arg("alive"), nb::arg("pt_tet"), nb::arg("active"), nb::arg("stream_ptr"));
+    m.def("delaunay_relocate_split", &delaunay_relocate_split, "Delaunay: move points of split tets to their child",
+          nb::arg("n_pts"), nb::arg("vote"), nb::arg("split_rank"), nb::arg("base_new"), nb::arg("tet_v"),
+          nb::arg("points"), nb::arg("pt_tet"), nb::arg("stream_ptr"));
+    m.def("delaunay_flip_detect", &delaunay_flip_detect, "Delaunay: find 2-3 / 3-2 flips on changed tets",
+          nb::arg("n_active"), nb::arg("active_list"), nb::arg("active_flag"), nb::arg("tet_v"), nb::arg("tet_opp"),
+          nb::arg("points"), nb::arg("cand_info"), nb::arg("cand_n"), nb::arg("cand_m"), nb::arg("owner"),
+          nb::arg("retry"), nb::arg("stream_ptr"));
+    m.def("delaunay_flip_decide", &delaunay_flip_decide, "Delaunay: keep flips that own all their tets",
+          nb::arg("n_cand"), nb::arg("active_list"), nb::arg("cand_info"), nb::arg("cand_n"), nb::arg("cand_m"),
+          nb::arg("owner"), nb::arg("exec"), nb::arg("active_next"), nb::arg("stream_ptr"));
+    m.def("delaunay_flip_execute", &delaunay_flip_execute, "Delaunay: perform the chosen flips",
+          nb::arg("n_cand"), nb::arg("active_list"), nb::arg("exec"), nb::arg("cand_n"), nb::arg("cand_m"),
+          nb::arg("slot_rank"), nb::arg("run_rank"), nb::arg("base_new"), nb::arg("points"), nb::arg("tet_v"),
+          nb::arg("tet_opp"), nb::arg("alive"), nb::arg("flipped"), nb::arg("redirect"), nb::arg("pend"),
+          nb::arg("new_tets"), nb::arg("active_next"), nb::arg("stream_ptr"));
+    m.def("delaunay_flip_fixup", &delaunay_flip_fixup, "Delaunay: reconnect faces across flips of one pass",
+          nb::arg("n_run"), nb::arg("new_tets"), nb::arg("flipped"), nb::arg("redirect"), nb::arg("tet_opp"),
+          nb::arg("pend"), nb::arg("stream_ptr"));
+    m.def("delaunay_relocate_flip", &delaunay_relocate_flip, "Delaunay: move points of flipped tets",
+          nb::arg("n_pts"), nb::arg("flipped"), nb::arg("new_tets"), nb::arg("tet_v"), nb::arg("points"),
+          nb::arg("pt_tet"), nb::arg("stream_ptr"));
+    m.def("delaunay_compact", &delaunay_compact, "Delaunay: drop dead tets and remap neighbours",
+          nb::arg("n_tets"), nb::arg("alive"), nb::arg("new_index"), nb::arg("tet_v"), nb::arg("tet_opp"),
+          nb::arg("out_tets"), nb::arg("out_nbr"), nb::arg("stream_ptr"));
+    m.def("mesh_bvh_build", &mesh_bvh_build, "Linear BVH over Morton-sorted triangles",
+          nb::arg("codes"), nb::arg("tris"), nb::arg("n_leaves"), nb::arg("child"), nb::arg("parent"),
+          nb::arg("visits"), nb::arg("box"), nb::arg("stream_ptr"));
+    m.def("closest_point_on_mesh", &closest_point_on_mesh, "Closest point on a BVH'd triangle mesh per query",
+          nb::arg("points"), nb::arg("n_points"), nb::arg("tris"), nb::arg("tri_index"), nb::arg("n_leaves"),
+          nb::arg("child"), nb::arg("box"), nb::arg("max_dist"), nb::arg("dist"), nb::arg("closest"), nb::arg("face"),
+          nb::arg("stream_ptr"));
+    m.def("closest_hit_on_mesh", &closest_hit_on_mesh, "Nearest ray hit on a BVH'd triangle mesh per ray",
+          nb::arg("origins"), nb::arg("directions"), nb::arg("n_rays"), nb::arg("tris"), nb::arg("tri_index"),
+          nb::arg("n_leaves"), nb::arg("child"), nb::arg("box"), nb::arg("tmin"), nb::arg("tmax"),
+          nb::arg("cull_backface"), nb::arg("t"), nb::arg("face"), nb::arg("stream_ptr"));
+    m.def("connected_components", &connected_components, "Union-find connected components of an edge list",
+          nb::arg("edges"), nb::arg("n_edges"), nb::arg("edges_int64"), nb::arg("n_nodes"), nb::arg("parent"),
+          nb::arg("labels"), nb::arg("stream_ptr"));
+    m.def("edge_collapse_checks", &edge_collapse_checks, "Flip / skinny / link checks for candidate edge collapses",
+          nb::arg("verts"), nb::arg("faces"), nb::arg("offsets"), nb::arg("cursor"), nb::arg("fan"), nb::arg("edges"),
+          nb::arg("positions"), nb::arg("n_corners"), nb::arg("n_edges"), nb::arg("cos_threshold"), nb::arg("flips"),
+          nb::arg("skinny"), nb::arg("link_ok"), nb::arg("stream_ptr"));
+    m.def("min_cut_init", &min_cut_init, "Residuals and reverse slots for min_cut", nb::arg("n"), nb::arg("K"),
+          nb::arg("nbr"), nb::arg("cap"), nb::arg("r"), nb::arg("rev"), nb::arg("stream_ptr"));
+    m.def("min_cut_global_relabel", &min_cut_global_relabel, "Heights by BFS from the sink", nb::arg("n"), nb::arg("K"),
+          nb::arg("nbr"), nb::arg("rev"), nb::arg("r"), nb::arg("rt"), nb::arg("tol"), nb::arg("big"), nb::arg("h"),
+          nb::arg("lists"), nb::arg("counts"), nb::arg("stream_ptr"));
+    m.def("min_cut_rebuild_active", &min_cut_rebuild_active, "Active list from scratch", nb::arg("n"), nb::arg("e"),
+          nb::arg("h"), nb::arg("tol"), nb::arg("big"), nb::arg("list"), nb::arg("count"), nb::arg("queued"),
+          nb::arg("stream_ptr"));
+    m.def("min_cut_iterate", &min_cut_iterate, "One push-relabel iteration over the active list", nb::arg("n"),
+          nb::arg("K"), nb::arg("nbr"), nb::arg("rev"), nb::arg("r"), nb::arg("e"), nb::arg("rt"), nb::arg("h"),
+          nb::arg("inc"), nb::arg("hn"), nb::arg("tol"), nb::arg("big"), nb::arg("list"), nb::arg("count"),
+          nb::arg("list_out"), nb::arg("count_out"), nb::arg("queued"), nb::arg("active"), nb::arg("stream_ptr"));
 }
