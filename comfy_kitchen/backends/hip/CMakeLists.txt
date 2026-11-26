@@ -185,7 +185,32 @@ set(HIP_SOURCES
     ops/w4a8_requant.hip
     ops/gated_delta.hip
     ops/memmove.hip
+    ops/delaunay3d.hip
+    ops/mesh_bvh.hip
+    ops/connected_components.hip
+    ops/edge_collapse.hip
+    ops/min_cut.hip
 )
+
+# The geometry predicates rely on IEEE semantics: the double-double sums need exact
+# rounding that reassociation cancels away, and an infinite cutoff must stay infinite.
+# Source options follow the target's, so this overrides -ffast-math for these files.
+set_source_files_properties(
+    ops/delaunay3d.hip
+    ops/mesh_bvh.hip
+    ops/connected_components.hip
+    ops/edge_collapse.hip
+    ops/min_cut.hip
+    PROPERTIES COMPILE_OPTIONS "-fno-fast-math"
+)
+
+# Round shared-edge products separately so adjacent triangles agree on ray hits.
+set_property(SOURCE ops/mesh_bvh.hip APPEND PROPERTY COMPILE_OPTIONS -ffp-contract=off)
+
+# All INT8 GEMM schedules round (acc * row_scale) * column_scale before
+# adding bias. Fast math can fuse the add or reassociate the scales.
+set_source_files_properties(ops/gemm_int8.hip PROPERTIES
+    COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
 
 set(CPP_SOURCES
     dlpack_bindings.cpp
