@@ -25,7 +25,7 @@ class TensorCoreFP8Layout(QuantizedLayout):
 
     Example:
         >>> x = torch.randn(128, 256, device="cuda", dtype=torch.bfloat16)
-        >>> qt = QuantizedTensor.from_float(x, TensorCoreFP8Layout)
+        >>> qt = QuantizedTensor.from_float(x, "TensorCoreFP8Layout")
         >>> qt.shape
         torch.Size([128, 256])
         >>> dq = qt.dequantize()
