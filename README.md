@@ -308,7 +308,7 @@ python setup.py build_ext --debug-build --lineinfo bdist_wheel
 - **CUDA Runtime** (for CUDA wheels): ≥13.0
   - Pre-built wheels require NVIDIA Driver r580+
   - Building from source requires CUDA Toolkit ≥12.8 and `CUDA_HOME` environment variable
-- **nanobind**: ≥2.0.0 (for building from source)
+- **nanobind**: ≥2.12.0 (for building from source)
 - **CMake**: ≥3.26 (for building from source; the abi3 modules need FindPython's `Development.SABIModule`)
 
 ## Quick Start
