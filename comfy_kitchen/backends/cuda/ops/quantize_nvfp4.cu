@@ -26,7 +26,7 @@ namespace {
 template <typename Input, int V, bool Masked, bool HiFirst>
 __global__ void
 quantize_nvfp4_kernel(const Input *input, const float *global_scale,
-                      uint8_t *output, __nv_fp8_e4m3 *scales, uint64_t groups,
+                      uint8_t *output, __nv_fp8_e4m3 *scales, uint64_t reciprocal,
                       uint64_t runtime_columns, uint64_t original_rows,
                       uint64_t original_columns) {
   constexpr int threads_per_group = 16 / V;
@@ -34,8 +34,12 @@ quantize_nvfp4_kernel(const Input *input, const float *global_scale,
   const uint64_t chunk = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
   {
     const uint64_t group = chunk / threads_per_group;
+    const uint64_t indexed_row =
+        Masked ? quantization::row_index(chunk * V, columns, reciprocal) : 0;
+    const uint64_t indexed_col = Masked ? chunk * V - indexed_row * columns : 0;
     const auto values = quantization::load_group<Input, V, Masked>(
-        input, chunk, columns, original_rows, original_columns);
+        input, chunk, columns, original_rows, original_columns, indexed_row,
+        indexed_col);
     float maximum = quantization::group_absmax(values);
     if constexpr (threads_per_group > 1) {
 #pragma unroll
@@ -50,7 +54,8 @@ quantize_nvfp4_kernel(const Input *input, const float *global_scale,
     const float encode =
         fminf(__fdividef(1.0f, float(scale) * tensor_scale), FLT_MAX);
     if (threadIdx.x % threads_per_group == 0) {
-      const uint64_t row = group / (columns / 16), col = group % (columns / 16);
+      const uint64_t row = Masked ? indexed_row : group / (columns / 16);
+      const uint64_t col = Masked ? indexed_col / 16 : group % (columns / 16);
       scales[scale_factor_swizzled_offset(row, col, columns / 16)] = scale;
     }
     union {
@@ -198,13 +203,14 @@ void launch_nvfp4_quantization(const void *input, const void *global_scale,
   const int blocks = static_cast<int>(chunks / threads);
   const bool masked = rows != original_rows || columns != original_columns ||
                       !optimized::aligned_to(input, 16);
+  const uint64_t reciprocal = masked ? ~uint64_t(0) / columns : 0;
 #define LAUNCH(MASKED, HI_FIRST)                                               \
   quantize_nvfp4_kernel<Input, V, MASKED, HI_FIRST>                         \
       <<<blocks, threads, 0, stream>>>(                                        \
           static_cast<const Input *>(input),                                   \
           static_cast<const float *>(global_scale),                            \
           static_cast<uint8_t *>(output),                                      \
-          static_cast<__nv_fp8_e4m3 *>(scales), groups, columns,               \
+          static_cast<__nv_fp8_e4m3 *>(scales), reciprocal, columns,            \
           original_rows, original_columns)
   if (masked) {
     if (hi_first) {
