@@ -41,7 +41,6 @@ from comfy_kitchen.backends.eager.sol_attn import (
     _normalize_key_bias,
     _sink_count,
     _topk_count,
-    _valid_rows,
     add_coarse_,
     coarse_output,
 )
@@ -132,6 +131,7 @@ __all__ = [
     "scaled_mm_fp8",
     "sol_attn",
     "sol_attn_chunked",
+    "sol_key_order",
     "stochastic_rounding_fp8",
     "w4a8_int8_linear",
 ]
@@ -2985,58 +2985,12 @@ def rms_rope_split_half_(
 # CUDA backend's entry points, including the workspace plan, which both backends
 # read from their own C++ Plan. The one place they diverge is what the carriers
 # hold: the CUDA layout permutes the contraction and key axes for its m16n8k32
-# fragments and this one does not, so the top-k threshold reads cen8 in channel
-# order rather than un-permuting it.
+# fragments and this one does not, so the row-order planner reads the staged keys
+# and query carriers as stored rather than un-permuting them.
 # ---------------------------------------------------------------------------
 
 _SOL_HD = 128
 _SOL_VSCALE_MARGIN = 1.1   # clip headroom on last step's V absmax
-
-
-def _topk_from_pooled(c8, csc, kc, topk_ratio, log2s, sinks):
-    """Per-query-block top-k as a threshold: the k-th largest pooled score (the
-    kernel keeps score >= threshold, so ties over-select). ``c8``/``csc`` are the
-    quantized centroids ``[BH, N, D]``/``[BH, N]``, ``kc`` the centred pooled keys.
-    Scores are computed through the route kernel's own int8 quantization and
-    operation order; an fp32 threshold against int8 kernel scores inflates the kept
-    budget ~15%. Sink blocks are always kept, so they neither count toward nor
-    consume the budget."""
-    n = kc.shape[1]
-    ksc = (kc.abs().amax(-1, True) / 127.0).clamp_min(1e-12)     # prep_pooled_quant
-    k8 = torch.round(kc / ksc).clamp_(-127, 127)
-    s = torch.bmm(c8, k8.transpose(1, 2))     # integer dot, exact in fp32
-    s = s * (csc * log2s).unsqueeze(-1) * ksc.squeeze(-1).unsqueeze(-2)
-    s0, s1 = sinks
-    if s1 > s0:
-        s[..., s0:s1] = float("-inf")
-    kk = _topk_count(n - _sink_count(n, s0, s1), topk_ratio)
-    if kk == 0:   # nothing beyond the forced blocks: a threshold no finite score clears
-        return torch.full(s.shape[:-1], float("inf"), device=s.device, dtype=s.dtype)
-    kth = s.topk(kk, dim=-1, sorted=False).values.min(-1).values
-    # backed off a few ulps: this replica of the kernel's scores is not bit-exact
-    return (kth - kth.abs() * 1e-5).contiguous()
-
-
-def _block_means(x, lengths=None, valid=None):
-    """(B, T, H, D) -> [BH, N, D] fp32 means over each 64-block's live rows, with
-    fp32 accumulation but no fp32 copy of x. ``lengths``/``valid`` only for
-    zero-padded tiles; the default divides by Python floats so the routing
-    threshold stays bit-identical run to run."""
-    b, t, h, d = x.shape
-    full = (t // 64) * 64
-    if lengths is None:
-        m = x[:, :full].view(b, -1, 64, h, d).sum(2, dtype=torch.float32) / 64.0
-        if full != t:
-            tail = x[:, full:].sum(1, keepdim=True, dtype=torch.float32) / (t - full)
-            m = torch.cat([m, tail], dim=1)
-    else:
-        if valid is not None:
-            x = x * valid.view(1, -1, 1, 1).to(x.dtype)
-        m = x[:, :full].view(b, -1, 64, h, d).sum(2, dtype=torch.float32)
-        if full != t:
-            m = torch.cat([m, x[:, full:].sum(1, keepdim=True, dtype=torch.float32)], dim=1)
-        m = m / lengths.view(1, -1, 1, 1)
-    return m.permute(0, 2, 1, 3).reshape(b * h, -1, d)
 
 
 def _check_block_len(block_len, t, device):
@@ -3056,16 +3010,6 @@ def _check_coarse_gate(coarse_gate, shape, device):
             f"sol_attn: coarse_gate must be {tuple(shape)} on {device}, got "
             f"{tuple(coarse_gate.shape)} on {coarse_gate.device}")
     return coarse_gate
-
-
-def _topk_threshold(q, k, topk_ratio, scale, lengths, valid, sinks):
-    """Top-k threshold from post-rope q/k, pooled and quantized like prep_q."""
-    cen = _block_means(q, lengths, valid)
-    kc = _block_means(k, lengths, valid)
-    kc = kc - kc.mean(dim=1, keepdim=True)
-    csc = (cen.abs().amax(-1, True) / 127.0).clamp_min(1e-8)      # prep_q
-    c8 = torch.round(cen / csc).clamp_(-127, 127)
-    return _topk_from_pooled(c8, csc.squeeze(-1), kc, topk_ratio, scale * _LOG2E, sinks)
 
 
 _ROPE_FAB_CACHE = {}
@@ -3119,6 +3063,28 @@ def _check_sol_args(sink_blocks, sink_q, topk_ratio, **tensors):
         raise ValueError(f"sol_attn: {check.failed_param}: {check.failure_reason}")
 
 
+def _check_order(order, shape, device, name):
+    """``order`` contiguous, after checking it is int32 ``shape`` ([B, H, T]) on ``device``
+    and holds each row of [0, T) once per head: a row outside is an out-of-bounds read, a
+    repeated one leaves output rows unwritten. One device sync."""
+    t = shape[-1]
+    if order.dtype != torch.int32 or tuple(order.shape) != tuple(shape) or order.device != device:
+        raise ValueError(f"{name}: order must be int32 {list(shape)} on {device}, "
+                         f"got {order.dtype} {list(order.shape)} on {order.device}")
+    order = order.contiguous()
+    lo, hi = order.aminmax()
+    rows = order.view(-1, t)
+    hit = torch.zeros(rows.shape, dtype=torch.bool, device=device).scatter_(1, rows.long().clamp_(0, t - 1), True)
+    if not bool(((lo >= 0) & (hi < t) & hit.all()).item()):
+        raise ValueError(f"{name}: order must hold each row of [0, {t}) once per head")
+    return order
+
+
+def _topk_budget(p, sinks, topk_ratio):
+    """The kernels' topk_count: key blocks kept beyond the sinks, or -1 for tau routing."""
+    return _topk_count(p["NTB"] - _sink_count(p["NTB"], *sinks), topk_ratio) if topk_ratio else -1
+
+
 def sol_attn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3134,10 +3100,20 @@ def sol_attn(
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
     q_offset: int = 0,
+    order: torch.Tensor | None = None,
+    key_order_from: int | None = None,
 ) -> torch.Tensor:
     """Sol-Attn sparse attention over ``(B, T, H, 128)`` bf16 or fp16 tensors;
     k and v may be longer than q. See sage_attention/sol_attn.hip and the
-    public docstring for ``tail``, ``block_len``, ``coarse_gate`` and ``q_offset``.
+    public docstring for ``tail``, ``block_len``, ``coarse_gate``, ``q_offset``
+    and ``key_order_from`` (the latter is ``order=sol_key_order(q, k, key_order_from)``).
+
+    ``order`` (int32 ``[B, H, T]``, each row a permutation of ``range(T)``):
+    position ``t`` of head ``h`` holds row ``order[b, h, t]`` of q, k and v, so
+    the 64-token blocks can group similar keys (``sol_key_order``); the output
+    comes back in the callers' row order. ``sink_blocks`` / ``sink_q`` count
+    blocks of the reordered sequence. Not with ``block_len``, ``key_bias``,
+    ``coarse_gate``, ``q_offset``, ``token_aug`` or longer k.
 
     ``topk_ratio`` > 0 switches selection from the tau threshold to SLA-style
     per-query-block top-k: keep that fraction of key blocks per query block (sinks
@@ -3156,11 +3132,8 @@ def sol_attn(
     tk = k.shape[1]
     if scale is None:
         scale = d ** -0.5
-    lengths = valid = None   # zero-padded tiles only; None keeps the default arithmetic exact
     if block_len is not None:
         block_len = block_len.contiguous()
-        lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
-        valid = _valid_rows(t, lengths)
     # Only the last dim must be contiguous (16-byte staging loads), so a BHND view
     # goes in as-is. A misaligned load faults asynchronously and poisons the
     # context, so base pointer and leading strides are checked here.
@@ -3179,8 +3152,17 @@ def sol_attn(
                     f"is not a multiple of 8, so the 16-byte staging loads would "
                     f"be misaligned; call .contiguous() on it")
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
-    thr = (_topk_threshold(q, k, topk_ratio, scale, lengths, valid, sb)
-           if topk_ratio else None)
+    if order is not None or key_order_from is not None:
+        if (tk != t or q_offset or block_len is not None or key_bias is not None or coarse_gate is not None
+                or token_aug):
+            raise ValueError("sol_attn: a row order needs q and k of one length and no q_offset, block_len, "
+                             "key_bias, coarse_gate or token_aug")
+        if key_order_from is None:
+            order = _check_order(order, (batch, h, t), q.device, "sol_attn")
+        elif order is not None:
+            raise ValueError("sol_attn: give order or key_order_from, not both")
+        else:
+            order = sol_key_order(q, k, key_order_from)
     kb = None
     if key_bias is not None:
         # exact branch only, in log2 units; biased blocks must be sink-covered
@@ -3189,6 +3171,8 @@ def sol_attn(
     out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     p = _C.sol_attn_plan(batch, t, h, token_aug=int(token_aug), key_len=tk)
     workspace = torch.empty(p["total"], dtype=torch.uint8, device=q.device)
+    # an order's blocks hold similar keys, not similar queries: the tail is taken per row (kernel tail 2)
+    ktail = (2 if order is not None else 1) if tail else 0
     _C.sol_attn(
         _dl(q), _dl(k), _dl(v), _dl(out), _dl(workspace),
         batch, t, h, d,
@@ -3196,16 +3180,150 @@ def sol_attn(
         sb[0], sb[1], sq[0], sq[1],
         _stream(q),
         key_bias=None if kb is None else _dl(kb),
-        threshold=None if thr is None else _dl(thr),
         block_len=None if block_len is None else _dl(block_len),
-        tail=bool(tail), token_aug=int(token_aug), q_offset=int(q_offset),
+        tail=ktail, token_aug=int(token_aug), q_offset=int(q_offset),
+        order=None if order is None else _dl(order),
+        topk_count=_topk_budget(p, sb, topk_ratio),
     )
     if coarse_gate is not None:
-        if lengths is None:
-            lengths = _block_lengths(t, (t + 63) // 64, q.device)
+        lengths = _block_lengths(t, (t + 63) // 64, q.device, block_len)
         add_coarse_(out, coarse_output(*_ws_block_means(workspace, p, batch * h, lengths), scale),
                     coarse_gate)
     return out
+
+
+_SOL_GROUP_DIMS = 16           # feature width (principal subspace of the keys)
+_SOL_GROUP_DIRS = 4            # split directions per pass over the features = tree levels per pass
+_SOL_GROUP_SAMPLES = 1024      # tokens per tree node a split direction is estimated from
+_SOL_GROUP_BASIS_ROWS = 4096   # rows the metric and the subspace are estimated from
+_SOL_GROUP_SCORE_MAX = 32766   # split scores are cosines, sorted as int16
+
+
+def sol_key_order(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    start: int = 0,
+) -> torch.Tensor:
+    """A row order for ``sol_attn(order=...)`` whose 64-token blocks hold similar
+    keys: int32 ``[B, H, T]``, rows below ``start`` (a multiple of 64) in place,
+    the rest grouped per head. q, k: ``(B, T, H, 128)`` post-rope, as given to
+    ``sol_attn``. Same planner as the CUDA backend's ``sol_key_order``.
+    """
+    if q.dim() != 4 or k.shape != q.shape:
+        raise ValueError("sol_key_order: q and k must be (B, T, H, D) tensors of one shape")
+    batch, t, h, d = q.shape
+    if start < 0 or start % 64 or start >= t:
+        raise ValueError(f"sol_key_order: start must be a multiple of 64 inside the sequence, got {start}")
+    n, bh, dev = t - start, batch * h, q.device
+    order = torch.arange(t, device=dev, dtype=torch.int32).expand(bh, t).contiguous()
+    if n <= 64:
+        return order.view(batch, h, t)
+    r = min(_SOL_GROUP_DIMS, d)
+    # [H, rows, D] views of one batch item: no [BH, T, D] copy of the keys
+    head_rows = lambda x, b, step: x[b, start::step].transpose(0, 1)   # noqa: E731
+    step = max(1, n // _SOL_GROUP_BASIS_ROWS)
+    w = _feature_basis(torch.cat([head_rows(q, b, step) for b in range(batch)]).float(),
+                       torch.cat([head_rows(k, b, step) for b in range(batch)]).float(), r).to(k.dtype)
+    feat = torch.empty(bh, n + 1, r, dtype=k.dtype, device=dev)
+    for b in range(batch):
+        torch.bmm(head_rows(k, b, 1), w[b * h:(b + 1) * h], out=feat[b * h:(b + 1) * h, :n])
+    feat[:, :n] /= torch.linalg.vector_norm(feat[:, :n], dim=-1, keepdim=True, dtype=torch.float32).clamp_(min=1e-12)
+    feat[:, n] = 0   # what padded node slots read
+    order[:, start:] = (_group_rows(feat) + start).to(torch.int32)
+    return order.view(batch, h, t)
+
+
+def _feature_basis(qs: torch.Tensor, ks: torch.Tensor, r: int) -> torch.Tensor:
+    """``[BH, D, r]`` map from rows to grouping features: the Cholesky factor
+    of the query sample's covariance times the top-r principal directions of
+    the key sample's unit features. qs, ks: ``[BH, rows, D]`` fp32."""
+    d = qs.shape[-1]
+    qs = qs - qs.mean(1, keepdim=True)
+    m2 = torch.bmm(qs.transpose(1, 2), qs) / qs.shape[1]
+    # floor: a head with constant queries (zero covariance) gets the identity metric
+    ridge = (1e-3 * m2.diagonal(dim1=1, dim2=2).mean(-1)).clamp_min(1e-12)
+    m2 = m2 + ridge[:, None, None] * torch.eye(d, device=qs.device)
+    chol = torch.linalg.cholesky_ex(m2)[0]
+    xs = torch.nn.functional.normalize(torch.bmm(ks, chol), dim=-1)
+    gram = torch.bmm(xs.transpose(1, 2), xs)
+    try:
+        vec = torch.linalg.eigh(gram)[1]
+    except torch.linalg.LinAlgError:   # fp32 can fail to converge when a head's keys span few directions
+        vec = torch.linalg.eigh(gram.double())[1].to(gram.dtype)
+    return torch.bmm(chol, vec[:, :, -r:])
+
+
+def _group_rows(feat: torch.Tensor) -> torch.Tensor:
+    """feat ``[BH, n + 1, r]`` unit rows (row n zero) -> ``[BH, n]`` int64 row per
+    position, every 64-run holding similar rows: recursive halving along each
+    node's principal directions. Nodes are aligned windows of a padded position
+    range (padding reads row n and sorts last, so the rows stay a prefix); the
+    last levels, nodes of at most 16 blocks, run in one kernel (group_leaves)."""
+    bh, n, r = feat.shape[0], feat.shape[1] - 1, feat.shape[2]
+    dev, nb = feat.device, (n + 63) // 64
+    levels = max(0, (nb - 1).bit_length() - 4)
+    size = -(-nb // (1 << levels)) * 64   # slots per node the kernel takes
+    total = size << levels
+    perm = torch.arange(total, device=dev).clamp_(max=n).expand(bh, total).contiguous()
+    carried = []
+    for level in range(levels):
+        w = total >> level
+        if not carried:
+            nd = min(_SOL_GROUP_DIRS, levels - level)
+            xg = feat.gather(1, perm.unsqueeze(-1).expand(-1, -1, r)).view(-1, w, r)
+            stride = max(2, -(-w // _SOL_GROUP_SAMPLES))
+            xsm = xg[:, ::stride].float()
+            cnt = (perm.view(-1, w)[:, ::stride] < n).sum(1).clamp(min=1).float()[:, None, None]
+            mean = xsm.sum(1)
+            gram = torch.bmm(xsm.transpose(1, 2), xsm) - (mean[:, :, None] * mean[:, None, :]) / cnt
+            dirs = torch.linalg.eigh(gram)[1][:, :, -nd:].flip(-1)
+            projs = torch.bmm(xg, dirs.to(xg.dtype)).float().mul_(_SOL_GROUP_SCORE_MAX)
+            projs = projs.clamp_(-_SOL_GROUP_SCORE_MAX, _SOL_GROUP_SCORE_MAX).to(torch.int16)
+            score = projs[:, :, 0].masked_fill(perm.view(-1, w) == n, _SOL_GROUP_SCORE_MAX + 1)
+            for j in range(1, nd):  # the children split on this node's next directions
+                by_row = torch.empty(bh, n + 1, device=dev, dtype=torch.int16)
+                by_row.scatter_(1, perm, projs[:, :, j].reshape(bh, total))
+                by_row[:, n] = _SOL_GROUP_SCORE_MAX + 1                     # padding sorts last
+                carried.append(by_row)
+            del xg, xsm, gram, projs
+        else:
+            score = carried.pop(0).gather(1, perm).view(-1, w)
+        perm = perm.view(-1, w).gather(1, score.argsort(1)).view(bh, total)
+    out = perm.to(torch.int32)
+    _C.sol_group_leaves(_dl(feat.to(torch.bfloat16)), _dl(out), bh, n, size, _stream(feat))
+    return out[:, :n].long()
+
+
+def _key_order_from_carriers(ws, p, kmean, t, h, start):
+    """``sol_key_order`` on the producer's staged raster carriers. The int8 keys
+    are centred, so their mean is added back in feature space. Full blocks from
+    ``start`` on are grouped; a ragged last block stays in place. The HIP carriers
+    are in natural row and channel order, so the planned rows need no un-permuting."""
+    d, dev, r = _SOL_HD, ws.device, _SOL_GROUP_DIMS   # group_features is built for 16 directions
+    tfull = (t // 64) * 64
+    n = tfull - start
+    order = torch.arange(t, device=dev, dtype=torch.int32).expand(h, t).contiguous()
+    if n <= 64:
+        return order.view(1, h, t)
+    tp = p["Tp"]
+    k8 = ws[p["rkiP"]:p["rkiP"] + h * tp * d].view(torch.int8).view(h, tp, d)[:, start:tfull]
+    ks = ws[p["rksb"]:p["rksb"] + h * tp * 8].view(torch.float32).view(h, tp, 2)[:, start:tfull, 0]
+    step = max(1, n // _SOL_GROUP_BASIS_ROWS)
+    q8 = ws[p["qiP"]:p["qiP"] + t * h * d].view(torch.int8).view(t, h, d)[start:tfull:step]
+    qsc = ws[p["qs"]:p["qs"] + t * h * 4].view(torch.float32).view(t, h)[start:tfull:step]
+    w = _feature_basis((q8.float() * qsc.unsqueeze(-1)).transpose(0, 1),
+                       k8[:, ::step].float() * ks[:, ::step, None] + kmean[:, None], r)
+    # features = unit rows of (k8 ks + kmean) W in-kernel: W's columns as int8 rows + scales, kmean W as an offset
+    wt = w.transpose(1, 2).contiguous()
+    dsc = (wt.abs().amax(-1) / 127.0).clamp_min(1e-20)
+    dir8 = torch.round(wt / dsc.unsqueeze(-1)).to(torch.int8)
+    doff = torch.bmm(kmean.unsqueeze(1), w).squeeze(1).contiguous()
+    feat = torch.empty(h, n + 1, r, dtype=torch.bfloat16, device=dev)
+    _C.sol_group_features(_dl(ws), _dl(dir8), _dl(dsc), _dl(doff), _dl(feat), 1, t, h, start // 64, n // 64,
+                          _stream(ws))
+    feat[:, n] = 0
+    order[:, start:tfull] = (_group_rows(feat) + start).to(torch.int32)
+    return order.view(1, h, t)
 
 
 def sol_attn_chunked(
@@ -3227,15 +3345,23 @@ def sol_attn_chunked(
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
     rope_split_half: bool = True,
+    order: torch.Tensor | None = None,
+    key_order_from: int | None = None,
 ):
     """Chunked-producer Sol-Attn over fused qkv projection chunks ([M, 3*H*128]
     bf16 or fp16, 64-aligned starts, B=1); full Q/K/V are never materialised.
     ``tail`` / ``block_len`` / ``coarse_gate`` / ``token_aug`` as in ``sol_attn``.
 
+    ``order`` as in ``sol_attn`` (int32 ``[1, H, T]``), or ``key_order_from`` (a
+    multiple of 64) to group the rows from there on by key similarity on the
+    producer's own carriers. The tail is then per row.
+    Not with ``block_len``, ``coarse_gate`` or ``token_aug``.
+
     ``qkv_chunks``: an iterable of chunks or a zero-arg callable returning one.
     ``kmean``/``vscale`` are LAST step's statistics ([H,128] f32); when None the
     producer runs twice (measure, then quantize), so pass a callable to stream on
-    the first call. ``rope_split_half``: q and k rotate in the pairs
+    the first call; under a row order it runs once, over chunks of one size (the
+    last may be shorter). ``rope_split_half``: q and k rotate in the pairs
     (i, i + rot/2) of ``rms_rope_split_half``, or when False in the interleaved
     pairs (2i, 2i + 1) of ``rms_rope``. Returns ``(out[1,T,H,128] in the chunks'
     dtype, kmean_next, vscale_next)``."""
@@ -3254,66 +3380,123 @@ def sol_attn_chunked(
     if coarse_gate is not None:
         coarse_gate = _check_coarse_gate(coarse_gate, (1, t, h, d), dev)
     lengths = _block_lengths(t, (t + 63) // 64, dev, block_len)
+    reorder = order is not None or key_order_from is not None
+    if reorder:
+        if block_len is not None or coarse_gate is not None or token_aug:
+            raise ValueError("sol_attn_chunked: a row order takes no block_len, coarse_gate or token_aug")
+        if order is not None and key_order_from is not None:
+            raise ValueError("sol_attn_chunked: give order or key_order_from, not both")
+        if order is not None:
+            order = _check_order(order, (1, h, t), dev, "sol_attn_chunked")
+        elif key_order_from < 0 or key_order_from % 64 or key_order_from >= t:
+            raise ValueError("sol_attn_chunked: key_order_from must be a multiple of 64 inside the sequence, "
+                             f"got {key_order_from}")
     qw, kw = (w.to(device=dev, dtype=torch.bfloat16).contiguous() for w in qk_norm_weights)
     factory = qkv_chunks if callable(qkv_chunks) else None
-    if factory is None and (kmean is None or vscale is None):
+    if factory is None and (kmean is None or vscale is None) and not reorder:
         qkv_chunks = list(qkv_chunks)          # need two passes over it
         factory = lambda: iter(qkv_chunks)     # noqa: E731
-    p = _C.sol_attn_plan(1, t, h, token_aug=int(token_aug))
+    p = _C.sol_attn_plan(1, t, h, token_aug=int(token_aug), reorder=reorder)
     ws = torch.empty(p["total"], dtype=torch.uint8, device=dev)
     stream = torch.cuda.current_stream(dev).cuda_stream
     width = 3 * h * d
     dtype = torch.bfloat16
 
-    def produce(km, vsc):
+    def stage(chunk, t0, km, vsc):
+        """One chunk to the producer at row t0; ``vsc`` None: its values take their
+        own range. Returns the V scale used."""
         nonlocal dtype
+        if t0 % 64:
+            raise ValueError("sol_attn_chunked: chunk starts must be 64-aligned")
+        # bare pointers below: a wrong width reads OOB, a host tensor poisons the context
+        if (chunk.shape[-1] != width or chunk.dtype not in (torch.bfloat16, torch.float16)
+                or chunk.device != dev):
+            raise ValueError(
+                f"sol_attn_chunked: chunks must be [M, {width}] bfloat16 or float16 on {dev}, "
+                f"got {tuple(chunk.shape)} {chunk.dtype} on {chunk.device}")
+        dtype = chunk.dtype
+        if vsc is None:
+            vsc = (chunk[..., 2 * h * d:].abs().amax(-2).float().view(h, d) / 127.0).clamp_min(1e-8)
+        _C.sol_producer_chunk(
+            _dl(ws), _dl(chunk.to(torch.bfloat16).contiguous()), _dl(fab), _dl(qw), _dl(kw), _dl(km), _dl(vsc),
+            float(rope_eps), rot, t0, chunk.shape[-2], 1, t, h, stream,
+            block_len=None if block_len is None else _dl(block_len),
+            token_aug=int(token_aug), split_half=bool(rope_split_half), reorder=reorder)
+        return vsc
+
+    def produce(km, vsc, chunks=None):
+        """Stage every chunk; ``vsc`` as in stage. Returns the V scales used and
+        the chunk length."""
         _C.sol_producer_begin(_dl(ws), 1, t, h, stream, token_aug=int(token_aug))
-        t0 = 0
-        for chunk in (factory() if factory is not None else qkv_chunks):
+        t0, scales, rows = 0, [], 0
+        for chunk in (chunks if chunks is not None else factory() if factory is not None else qkv_chunks):
             m = chunk.shape[-2]
-            if t0 % 64 and m:
-                raise ValueError("sol_attn_chunked: chunk starts must be 64-aligned")
-            # bare pointers below: a wrong width reads OOB, a host tensor poisons the context
-            if (chunk.shape[-1] != width or chunk.dtype not in (torch.bfloat16, torch.float16)
-                    or chunk.device != dev):
-                raise ValueError(
-                    f"sol_attn_chunked: chunks must be [M, {width}] bfloat16 or float16 on {dev}, "
-                    f"got {tuple(chunk.shape)} {chunk.dtype} on {chunk.device}")
-            dtype = chunk.dtype
-            _C.sol_producer_chunk(
-                _dl(ws), _dl(chunk.to(torch.bfloat16).contiguous()), _dl(fab), _dl(qw), _dl(kw), _dl(km), _dl(vsc),
-                float(rope_eps), rot, t0, m, 1, t, h, stream,
-                block_len=None if block_len is None else _dl(block_len),
-                token_aug=int(token_aug), split_half=bool(rope_split_half))
+            if not m:
+                continue
+            # row r takes chunk r // rows's V scale: every chunk before this one was `rows` long
+            if vsc is None and scales and (t0 != rows * len(scales) or m > rows):
+                raise ValueError("sol_attn_chunked: a row order needs chunks of one size "
+                                 "(the last may be shorter)")
+            rows = rows or m
+            scales.append(stage(chunk, t0, km, vsc))
             t0 += m
+            del chunk   # gone before the next one is made
         if t0 != t:
             raise ValueError(f"sol_attn_chunked: chunks cover {t0} tokens, T={t}")
+        return scales, rows
 
     def vscale_of(vamax):
         return (vamax / 127.0 * _SOL_VSCALE_MARGIN).clamp_min(1e-8)
 
-    if kmean is None or vscale is None:
-        # bootstrap: harvest the scale-independent statistics (post-rope K sums, V
-        # absmax) with dummy scales, then produce for real
-        produce(torch.zeros(h, d, device=dev), torch.ones(h, d, device=dev))
-        kmean = _ws_ksums(ws, p, h).sum(1) / lengths.sum()   # live tokens, like prep_sums_to_means
-        vscale = vscale_of(ws[p["statsV"]:p["statsV"] + h * d * 4].view(torch.float32))
-    kmean = kmean.to(device=dev, dtype=torch.float32).contiguous()
-    # a zero scale is 1/0 in the producer and 255/0 in route: clamp like vscale_of
-    vscale = vscale.to(device=dev, dtype=torch.float32).clamp_min(1e-8).contiguous()
-    produce(kmean, vscale)
+    vfac, vfac_rows = None, 0
+    if (kmean is None or vscale is None) and reorder:
+        # one pass: with the per-row tail the key mean only centres the int8 keys, so the first
+        # chunk's will do; each chunk's values take their own range, and sol_attn_reorder brings
+        # them to the common scale as it regroups the rows
+        it = iter(factory() if factory is not None else qkv_chunks)
+        head = [next((c for c in it if c.shape[-2]), None)]
+        if head[0] is None:
+            raise ValueError(f"sol_attn_chunked: chunks cover 0 tokens, T={t}")
+        m0 = head[0].shape[-2]
+        _C.sol_producer_begin(_dl(ws), 1, t, h, stream, token_aug=int(token_aug))
+        stage(head[0], 0, torch.zeros(h, d, device=dev), torch.ones(h, d, device=dev))
+        kmean = (_ws_ksums(ws, p, h)[:, :(m0 + 63) // 64].sum(1) / m0).contiguous()
+
+        def again():   # the first chunk once more, then the rest; popped so nothing else holds it
+            yield head.pop()
+            yield from it
+
+        scales, vfac_rows = produce(kmean, None, again())
+        scales = torch.stack(scales)
+        vscale = scales.amax(0).contiguous()
+        vfac = (scales / vscale).contiguous()
+    else:
+        if kmean is None or vscale is None:
+            # bootstrap: harvest the scale-independent statistics (post-rope K sums, V
+            # absmax) with dummy scales, then produce for real
+            produce(torch.zeros(h, d, device=dev), torch.ones(h, d, device=dev))
+            kmean = _ws_ksums(ws, p, h).sum(1) / lengths.sum()   # live tokens, like prep_sums_to_means
+            vscale = vscale_of(ws[p["statsV"]:p["statsV"] + h * d * 4].view(torch.float32))
+        kmean = kmean.to(device=dev, dtype=torch.float32).contiguous()
+        # a zero scale is 1/0 in the producer and 255/0 in route: clamp like vscale_of
+        vscale = vscale.to(device=dev, dtype=torch.float32).clamp_min(1e-8).contiguous()
+        produce(kmean, vscale)
+    if reorder:
+        if order is None:
+            order = _key_order_from_carriers(ws, p, kmean, t, h, int(key_order_from))
+        _C.sol_attn_reorder(_dl(ws), _dl(order), _dl(kmean), _dl(vscale), 1, t, h, stream,
+                            vfac=None if vfac is None else _dl(vfac), vfac_rows=int(vfac_rows))
+    ktail = (2 if reorder else 1) if tail else 0
     sb, sq = _sink_pair(sink_blocks), _sink_pair(sink_q)
-    threshold = (_topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sb)
-                 if topk_ratio else None)
     out = torch.empty(1, t, h, d, dtype=torch.bfloat16, device=dev)
     kmean_next = torch.empty(h, d, device=dev, dtype=torch.float32)
     vamax = torch.empty(h, d, device=dev, dtype=torch.float32)
     _C.sol_attn_core(
         _dl(ws), _dl(out), _dl(vscale), _dl(kmean_next), _dl(vamax),
         1, t, h, float(tau), float(scale), sb[0], sb[1], sq[0], sq[1], stream,
-        threshold=None if threshold is None else _dl(threshold),
-        block_len=None if block_len is None else _dl(block_len), tail=bool(tail),
-        token_aug=int(token_aug))
+        block_len=None if block_len is None else _dl(block_len), tail=ktail,
+        token_aug=int(token_aug), order=_dl(order) if reorder else None,
+        topk_count=_topk_budget(p, sb, topk_ratio))
     if coarse_gate is not None:
         add_coarse_(out, coarse_output(*_ws_block_means(ws, p, h, lengths), scale), coarse_gate)
     ws = None   # released before a converted copy of out exists
@@ -3336,18 +3519,6 @@ def _ws_block_means(ws, p, bh, lengths):
     qm = ws[p["qmean"]:p["qmean"] + bh * nq * d * 4].view(torch.float32).view(bh, nq, d)
     vm = ws[p["vcT"]:p["vcT"] + bh * d * npad * 2].view(torch.bfloat16).view(bh, d, npad)[:, :, :ntb]
     return qm, _ws_ksums(ws, p, bh), vm.transpose(1, 2).float() / lengths.view(1, -1, 1)
-
-
-def _topk_threshold_from_workspace(ws, p, h, topk_ratio, scale, lengths, sinks):
-    """Producer-path top-k threshold from the workspace's own pooled outputs. The
-    HIP carriers are in channel order, so cen8 is read as stored -- the CUDA entry
-    has to gather it at perm_d first."""
-    ntb, d = p["NTB"], _SOL_HD
-    cen8 = ws[p["cen8"]:p["cen8"] + h * ntb * d].view(torch.int8).view(h, ntb, d).float()
-    cens = ws[p["cens"]:p["cens"] + h * ntb * 4].view(torch.float32).view(h, ntb)
-    kc = _ws_ksums(ws, p, h) / lengths.view(1, -1, 1)
-    kc = kc - kc.mean(dim=1, keepdim=True)
-    return _topk_from_pooled(cen8, cens, kc, topk_ratio, scale * _LOG2E, sinks)
 
 
 # ---------------------------------------------------------------------------

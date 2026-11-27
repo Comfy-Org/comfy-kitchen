@@ -101,7 +101,7 @@ __global__ void sol_producer_kernel(
         const int d = tid;
         const float inv = 1.f / vscale[(size_t)h * HD + d];
         float sv = 0.f, av = 0.f;
-        // vTi: raw channel rows, perm_d on the KEY axis per 64-block
+        // vTi: this block's channel rows (vt_at), perm_d on the KEY axis
         __align__(16) int8_t col[BLK];
         for (int t = 0; t < BLK; ++t) {
             const float x = (t < len) ? __bfloat162float(sT[t * LD_TILE + d]) : 0.f;
@@ -109,11 +109,13 @@ __global__ void sol_producer_kernel(
             col[perm_d(t)] = q8(x, inv);
             if (vRow) vRow[((size_t)h * Tp + nblk * BLK + t) * HD + d] = col[perm_d(t)];   // row-major copy (token routing)
         }
-        const size_t vbase = ((size_t)h * HD + d) * Tp + nblk * BLK;
-        #pragma unroll
-        for (int c = 0; c < BLK; c += 16)
-            *reinterpret_cast<uint4*>(vTi + vbase + c) = *reinterpret_cast<const uint4*>(col + c);
-        vcT[((size_t)h * HD + d) * NPAD + nblk] = __float2bfloat16(sv);
+        if (vTi) {   // null when a row order follows: sol_attn_reorder writes the tiles and their sums
+            const size_t vbase = (size_t)h * HD * Tp + vt_at(nblk, d);
+            #pragma unroll
+            for (int c = 0; c < BLK; c += 16)
+                *reinterpret_cast<uint4*>(vTi + vbase + c) = *reinterpret_cast<const uint4*>(col + c);
+            vcT[((size_t)h * HD + d) * NPAD + nblk] = __float2bfloat16(sv);
+        }
         atomicMax(reinterpret_cast<unsigned int*>(&vamax_next[(size_t)h * HD + d]),
                   __float_as_uint(av));
     }

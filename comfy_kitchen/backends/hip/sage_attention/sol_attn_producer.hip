@@ -86,9 +86,10 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
         const int d = tid;
         const float inv = 1.f / vscale[static_cast<size_t>(h) * HD + d];
         float sv = 0.f, av = 0.f;
-        // vT: raw channel rows, keys in natural order
+        // vT: raw channel rows, keys in natural order; null when a row order follows
+        // (sol_attn_reorder writes the tiles and their sums)
         __attribute__((aligned(16))) int8_t col[16];
-        const size_t vbase = (static_cast<size_t>(h) * HD + d) * Tp + nblk * BLK;
+        const size_t vbase = static_cast<size_t>(h) * HD * Tp + vt_at(nblk, d);
 #pragma unroll
         for (int c0 = 0; c0 < BLK; c0 += 16) {
 #pragma unroll
@@ -99,7 +100,7 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
                 av = fmaxf(av, fabsf(x));
                 col[j] = q8(x, inv);
             }
-            *reinterpret_cast<uint4*>(vT + vbase + c0) = *reinterpret_cast<const uint4*>(col);
+            if (vT) *reinterpret_cast<uint4*>(vT + vbase + c0) = *reinterpret_cast<const uint4*>(col);
             // row-major copy for the gathered token tiles (token routing)
             if (vRow) {
 #pragma unroll
@@ -108,7 +109,7 @@ __global__ __launch_bounds__(HD) void sol_producer_kernel(
                 }
             }
         }
-        vcT[(static_cast<size_t>(h) * HD + d) * NPAD + nblk] = static_cast<__bf16>(sv);
+        if (vT) vcT[(static_cast<size_t>(h) * HD + d) * NPAD + nblk] = static_cast<__bf16>(sv);
         atomicMax(reinterpret_cast<unsigned int*>(&vamax_next[static_cast<size_t>(h) * HD + d]),
                   __float_as_uint(av));
     }
