@@ -1134,6 +1134,7 @@ class TestBandedStreamK:
         assert torch.equal(out, expected)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
+            stream = torch.cuda.current_stream().cuda_stream
             assert cuda._C.cutlass_int8_dequant_scalar(*(cuda._wrap_for_dlpack(t) for t in args), stream)
         ws.fill_(0.125)
         graph.replay()
