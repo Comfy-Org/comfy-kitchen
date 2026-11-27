@@ -27,6 +27,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "joint_qk_rms_rope_cat",
 ]
 
 # Try to import triton and register if available
@@ -54,6 +55,7 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .joint_qk_rms_rope_cat import joint_qk_rms_rope_cat
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -125,6 +127,48 @@ def _build_constraints() -> dict:
         q = kwargs.get("q")
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
+    def _joint_qk_rms_rope_cat_call_rule(kwargs):
+        # No size threshold: every call that passes the checks below goes to the kernel.
+        img_q, txt_q = kwargs.get("img_q"), kwargs.get("txt_q")
+        freqs_cis, heads = kwargs.get("freqs_cis"), kwargs.get("heads")
+        if img_q is None or txt_q is None or freqs_cis is None or heads is None:
+            return ValidationResult.ok()
+        img = [kwargs.get(n) for n in ("img_q", "img_k", "img_v")]
+        txt = [kwargs.get(n) for n in ("txt_q", "txt_k", "txt_v")]
+        weights = [
+            kwargs.get(n) for n in ("img_q_weight", "img_k_weight", "txt_q_weight", "txt_k_weight")
+        ]
+        tensors = [*img, *txt, *weights, freqs_cis]
+        if any(t is None for t in tensors):
+            return ValidationResult.ok()
+        if any(t.device != img_q.device for t in tensors):
+            return ValidationResult.fail("img_q", "all tensors must be on one device")
+        batch_size, seq_img, channels = img_q.shape
+        seq_txt = txt_q.shape[1]
+        if batch_size == 0 or seq_img == 0 or seq_txt == 0:
+            return ValidationResult.fail("img_q", "empty streams are not supported by triton")
+        head_dim = channels // heads
+        if head_dim not in (16, 32, 64, 128):
+            return ValidationResult.fail("img_q", "head_dim must be 16, 32, 64 or 128")
+        for group in (img, txt):
+            if group[0].stride(2) != 1:
+                return ValidationResult.fail(
+                    "img_q", "projections must be contiguous in the last dim"
+                )
+            if any(t.stride() != group[0].stride() for t in group[1:]):
+                return ValidationResult.fail(
+                    "img_k", "k and v must have q's strides in each stream"
+                )
+        if any(w.stride(0) != 1 for w in weights):
+            return ValidationResult.fail("img_q_weight", "weights must be contiguous")
+        if freqs_cis.stride()[2:] != (2 * head_dim, 4, 2, 1):
+            return ValidationResult.fail("freqs_cis", "freqs_cis rows must be contiguous")
+        if batch_size > 65535 or heads > 65535:
+            return ValidationResult.fail("img_q", "batch and heads must be <= 65535 (grid)")
+        if batch_size * channels * (seq_txt + seq_img) >= 2**31:
+            return ValidationResult.fail("img_q", "outputs must have fewer than 2**31 elements")
         return ValidationResult.ok()
 
     cuda_devices = frozenset({"cuda"})
@@ -336,6 +380,23 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    # cuda covers ROCm builds of PyTorch (device type "cuda")
+    bf16 = frozenset({torch.bfloat16})
+    out["joint_qk_rms_rope_cat"] = FunctionConstraints(
+        params={
+            **{
+                name: ParamConstraint(dtypes=bf16, shape_rules=(ExactDims(3),))
+                for name in ("img_q", "img_k", "img_v", "txt_q", "txt_k", "txt_v")
+            },
+            **{
+                name: ParamConstraint(dtypes=bf16, shape_rules=(ExactDims(1),))
+                for name in ("img_q_weight", "img_k_weight", "txt_q_weight", "txt_k_weight")
+            },
+            "freqs_cis": ParamConstraint(dtypes=bf16, shape_rules=(ExactDims(6),)),
+        },
+        default_devices=cuda_devices,
+        call_rules=(_joint_qk_rms_rope_cat_call_rule,),
     )
     return out
 
