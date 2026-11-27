@@ -249,7 +249,7 @@ __global__ void SOL_TOKEN_BOUNDS sol_token_kernel(
             for (int idx = tid; idx < HD * 4; idx += NTHREADS) {               \
                 const int c = idx >> 2, part = idx & 3;                        \
                 cp_async16(SVT(buf) + c * LDV + ((part ^ swz_v(c)) << 4),      \
-                           vTi + vT_base + (int64_t)c * Tp + k0_ + part * 16); \
+                           vTi + vT_base + vt_at(kbi, c) + part * 16);         \
             }                                                                  \
         }                                                                      \
     }

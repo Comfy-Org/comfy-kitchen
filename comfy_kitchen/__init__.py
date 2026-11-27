@@ -196,6 +196,7 @@ def sol_attn(
     coarse_gate: torch.Tensor | None = None,
     token_aug: int = 0,
     q_offset: int = 0,
+    key_order_from: int | None = None,
 ) -> torch.Tensor:
     """Sol-Attn training-free sparse attention (arXiv 2607.24027).
 
@@ -239,6 +240,15 @@ def sol_attn(
             keys before it are a prefix (cover them with ``sink_blocks`` to
             keep them exact). It only places the band of always-exact key
             blocks around each query block. At most ``Tk - T``.
+        key_order_from: Spark-Attn key grouping (arXiv 2611.24256): from this
+            row on (a multiple of 64; earlier rows stay in place) each head's
+            rows are regrouped so that every 64-token block holds similar keys,
+            and the blocks a query block leaves out reach each of its rows as
+            one weighted summary key per block. Pairs with ``topk_ratio``.
+            ``sink_blocks`` and ``sink_q`` count blocks after the regrouping,
+            so they hold their original rows only below this row. CUDA only;
+            needs k and v as long as q and no ``q_offset``, ``block_len``,
+            ``key_bias``, ``coarse_gate`` or ``token_aug``.
 
     Returns:
         ``(B, T, H, 128)`` attention output, one row per query.
@@ -254,6 +264,7 @@ def sol_attn(
         coarse_gate,
         int(token_aug),
         int(q_offset),
+        None if key_order_from is None else int(key_order_from),
     )
 
 

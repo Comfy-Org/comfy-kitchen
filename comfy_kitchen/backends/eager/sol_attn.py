@@ -130,9 +130,9 @@ def sol_attn(
     tail: bool = True,
     block_len: torch.Tensor | None = None,
     coarse_gate: torch.Tensor | None = None,
-    token_aug: int = 0,   # ignored: the reference is exact arithmetic over the same
-                          # block selection, so there is no token routing stage to model
+    token_aug: int = 0,   # ignored: no token routing in the reference
     q_offset: int = 0,
+    key_order_from: int | None = None,
 ) -> torch.Tensor:
     """Sol-Attn over ``(B, T, H, D)`` tensors. See the module docstring.
 
@@ -148,6 +148,8 @@ def sol_attn(
     output rows are unspecified), and ``coarse_gate`` adds VSA's gated coarse
     branch: ``gate * softmax(q_mean k_mean^T * scale) v_mean`` per block.
     """
+    if key_order_from is not None:
+        raise NotImplementedError("sol_attn: row orders (key_order_from) are CUDA-only")
     b, t, h, d = q.shape
     tk = k.shape[1]
     n = (t + BLOCK - 1) // BLOCK                    # query blocks
@@ -275,13 +277,14 @@ def _op_sol_attn(
     coarse_gate: torch.Tensor | None,
     token_aug: int = 0,
     q_offset: int = 0,
+    key_order_from: int | None = None,
 ) -> torch.Tensor:
     kwargs = {
         "q": q, "k": k, "v": v, "tau": tau, "scale": scale,
         "sink_blocks": sink_blocks, "sink_q": sink_q,
         "key_bias": key_bias, "topk_ratio": topk_ratio,
         "tail": tail, "block_len": block_len, "coarse_gate": coarse_gate,
-        "token_aug": token_aug, "q_offset": q_offset,
+        "token_aug": token_aug, "q_offset": q_offset, "key_order_from": key_order_from,
     }
     impl = registry.get_implementation("sol_attn", kwargs=kwargs)
     return impl(**kwargs)
@@ -289,6 +292,7 @@ def _op_sol_attn(
 
 @_op_sol_attn.register_fake
 def _op_sol_attn_fake(q, k, v, tau, scale, sink_blocks, sink_q,
-                      key_bias, topk_ratio, tail, block_len, coarse_gate, token_aug=0, q_offset=0):
+                      key_bias, topk_ratio, tail, block_len, coarse_gate, token_aug=0, q_offset=0,
+                      key_order_from=None):
     # contiguous, NOT empty_like(v): both real implementations return contiguous
     return torch.empty(q.shape, dtype=v.dtype, device=v.device)
