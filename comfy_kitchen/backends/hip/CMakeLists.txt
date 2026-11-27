@@ -31,10 +31,12 @@ endfunction()
 _ck_read_arch_group(COMFY_HIP_ELEMENTWISE_ARCHS elementwise_only)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX11_ARCHS wmma_gfx11)
 _ck_read_arch_group(COMFY_HIP_WMMA_GFX12_ARCHS wmma_gfx12)
+_ck_read_arch_group(COMFY_HIP_GEOMETRY_ARCHS geometry_only)
 set(COMFY_HIP_SUPPORTED_ARCHS
     ${COMFY_HIP_ELEMENTWISE_ARCHS}
     ${COMFY_HIP_WMMA_GFX11_ARCHS}
     ${COMFY_HIP_WMMA_GFX12_ARCHS}
+    ${COMFY_HIP_GEOMETRY_ARCHS}
 )
 list(LENGTH COMFY_HIP_SUPPORTED_ARCHS _arch_count)
 list(REMOVE_DUPLICATES COMFY_HIP_SUPPORTED_ARCHS)
@@ -55,6 +57,19 @@ foreach(_arch IN LISTS COMFY_HIP_ARCHS)
     endif()
 endforeach()
 set(CMAKE_HIP_ARCHITECTURES "${COMFY_HIP_ARCHS}")
+
+# RDNA targets get every kernel, at wave32, in _C. CDNA targets run wave64 only, so
+# they get just the geometry kernels, which do not depend on the wavefront size, in
+# _geom. One configure can build both: each kernel target sets its own architectures.
+set(COMFY_HIP_WAVE32_ARCHS)
+set(COMFY_HIP_WAVE64_ARCHS)
+foreach(_arch IN LISTS COMFY_HIP_ARCHS)
+    if(_arch IN_LIST COMFY_HIP_GEOMETRY_ARCHS)
+        list(APPEND COMFY_HIP_WAVE64_ARCHS ${_arch})
+    else()
+        list(APPEND COMFY_HIP_WAVE32_ARCHS ${_arch})
+    endif()
+endforeach()
 
 function(_ck_make_arch_condition output)
     set(_condition "")
@@ -212,77 +227,95 @@ set_property(SOURCE ops/mesh_bvh.hip APPEND PROPERTY COMPILE_OPTIONS -ffp-contra
 set_source_files_properties(ops/gemm_int8.hip PROPERTIES
     COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
 
+set(GEOMETRY_HIP_SOURCES
+    ops/delaunay3d.hip
+    ops/mesh_bvh.hip
+    ops/connected_components.hip
+    ops/edge_collapse.hip
+    ops/min_cut.hip
+)
+
 set(CPP_SOURCES
     dlpack_bindings.cpp
+    geometry_bindings.cpp
     int8_decode_bindings.cpp
 )
 
 # Keep HIP compilation independent of the Python extension target. The kernels
 # consume HIP and project headers only, so a compiler cache can reuse their
 # objects across CPython wheel builds.
-add_library(comfy_kitchen_hip_kernels OBJECT ${HIP_SOURCES})
-# The kernels index lanes and reduce warps at a width of 32. The wavefront size is
-# not a constant expression, so no kernel can assert it; the last flag wins, and
-# these follow CMAKE_HIP_FLAGS.
-target_compile_options(comfy_kitchen_hip_kernels PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:-O3>
-    $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
-    $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64>
-)
-if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_options(
-        comfy_kitchen_hip_kernels PRIVATE
-        $<$<COMPILE_LANGUAGE:HIP>:-gline-tables-only>
+function(_ck_add_kernels target archs)
+    add_library(${target} OBJECT ${ARGN})
+    set_target_properties(${target} PROPERTIES HIP_ARCHITECTURES "${archs}")
+    target_compile_options(${target} PRIVATE
+        $<$<COMPILE_LANGUAGE:HIP>:-O3>
+        $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
     )
-endif()
-target_include_directories(comfy_kitchen_hip_kernels PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention
-    ${_CK_HIP_GENERATED_INCLUDE_DIR}
-)
-target_link_libraries(comfy_kitchen_hip_kernels PRIVATE hip::host)
+    if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+        target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-gline-tables-only>)
+    endif()
+    target_include_directories(${target} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/sage_attention
+        ${_CK_HIP_GENERATED_INCLUDE_DIR}
+    )
+    target_link_libraries(${target} PRIVATE hip::host)
+endfunction()
 
 # NOMINSIZE: nanobind_add_module() otherwise puts -Os on the whole target, which the
 # kernel object target already avoids. Keep it off the binding translation unit too.
-if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
-    message(STATUS "Python ${Python_VERSION} detected - enabling stable ABI (abi3)")
-    nanobind_add_module(_C NB_STATIC STABLE_ABI LTO NOMINSIZE ${CPP_SOURCES})
-    if(WIN32)
-        set_target_properties(_C PROPERTIES SUFFIX ".abi3.pyd")
+function(_ck_add_extension name kernels)
+    if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
+        message(STATUS "Python ${Python_VERSION} detected - enabling stable ABI (abi3) for ${name}")
+        nanobind_add_module(${name} NB_STATIC STABLE_ABI LTO NOMINSIZE ${ARGN})
+        if(WIN32)
+            set_target_properties(${name} PROPERTIES SUFFIX ".abi3.pyd")
+        else()
+            set_target_properties(${name} PROPERTIES SUFFIX ".abi3.so")
+        endif()
+        target_compile_definitions(${name} PRIVATE Py_LIMITED_API=0x030C0000)
     else()
-        set_target_properties(_C PROPERTIES SUFFIX ".abi3.so")
+        message(STATUS "Python ${Python_VERSION} detected - building version-specific ${name}")
+        nanobind_add_module(${name} NB_STATIC LTO NOMINSIZE ${ARGN})
     endif()
-    target_compile_definitions(_C PRIVATE Py_LIMITED_API=0x030C0000)
-else()
-    message(STATUS "Python ${Python_VERSION} detected - building version-specific module")
-    nanobind_add_module(_C NB_STATIC LTO NOMINSIZE ${CPP_SOURCES})
-endif()
 
-target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_hip_kernels>)
-
-target_compile_definitions(_C PRIVATE NB_STATIC)
-
-target_include_directories(_C PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${_CK_HIP_GENERATED_INCLUDE_DIR}
-)
-
-target_link_libraries(_C PRIVATE hip::host)
-
-if(CMAKE_CONFIGURATION_TYPES)
-    set_target_properties(_C PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
-        LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
-        LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
-        LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
-        RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
-        RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
-        RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
-        RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+    target_sources(${name} PRIVATE $<TARGET_OBJECTS:${kernels}>)
+    target_compile_definitions(${name} PRIVATE NB_STATIC)
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${_CK_HIP_GENERATED_INCLUDE_DIR}
     )
+    target_link_libraries(${name} PRIVATE hip::host)
+
+    if(CMAKE_CONFIGURATION_TYPES)
+        set_target_properties(${name} PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+            LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+            LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+            LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+            RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+            RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+            RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+            RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+        )
+    endif()
+
+    install(TARGETS ${name}
+        LIBRARY DESTINATION .
+        RUNTIME DESTINATION .
+    )
+endfunction()
+
+if(COMFY_HIP_WAVE32_ARCHS)
+    _ck_add_kernels(comfy_kitchen_hip_kernels "${COMFY_HIP_WAVE32_ARCHS}" ${HIP_SOURCES})
+    # These kernels index lanes and reduce warps at a width of 32. The wavefront size is
+    # not a constant expression, so no kernel can assert it; the last flag wins, and
+    # these follow CMAKE_HIP_FLAGS.
+    target_compile_options(comfy_kitchen_hip_kernels PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-mno-wavefrontsize64>)
+    _ck_add_extension(_C comfy_kitchen_hip_kernels ${CPP_SOURCES})
 endif()
 
-install(TARGETS _C
-    LIBRARY DESTINATION .
-    RUNTIME DESTINATION .
-)
+if(COMFY_HIP_WAVE64_ARCHS)
+    _ck_add_kernels(comfy_kitchen_hip_geometry_kernels "${COMFY_HIP_WAVE64_ARCHS}" ${GEOMETRY_HIP_SOURCES})
+    _ck_add_extension(_geom comfy_kitchen_hip_geometry_kernels geometry_module.cpp geometry_bindings.cpp)
+endif()
