@@ -43,13 +43,6 @@ struct Ring {
     }
 };
 
-__device__ __forceinline__ void wait_phase(uint32_t addr, int parity) {
-    asm volatile("{ .reg .pred done; wait_again: "
-                 "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1; "
-                 "@!done bra.uni wait_again; }" ::"r"(addr),
-                 "r"(parity)
-                 : "memory");
-}
 __device__ __forceinline__ void bulk_load(uint32_t dst, const void* src, int bytes, uint32_t bar) {
     asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
                  "[%0], [%1], %2, [%3];" ::"r"(dst),
@@ -83,14 +76,14 @@ __device__ __forceinline__ void release(const Ring& ring, int previous_tile, int
                  : "memory");
     if ((previous & 7) == 7) {
         if (previous_tile + 4 < ring.end) {
-            wait_phase(ring.addr(empty_offset + 8 * Stage), parity);
+            cutlass::arch::ClusterBarrier::wait(ring.barrier(empty_offset, Stage), parity);
             cutlass::arch::fence_view_async_shared();
             fill<Stage, false>(ring, previous_tile + 4);
         } else if constexpr (Stage & 1) {
             // An odd tile and the unpaired last tile share this means buffer.
             // Delay the final DMA until every warp consumed the older means.
             if ((ring.end & 1) && previous_tile == ring.end - 4) {
-                wait_phase(ring.addr(empty_offset + 8 * Stage), parity);
+                cutlass::arch::ClusterBarrier::wait(ring.barrier(empty_offset, Stage), parity);
                 cutlass::arch::fence_view_async_shared();
                 constexpr int last_stage = (Stage + 3) & 3;
                 bulk_load(ring.addr(smem_mean_offset + (last_stage / 2) * layout::mean_bytes),
@@ -100,44 +93,37 @@ __device__ __forceinline__ void release(const Ring& ring, int previous_tile, int
         }
     }
 }
-__device__ __forceinline__ void take_turn(int id) {
-    asm volatile("bar.sync %0, 64;" ::"r"(id) : "memory");
-}
-__device__ __forceinline__ void pass_turn(int id) {
-    asm volatile("bar.arrive %0, 64;" ::"r"(id) : "memory");
-}
-
 template <int Stage, bool Masked, class State>
 __device__ __forceinline__ void step(State& st, const Ring& ring, int tile, int phase) {
     constexpr int Prev = (Stage + 3) & 3;
     const int valid = Masked ? 1 + (State::S - 1) % 128 : 128;
-    wait_phase(ring.addr(full_offset + 8 * Stage), phase);
-    uint4 early_q[4], early_v[4];
+    cutlass::arch::ClusterBarrier::wait(ring.barrier(full_offset, Stage), phase);
+    Fragment early_q[4], early_v[4];
     const uint32_t qs = ring.addr(Stage * layout::mean_offset);
     const uint32_t vs = ring.addr(Prev * layout::mean_offset);
-    preload_q(st, qs, early_q);
-    preload_v(st, vs, early_v);
-    take_turn(ring.wait_id);
+    preload(st, qs, early_q);
+    preload(st, vs + layout::value_offset, early_v);
+    cutlass::arch::NamedBarrier::sync(64, ring.wait_id);
     float scores[16][4];
     qk<Masked>(st, qs, scores, valid, early_q);
     pv(st, vs, early_v);
     if constexpr (Prev & 1) {
         means(st, ring.addr(smem_mean_offset + (Prev / 2) * layout::mean_bytes), st.Pst[10], st.Pst[11]);
     }
-    pass_turn(ring.post_id);
+    cutlass::arch::NamedBarrier::arrive(64, ring.post_id);
     release<Prev>(ring, tile - 1, phase ^ (Stage == 0));
     softmax<Masked, (Stage & 1) != 0>(st, scores, valid);
 }
 template <int Stage, class State>
 __device__ __forceinline__ void finish(State& st, const Ring& ring) {
-    uint4 early_v[4];
+    Fragment early_v[4];
     const uint32_t vs = ring.addr(Stage * layout::mean_offset);
-    preload_v(st, vs, early_v);
-    take_turn(ring.wait_id);
+    preload(st, vs + layout::value_offset, early_v);
+    cutlass::arch::NamedBarrier::sync(64, ring.wait_id);
     pv(st, vs, early_v);
     means(st, ring.addr(smem_mean_offset + (Stage / 2) * layout::mean_bytes),
           (Stage & 1) ? st.Pst[10] : 0, (Stage & 1) ? st.Pst[11] : 0);
-    if (threadIdx.x < 128) pass_turn(ring.post_id);
+    if (threadIdx.x < 128) cutlass::arch::NamedBarrier::arrive(64, ring.post_id);
 }
 
 template <int Sequence, int Heads, bool SingleWriter>
@@ -162,7 +148,7 @@ __global__ __launch_bounds__(256, 1) void deco_fp4_core(
     const int pair = warp & 3;
     const int phase_b = warp >> 2;
     const Ring ring{smem, image + size_t(head) * tile_count * layout::tile_bytes, end,
-                    1 + pair + 4 * phase_b, 5 + pair - 4 * phase_b};
+                    pair + 4 * phase_b, 4 + pair - 4 * phase_b};
     if (threadIdx.x == 0) {
 #pragma unroll
         for (int s = 0; s < 4; s++) {
@@ -195,14 +181,14 @@ __global__ __launch_bounds__(256, 1) void deco_fp4_core(
         st.lsum[i] = 0;
     }
     {
-        wait_phase(ring.addr(full_offset), 0);
-        uint4 early_q[4];
+        cutlass::arch::ClusterBarrier::wait(ring.barrier(full_offset, 0), 0);
+        Fragment early_q[4];
         const auto qs = ring.addr(0);
-        preload_q(st, qs, early_q);
-        if (phase_b) take_turn(ring.wait_id);
+        preload(st, qs, early_q);
+        if (phase_b) cutlass::arch::NamedBarrier::sync(64, ring.wait_id);
         float scores[16][4];
         qk<false>(st, qs, scores, 128, early_q);
-        pass_turn(ring.post_id);
+        cutlass::arch::NamedBarrier::arrive(64, ring.post_id);
         softmax<false, false>(st, scores, 128);
     }
     if constexpr (Sequence == 16481 && Heads == 56) {

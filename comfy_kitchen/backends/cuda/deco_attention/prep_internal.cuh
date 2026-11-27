@@ -4,12 +4,6 @@
 #include "layout.h"
 
 namespace comfy_deco {
-__device__ __forceinline__ uint32_t round_bf16(float lo, float hi) {
-    uint32_t word;
-    asm("cvt.rn.bf16x2.f32 %0,%2,%1;" : "=r"(word) : "f"(lo), "f"(hi));
-    return word;
-}
-
 struct PrepGeometry {
     int sequence, heads, tiles;
 };

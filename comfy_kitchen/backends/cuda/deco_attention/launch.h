@@ -22,8 +22,7 @@ cudaError_t launch_shape(const CoreArguments& args, int sms, bool single_writer,
 
 } // namespace comfy_deco::detail
 
-// Only the host binding needs the dispatch table. Each CUDA translation
-// unit instantiates the two writer policies for one shape.
+// Only the host binding needs the dispatch table.
 #ifdef COMFY_DECO_CCS
 namespace comfy_deco {
 

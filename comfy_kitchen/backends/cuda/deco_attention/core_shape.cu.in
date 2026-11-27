@@ -1,5 +1,0 @@
-// SPDX-License-Identifier: Apache-2.0
-#include "core.cuh"
-
-template cudaError_t comfy_deco::detail::launch_shape<@DECO_SEQUENCE@, @DECO_HEADS@>(
-    const comfy_deco::detail::CoreArguments&, int, bool, cudaStream_t);

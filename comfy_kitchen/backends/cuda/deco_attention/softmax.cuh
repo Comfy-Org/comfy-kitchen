@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 #include <stdint.h>
+#include "../float_utils.cuh"
+#include "../sage_attention/math.cuh"
 #include "layout.h"
 
 namespace comfy_deco::detail {
@@ -14,20 +16,8 @@ __device__ __forceinline__ float make_subnormal_scale(float c) {
     return m;
 }
 
-__device__ __forceinline__ uint32_t soft_bf16x2(float lo, float hi) {
-    uint32_t v;
-    asm("cvt.rn.bf16x2.f32 %0,%2,%1;" : "=r"(v) : "f"(lo), "f"(hi));
-    return v;
-}
-
 __device__ __forceinline__ uint32_t rescale_mean(uint32_t v, float f) {
-    return soft_bf16x2(__uint_as_float(v << 16) * f, __uint_as_float(v & 0xffff0000u) * f);
-}
-
-__device__ __forceinline__ float soft_exp2(float x) {
-    float y;
-    asm("ex2.approx.ftz.f32 %0,%1;" : "=f"(y) : "f"(x));
-    return y;
+    return comfy::pack_bf2(__uint_as_float(v << 16) * f, __uint_as_float(v & 0xffff0000u) * f);
 }
 
 __device__ __forceinline__ float soft_rcp(float x) {
@@ -149,7 +139,7 @@ __device__ __forceinline__ void softmax(State& st, float (&scores)[16][4], int v
             const float top = __fmul_rn(m, st.c);
             const float old = st.anchor[r];
             const float next = (top > __fadd_rn(old, 4.f)) ? top : old;
-            factor[r] = soft_exp2(__fsub_rn(old, next));
+            factor[r] = ::math::ptx_exp2(__fsub_rn(old, next));
             st.anchor[r] = next;
             st.lsum[r] = __fmul_rn(st.lsum[r], factor[r]);
             const uint32_t ci = __float_as_uint(st.c);
@@ -239,7 +229,7 @@ __device__ __forceinline__ void softmax(State& st, float (&scores)[16][4], int v
 #pragma unroll
     for (int r = 0; r < 2; r++) {
         st.lsum[r] = __fadd_rn(st.lsum[r], __fadd_rn(xs[0][r], xs[1][r]));
-        const uint32_t ma = soft_bf16x2(xs[0][r], xs[1][r]);
+        const uint32_t ma = comfy::pack_bf2(xs[0][r], xs[1][r]);
         if constexpr (Odd)
             st.Pst[10 + r] = ma;
         else
@@ -277,8 +267,8 @@ __device__ __forceinline__ void store_final(State& st, uint16_t* out, int row_g,
 #pragma unroll
             for (int j = 0; j < 16; j += 2) {
                 const int e = 4 * j + 2 * rr;
-                const uint32_t a = soft_bf16x2(st.O[e] * inv, st.O[e + 1] * inv);
-                const uint32_t b = soft_bf16x2(st.O[e + 4] * inv, st.O[e + 5] * inv);
+                const uint32_t a = comfy::pack_bf2(st.O[e] * inv, st.O[e + 1] * inv);
+                const uint32_t b = comfy::pack_bf2(st.O[e + 4] * inv, st.O[e + 5] * inv);
                 // Even lanes store both words from fragment j; odd lanes
                 // store both from j+1. Neighbors exchange exactly one word.
                 const uint32_t peer = __shfl_xor_sync(valid, parity ? a : b, 1);
@@ -289,7 +279,7 @@ __device__ __forceinline__ void store_final(State& st, uint16_t* out, int row_g,
             uint32_t* dst = reinterpret_cast<uint32_t*>(out) + (int64_t(row) * st.H + head) * 64 + st.t;
 #pragma unroll
             for (int jc = 0; jc < 16; jc++)
-                dst[4 * jc] = soft_bf16x2(st.O[4 * jc + 2 * rr] * inv, st.O[4 * jc + 2 * rr + 1] * inv);
+                dst[4 * jc] = comfy::pack_bf2(st.O[4 * jc + 2 * rr] * inv, st.O[4 * jc + 2 * rr + 1] * inv);
         }
     }
 }
@@ -306,6 +296,15 @@ __device__ __forceinline__ void store_partial(State& st, uint16_t* out, int row_
                                                  split_count * layout::split_pair_bytes) +
                  slot;
     const float sums[2] = {soft_total(st, 0), soft_total(st, 1)};
+    auto store_record = [&](uint4* dst) {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            dst[j * stride] = make_uint4(__float_as_uint(st.O[4 * j]), __float_as_uint(st.O[4 * j + 1]),
+                                         __float_as_uint(st.O[4 * j + 2]), __float_as_uint(st.O[4 * j + 3]));
+        }
+        dst[16 * stride] = make_uint4(__float_as_uint(sums[0]), __float_as_uint(sums[1]),
+                                      __float_as_uint(st.anchor[0]), __float_as_uint(st.anchor[1]));
+    };
     const uint4* peer;
     if constexpr (SingleWriter) {
         auto* mine = records + int64_t(slot) * threads * vectors + threadIdx.x;
@@ -314,15 +313,7 @@ __device__ __forceinline__ void store_partial(State& st, uint16_t* out, int row_
         if (threadIdx.x == 0) *shared_arrived = atomicCAS(flag, 0u, 1u) == 0u;
         __syncthreads();
         if (*shared_arrived) {
-#pragma unroll
-            for (int j = 0; j < 16; ++j) {
-                mine[j * threads] =
-                    make_uint4(__float_as_uint(st.O[4 * j]), __float_as_uint(st.O[4 * j + 1]),
-                               __float_as_uint(st.O[4 * j + 2]), __float_as_uint(st.O[4 * j + 3]));
-            }
-            mine[16 * threads] =
-                make_uint4(__float_as_uint(sums[0]), __float_as_uint(sums[1]),
-                           __float_as_uint(st.anchor[0]), __float_as_uint(st.anchor[1]));
+            store_record(mine);
             __threadfence();
             __syncthreads();
             if (threadIdx.x == 0) {
@@ -340,13 +331,7 @@ __device__ __forceinline__ void store_partial(State& st, uint16_t* out, int row_
         peer = mine;
     } else {
         uint4* mine = records + ((int64_t(slot) * 2 + part - 1) * threads + threadIdx.x) * vectors;
-#pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            mine[j] = make_uint4(__float_as_uint(st.O[4 * j]), __float_as_uint(st.O[4 * j + 1]),
-                                 __float_as_uint(st.O[4 * j + 2]), __float_as_uint(st.O[4 * j + 3]));
-        }
-        mine[16] = make_uint4(__float_as_uint(sums[0]), __float_as_uint(sums[1]),
-                              __float_as_uint(st.anchor[0]), __float_as_uint(st.anchor[1]));
+        store_record(mine);
         asm volatile("fence.acq_rel.gpu;" ::: "memory");
         __syncthreads();
         if (threadIdx.x == 0) {
@@ -371,8 +356,8 @@ __device__ __forceinline__ void store_partial(State& st, uint16_t* out, int row_
         const float a1 = part == 1 ? st.anchor[rr] : peer_anchor[rr];
         const float a2 = part == 1 ? peer_anchor[rr] : st.anchor[rr];
         const float high = fmaxf(a1, a2);
-        f1[rr] = soft_exp2(a1 - high);
-        f2[rr] = soft_exp2(a2 - high);
+        f1[rr] = ::math::ptx_exp2(a1 - high);
+        f2[rr] = ::math::ptx_exp2(a2 - high);
         const float l1 = part == 1 ? sums[rr] : peer_sum[rr];
         const float l2 = part == 1 ? peer_sum[rr] : sums[rr];
         inv[rr] = st.vscale * soft_rcp(l1 * f1[rr] + l2 * f2[rr]);
@@ -396,7 +381,7 @@ __device__ __forceinline__ void store_partial(State& st, uint16_t* out, int row_
             if (row < st.S) {
                 uint32_t* dst =
                     reinterpret_cast<uint32_t*>(out) + (int64_t(row) * st.H + head) * 64 + st.t;
-                dst[4 * j] = soft_bf16x2(x[0], x[1]);
+                dst[4 * j] = comfy::pack_bf2(x[0], x[1]);
             }
         }
     }

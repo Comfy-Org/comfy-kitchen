@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include "prep_v.cuh"
+#include "../sage_attention/mma.cuh"
 
 namespace comfy_deco {
 namespace {
@@ -19,12 +20,6 @@ __device__ __forceinline__ float plus(float x, float y) { return __fadd_rn(x,y);
 __device__ __forceinline__ float minus(float x, float y) { return __fsub_rn(x,y); }
 __device__ __forceinline__ float addprod(float sum, float a, float b) { return __fmaf_rn(a,b,sum); }
 __device__ __forceinline__ float subprod(float sum, float a, float b) { return __fmaf_rn(-a,b,sum); }
-__device__ __forceinline__ float reciprocal(float x) {
-    float v; asm("rcp.approx.ftz.f32 %0,%1;":"=f"(v):"f"(x)); return v;
-}
-__device__ __forceinline__ float rsqrt_approx(float x) {
-    float v; asm("rsqrt.approx.ftz.f32 %0,%1;":"=f"(v):"f"(x)); return v;
-}
 __device__ __forceinline__ float sqrt_approx(float x) {
     float v; asm("sqrt.approx.ftz.f32 %0,%1;":"=f"(v):"f"(x)); return v;
 }
@@ -54,19 +49,6 @@ __device__ __forceinline__ float4 scale4(float4 v,float f) {
 }
 
 // The Gram fragment per warp is 16x64 from Q, then 16x64 from K.
-__device__ __forceinline__ uint4 matrix_load(const bf16* ptr) {
-    uint4 reg;
-    unsigned address=static_cast<unsigned>(__cvta_generic_to_shared(ptr));
-    asm("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3},[%4];"
-        :"=r"(reg.x),"=r"(reg.y),"=r"(reg.z),"=r"(reg.w):"r"(address));
-    return reg;
-}
-__device__ __forceinline__ void gram_mma(float* acc,uint4 a,uint32_t b0,uint32_t b1) {
-    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-        "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
-        :"+f"(acc[0]),"+f"(acc[1]),"+f"(acc[2]),"+f"(acc[3])
-        :"r"(a.x),"r"(a.y),"r"(a.z),"r"(a.w),"r"(b0),"r"(b1));
-}
 __device__ __forceinline__ void sampled_gram(PrepGeometry shape, InputView q, InputView k,
         const int* rows, char* sm, float (&a)[32]) {
     int tid=threadIdx.x, lane=tid%32, warp=tid/32, mi=warp%8, nb=(warp/8)*8;
@@ -96,12 +78,14 @@ __device__ __forceinline__ void sampled_gram(PrepGeometry shape, InputView q, In
             for (int side=0;side<2;++side) {
                 const bf16* base=stage+(48*side+16*quad)*136;
                 int oct=lane/8, r8=lane%8;
-                auto af=matrix_load(base+((oct/2)*8+r8)*136+16*mi+(oct%2)*8);
+                uint32_t af[4];
+                mma::ldmatrix_m8n8x4_trans(af, base+((oct/2)*8+r8)*136+16*mi+(oct%2)*8);
                 #pragma unroll
                 for (int blk=0;blk<4;++blk) {
-                    auto bf=matrix_load(base+((oct%2)*8+r8)*136+8*(nb+2*blk+oct/2));
-                    gram_mma(acc+32*side+8*blk,af,bf.x,bf.y);
-                    gram_mma(acc+32*side+8*blk+4,af,bf.z,bf.w);
+                    uint32_t bf[4];
+                    mma::ldmatrix_m8n8x4_trans(bf, base+((oct%2)*8+r8)*136+8*(nb+2*blk+oct/2));
+                    mma::mma_bf16(acc+32*side+8*blk, af, bf);
+                    mma::mma_bf16(acc+32*side+8*blk+4, af, bf+2);
                 }
             }
         }
@@ -189,7 +173,7 @@ __device__ __forceinline__ void tridiagonal_segment(Scratch s,float (&a)[32]) {
             float norm=sqrt_approx(sq);
             float alpha=x0>=0 ? -norm:norm;
             bool active=subprod(sq,x0,x0)>prod(sq,1e-30f);
-            float scale=active ? rsqrt_approx(subprod(sq,x0,alpha)) : 0;
+            float scale=active ? math::rsqrt(subprod(sq,x0,alpha)) : 0;
             if (!active) alpha=x0;
             if (rr==k) {
                 #pragma unroll
@@ -329,20 +313,20 @@ __device__ __forceinline__ void inverse_iteration(Scratch s,float span) {
         #pragma unroll 4
         for(int i=1;i<128;++i) {
             float e=s.e[i-1];
-            float mult=prod(e,reciprocal(piv));
+            float mult=prod(e,math::ptx_rcp(piv));
             piv=floor_pivot(subprod(minus(s.d[i],lam),mult,e));
             y=iter==0 ? subprod(z[32*i],mult,y) : __fmaf_rn(z[32*i],scale,-prod(mult,y));
             pivots[32*i]=piv; z[32*i]=y;
         }
-        float v=prod(y,reciprocal(piv));
+        float v=prod(y,math::ptx_rcp(piv));
         z[127*32]=v;
         float mx=fabsf(v);
         #pragma unroll 4
         for (int i=126;i>=0;--i) {
-            v=prod(subprod(z[32*i],s.e[i],v),reciprocal(pivots[32*i]));
+            v=prod(subprod(z[32*i],s.e[i],v),math::ptx_rcp(pivots[32*i]));
             z[32*i]=v; mx=fmaxf(mx,fabsf(v));
         }
-        scale=mx>0 ? reciprocal(mx):1;
+        scale=mx>0 ? math::ptx_rcp(mx):1;
     }
     s.scale[c]=scale;
 }
@@ -362,7 +346,7 @@ __device__ __forceinline__ void orthogonalize(Scratch s) {
         float* buf=s.column+(c%2)*128+4*lane;
         if (warp==c/2) {
             float4 v=c%2 ? b:a;
-            v=scale4(v,rsqrt_approx(fmaxf(warp_sum(dot4(v,v)),1e-30f)));
+            v=scale4(v,math::rsqrt(fmaxf(warp_sum(dot4(v,v)),1e-30f)));
             if (c%2) b=v; else a=v;
             store4(buf,v);
         }

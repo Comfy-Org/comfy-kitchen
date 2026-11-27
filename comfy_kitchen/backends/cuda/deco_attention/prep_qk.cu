@@ -4,7 +4,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include "prep_v.cuh"
-#include <cute/arch/mma_sm80.hpp>
+#include "../sage_attention/mma.cuh"
 
 namespace comfy_deco {
 namespace {
@@ -27,28 +27,6 @@ struct alignas(64) ScaleSidePlane {
 static_assert(sizeof(ScaleSidePlane) == layout::scale_side_bytes);
 
 
-__device__ __forceinline__ void mma(float (&acc)[4], const unsigned (&a)[4], uint2 b) {
-    cute::SM80_16x8x16_F32BF16BF16F32_TN::fma(
-        acc[0], acc[1], acc[2], acc[3], a[0], a[1], a[2], a[3], b.x, b.y,
-        acc[0], acc[1], acc[2], acc[3]);
-}
-
-__device__ __forceinline__ U32 pack_fp4(float a, float b, float c, float d) {
-    U32 word;
-    asm("{ .reg .b8 ab, cd; .reg .b16 lo, hi; "
-        "cvt.rn.satfinite.e2m1x2.f32 ab,%2,%1; cvt.rn.satfinite.e2m1x2.f32 cd,%4,%3; "
-        "mov.b16 lo,{ab,cd}; mov.b16 hi,0; mov.b32 %0,{lo,hi}; }"
-        : "=r"(word) : "f"(a), "f"(b), "f"(c), "f"(d));
-    return word;
-}
-
-__device__ __forceinline__ void unpack_fp4(unsigned pair, float &a, float &b) {
-    asm("{ .reg .b8 byte; .reg .b32 h; .reg .f16 lo,hi; "
-        "cvt.u8.u32 byte,%2; cvt.rn.f16x2.e2m1x2 h,byte; mov.b32 {lo,hi},h; "
-        "cvt.f32.f16 %0,lo; cvt.f32.f16 %1,hi; }"
-        : "=f"(a), "=f"(b) : "r"(pair));
-}
-
 struct Block {
     float scale;
     U32 codes;
@@ -64,7 +42,7 @@ __device__ __forceinline__ Block quantize(float a, float b, float c, float d) {
     float inv;
     asm("rcp.approx.f32 %0,%1;" : "=f"(inv) : "f"(scale));
     if (scale <= 1e-30f) inv = 0;
-    return {scale, pack_fp4(a * inv, b * inv, c * inv, d * inv)};
+    return {scale, comfy::pack_fp4x4<false>(a * inv, b * inv, c * inv, d * inv)};
 }
 
 struct alignas(16) WarpStage {
@@ -174,7 +152,8 @@ __device__ __forceinline__ void transform(const uint2 (&rows)[8][2],
         for (int n = 0; n < 2; ++n) {
             #pragma unroll
             for (int e = 0; e < 4; ++e) y[a][n][e] = 0;
-            mma(y[a][n], operand, rotation[a][n]);
+            const uint32_t b[] = {rotation[a][n].x, rotation[a][n].y};
+            mma::mma_bf16(y[a][n], operand, b);
         }
     }
     // The canonical DeCo rotation is diag(signs) times H8 (x) H16.
@@ -213,20 +192,19 @@ __device__ __forceinline__ void encode_item(float (&y)[8][2][4], bool key,
             Block x = quantize(a, b, c, d);
             stage_block(stage, bo, g + 8*r, t, x);
             groups[0] = fmaxf(groups[0], x.scale);
-            float da, db, dc, dd;
-            unpack_fp4(x.codes, da, db);
-            unpack_fp4(x.codes >> 8, dc, dd);
-            da *= x.scale; db *= x.scale; dc *= x.scale; dd *= x.scale;
-            aq[r] = round_bf16(da, db); aq[2+r] = round_bf16(dc, dd);
-            ad[r] = round_bf16(a-da, b-db); ad[2+r] = round_bf16(c-dc, d-dd);
+            const auto ab = __half22float2(__nv_cvt_fp4x2_to_halfraw2(uint8_t(x.codes), __NV_E2M1));
+            const auto cd = __half22float2(__nv_cvt_fp4x2_to_halfraw2(uint8_t(x.codes >> 8), __NV_E2M1));
+            const float da = ab.x * x.scale, db = ab.y * x.scale;
+            const float dc = cd.x * x.scale, dd = cd.y * x.scale;
+            aq[r] = comfy::pack_bf2(da, db); aq[2+r] = comfy::pack_bf2(dc, dd);
+            ad[r] = comfy::pack_bf2(a-da, b-db); ad[2+r] = comfy::pack_bf2(c-dc, d-dd);
         }
         #pragma unroll
         for (int n = 0; n < 4; ++n) {
             const U16 *ub = &basis[8*n+g][16*bo+2*t];
-            const uint2 frag = make_uint2(*reinterpret_cast<const U32*>(ub),
-                                         *reinterpret_cast<const U32*>(ub+8));
-            mma(body[n], aq, frag);
-            mma(residual[n], ad, frag);
+            const U32 frag[] = {*reinterpret_cast<const U32*>(ub), *reinterpret_cast<const U32*>(ub+8)};
+            mma::mma_bf16(body[n], aq, frag);
+            mma::mma_bf16(residual[n], ad, frag);
         }
     }
     #pragma unroll
@@ -301,9 +279,7 @@ __device__ __forceinline__ void process_head(PrepGeometry shape, InputView src, 
     }
     #pragma unroll
     for (int j=0;j<3;++j) {
-        float v=groups[j];
-        #pragma unroll
-        for (int gap=16;gap;gap/=2) v=fmaxf(v,__shfl_xor_sync(~0u,v,gap));
+        const float v = comfy::warp_reduce_fmax(groups[j]);
         if (lane==0) red[warp][j]=v;
     }
     __syncthreads();
@@ -342,11 +318,7 @@ __device__ __forceinline__ U32 pack_e4m3(U32 a, U32 b, float db, float dc) {
     float x1 = __uint_as_float(a & 0xffff0000u) * db;
     float x2 = __uint_as_float(b << 16) * dc;
     float x3 = __uint_as_float(b & 0xffff0000u) * dc;
-    U32 packed;
-    asm("{ .reg .b16 lo,hi; cvt.rn.satfinite.e4m3x2.f32 lo,%2,%1;"
-        "cvt.rn.satfinite.e4m3x2.f32 hi,%4,%3; mov.b32 %0,{lo,hi}; }"
-        : "=r"(packed):"f"(x0),"f"(x1),"f"(x2),"f"(x3));
-    return packed;
+    return __nv_fp8x4_e4m3(make_float4(x0, x1, x2, x3)).__x;
 }
 
 __device__ __forceinline__ U32 common_upper_bytes(U32 middle) {

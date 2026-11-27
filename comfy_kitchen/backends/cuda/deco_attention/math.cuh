@@ -5,29 +5,17 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include "layout.h"
-#include <type_traits>
+#include <cute/algorithm/tuple_algorithms.hpp>
+#include <cute/container/array_aligned.hpp>
+#include <cutlass/arch/memory.h>
 #include <cute/arch/copy_sm75.hpp>
 #include <cute/arch/mma_sm80.hpp>
 
 namespace comfy_deco::detail {
+
+using Fragment = cute::array_aligned<uint32_t, 4>;
+
 namespace packed_fp4 {
-
-template <int I, int N, typename F>
-__device__ __forceinline__ void unroll(F const& fn) {
-    if constexpr (I < N) {
-        fn(std::integral_constant<int, I>{});
-        unroll<I + 1, N>(fn);
-    }
-}
-
-template <int I>
-__device__ __forceinline__ uint32_t word(uint4 v) {
-    static_assert(I >= 0 && I < 4);
-    if constexpr (I == 0) return v.x;
-    if constexpr (I == 1) return v.y;
-    if constexpr (I == 2) return v.z;
-    return v.w;
-}
 
 __device__ __forceinline__ uint32_t global_u32(uintptr_t address, bool valid) {
     uint32_t out;
@@ -37,27 +25,19 @@ __device__ __forceinline__ uint32_t global_u32(uintptr_t address, bool valid) {
     return out;
 }
 
-__device__ __forceinline__ uint4 shared_u128(unsigned address) {
-    uint4 r;
-    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3},[%4];"
-                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w)
-                 : "r"(address));
-    return r;
-}
-
 template <bool Transposed = false>
-__device__ __forceinline__ uint4 load_matrix(unsigned address) {
+__device__ __forceinline__ Fragment load_matrix(unsigned address) {
     auto const& src = *reinterpret_cast<cute::uint128_t const*>(__cvta_shared_to_generic(address));
-    uint4 r;
+    Fragment r;
     if constexpr (Transposed)
-        cute::SM75_U16x8_LDSM_T::copy(src, r.x, r.y, r.z, r.w);
+        cute::SM75_U16x8_LDSM_T::copy(src, r[0], r[1], r[2], r[3]);
     else
-        cute::SM75_U32x4_LDSM_N::copy(src, r.x, r.y, r.z, r.w);
+        cute::SM75_U32x4_LDSM_N::copy(src, r[0], r[1], r[2], r[3]);
     return r;
 }
 
 // The packed scale selectors are (0,0) for A and (0,ThreadIdB) for B.
-// The four B selectors consume a single four-lane-distributed block scale.
+// CuTe fixes the B thread selector to zero. Here all four lanes supply scales.
 template <int ThreadIdB>
 __device__ __forceinline__ void mma(float* c, const uint32_t* a, uint32_t b0, uint32_t b1, uint32_t sfa,
                                     uint32_t sfb) {
@@ -106,27 +86,20 @@ __device__ __forceinline__ void load_query(State& s, const void* q, const void* 
 }
 
 template <class State>
-__device__ __forceinline__ void preload_q(State const& s, unsigned tile, uint4 (&early)[4]) {
+__device__ __forceinline__ void preload(State const& s, unsigned tile, Fragment (&early)[4]) {
 #pragma unroll
     for (int jp = 0; jp < 4; ++jp)
         early[jp] = packed_fp4::load_matrix(tile + s.ldsm_off + 256 * jp);
 }
 
-template <class State>
-__device__ __forceinline__ void preload_v(State const& s, unsigned tile, uint4 (&early)[4]) {
-#pragma unroll
-    for (int jp = 0; jp < 4; ++jp)
-        early[jp] = packed_fp4::load_matrix(tile + layout::value_offset + s.ldsm_off + 256 * jp);
-}
-
 template <bool Masked, class State>
 __device__ __forceinline__ void qk(State const& s, unsigned tile, float (&score)[16][4], int valid_keys,
-                                   const uint4 (&early)[4]) {
+                                   const Fragment (&early)[4]) {
     using namespace packed_fp4;
-    uint4 kw[3];
+    Fragment kw[3];
 #pragma unroll
     for (int a = 0; a < 3; ++a)
-        kw[a] = shared_u128(tile + s.ksf_lane + layout::scale_fragment_bytes * a);
+        cutlass::arch::shared_load<16>(&kw[a], tile + s.ksf_lane + layout::scale_fragment_bytes * a);
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
 #pragma unroll
@@ -134,19 +107,17 @@ __device__ __forceinline__ void qk(State const& s, unsigned tile, float (&score)
             score[j][e] = 0.f;
     }
 
-    unroll<0, 3>([&](auto kk) {
-        constexpr int k = decltype(kk)::value;
-        unroll<0, 8>([&](auto ii) {
-            constexpr int i = decltype(ii)::value;
-            uint4 b;
+    cute::for_each(cute::make_seq<3>{}, [&](auto k) {
+        cute::for_each(cute::make_seq<8>{}, [&](auto i) {
+            Fragment b;
             if constexpr (k == 0 && i < 4)
                 b = early[i];
             else
                 b = load_matrix(tile + k * layout::fragment_bytes + i * 256 + s.ldsm_off);
             constexpr int j = 2 * i;
             constexpr int scale = 2 * (j >> 3) + ((j >> 2) & 1);
-            mma<j % 4>(score[j], s.qa[k], b.x, b.y, s.qsf[k], word<scale>(kw[k]));
-            mma<(j + 1) % 4>(score[j + 1], s.qa[k], b.z, b.w, s.qsf[k], word<scale>(kw[k]));
+            mma<j % 4>(score[j], s.qa[k], b[0], b[1], s.qsf[k], kw[k][scale]);
+            mma<(j + 1) % 4>(score[j + 1], s.qa[k], b[2], b[3], s.qsf[k], kw[k][scale]);
         });
     });
 
@@ -163,15 +134,15 @@ __device__ __forceinline__ void qk(State const& s, unsigned tile, float (&score)
 }
 
 template <class State>
-__device__ __forceinline__ void pv(State& s, unsigned tile, const uint4 (&early)[4]) {
+__device__ __forceinline__ void pv(State& s, unsigned tile, const Fragment (&early)[4]) {
     using namespace packed_fp4;
-    uint4 vs[2] = {shared_u128(tile + s.vsf_lane),
-                   shared_u128(tile + s.vsf_lane + layout::scale_fragment_bytes)};
-    unroll<0, 2>([&](auto kk) {
-        constexpr int k = decltype(kk)::value;
-        unroll<0, 8>([&](auto ii) {
-            constexpr int i = decltype(ii)::value;
-            uint4 b;
+    Fragment vs[2];
+#pragma unroll
+    for (int k = 0; k < 2; ++k)
+        cutlass::arch::shared_load<16>(&vs[k], tile + s.vsf_lane + k * layout::scale_fragment_bytes);
+    cute::for_each(cute::make_seq<2>{}, [&](auto k) {
+        cute::for_each(cute::make_seq<8>{}, [&](auto i) {
+            Fragment b;
             if constexpr (k == 0 && i < 4)
                 b = early[i];
             else
@@ -179,9 +150,9 @@ __device__ __forceinline__ void pv(State& s, unsigned tile, const uint4 (&early)
                                 s.ldsm_off);
             constexpr int j = 2 * i;
             constexpr int group = j >> 2;
-            const uint32_t scale = word<2 * (group & 1) + k>(vs[group >> 1]);
-            mma<j % 4>(s.O + 4 * j, s.Pst + 4 * k, b.x, b.y, s.Pst[8 + k], scale);
-            mma<(j + 1) % 4>(s.O + 4 * (j + 1), s.Pst + 4 * k, b.z, b.w, s.Pst[8 + k], scale);
+            const uint32_t scale = vs[group >> 1][2 * (group & 1) + k];
+            mma<j % 4>(s.O + 4 * j, s.Pst + 4 * k, b[0], b[1], s.Pst[8 + k], scale);
+            mma<(j + 1) % 4>(s.O + 4 * (j + 1), s.Pst + 4 * k, b[2], b[3], s.Pst[8 + k], scale);
         });
     });
 }
@@ -189,14 +160,12 @@ __device__ __forceinline__ void pv(State& s, unsigned tile, const uint4 (&early)
 template <class State>
 __device__ __forceinline__ void means(State& s, unsigned mean_tile, uint32_t hi0, uint32_t hi1) {
     using namespace packed_fp4;
-    unroll<0, 8>([&](auto ii) {
-        constexpr int i = decltype(ii)::value;
-        const uint4 b = load_matrix<true>(mean_tile + s.vm_lane + (((2 * i + s.vm_mh) ^ s.vm_pb) << 4));
-        unroll<0, 2>([&](auto ee) {
-            constexpr int e = decltype(ee)::value;
+    cute::for_each(cute::make_seq<8>{}, [&](auto i) {
+        const Fragment b = load_matrix<true>(mean_tile + s.vm_lane + (((2 * i + s.vm_mh) ^ s.vm_pb) << 4));
+        cute::for_each(cute::make_seq<2>{}, [&](auto e) {
             float* c = s.O + 4 * (2 * i + e);
             cute::SM80_16x8x16_F32BF16BF16F32_TN::fma(c[0], c[1], c[2], c[3], s.Mlo[0], s.Mlo[1], hi0,
-                                                      hi1, word<2 * e>(b), word<2 * e + 1>(b), c[0],
+                                                      hi1, b[2 * e], b[2 * e + 1], c[0],
                                                       c[1], c[2], c[3]);
         });
     });

@@ -218,21 +218,15 @@ endif()
 
 target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_cuda_kernels>)
 
-# ConvRot and DeCo both need the exact images supported by this NVCC.
+# Expand requested families to the architecture-specific images NVCC supports.
 if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1" OR COMFY_CUDA_ARCHS MATCHES "(^|;)12[01][af]?(-real)?(;|$)")
     execute_process(COMMAND "${CMAKE_CUDA_COMPILER}" --list-gpu-code
-        OUTPUT_VARIABLE comfy_gpu_codes RESULT_VARIABLE comfy_gpu_list_status)
-    if(NOT comfy_gpu_list_status EQUAL 0)
+        OUTPUT_VARIABLE gpu_codes RESULT_VARIABLE list_status)
+    if(NOT list_status EQUAL 0)
         message(FATAL_ERROR "Cannot query NVCC architecture support")
     endif()
-endif()
-
-# The packed converter requires architecture-specific images.
-if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1")
-    string(REGEX MATCHALL "sm_[0-9]+" convrot_family_archs "${comfy_gpu_codes}")
-    list(TRANSFORM convrot_family_archs REPLACE "^sm_" "")
-    list(TRANSFORM convrot_family_archs APPEND "a-real")
-    set(COMFY_CONVROT_ARCHS "")
+    string(REGEX MATCHALL "sm_[0-9]+" supported_images "${gpu_codes}")
+    list(TRANSFORM supported_images REPLACE "^sm_([0-9]+)$" "\\1a-real")
     foreach(arch IN LISTS COMFY_CUDA_ARCHS)
         if(NOT arch MATCHES "^([0-9]+)")
             continue()
@@ -240,18 +234,29 @@ if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1")
         set(cc "${CMAKE_MATCH_1}")
         if(arch MATCHES "f(-real)?$")
             string(REGEX REPLACE "[0-9]$" "" family "${cc}")
-            set(targets ${convrot_family_archs})
-            list(FILTER targets INCLUDE REGEX "^${family}[0-9]a-real$")
-            list(APPEND COMFY_CONVROT_ARCHS ${targets})
+            set(images ${supported_images})
+            list(FILTER images INCLUDE REGEX "^${family}[0-9]a-real$")
         elseif(cc GREATER_EQUAL 90)
-            list(APPEND COMFY_CONVROT_ARCHS "${cc}a-real")
+            set(images "${cc}a-real")
         elseif(cc GREATER_EQUAL 80)
-            list(APPEND COMFY_CONVROT_ARCHS "${cc}-real")
+            set(images "${cc}-real")
+        else()
+            continue()
+        endif()
+        list(APPEND COMFY_CONVROT_ARCHS ${images})
+        if(NOT arch MATCHES "-virtual$")
+            foreach(image IN LISTS images)
+                if(image IN_LIST supported_images AND image MATCHES "^(12[01])a-real$")
+                    if(CMAKE_MATCH_1 GREATER_EQUAL cc)
+                        list(APPEND deco_archs "${image}")
+                    endif()
+                endif()
+            endforeach()
         endif()
     endforeach()
     list(REMOVE_DUPLICATES COMFY_CONVROT_ARCHS)
-    message(STATUS "ConvRot fast architectures: ${COMFY_CONVROT_ARCHS}")
-    if(COMFY_CONVROT_ARCHS)
+    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1" AND COMFY_CONVROT_ARCHS)
+        message(STATUS "ConvRot fast architectures: ${COMFY_CONVROT_ARCHS}")
         set(COMFY_CONVROT_CCS ${COMFY_CONVROT_ARCHS})
         list(TRANSFORM COMFY_CONVROT_CCS REPLACE "[^0-9]" "")
         list(JOIN COMFY_CONVROT_CCS "\\," COMFY_CONVROT_CCS)
@@ -268,40 +273,11 @@ if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1")
     endif()
 endif()
 
-# 120f includes SM120 and newer members of its family. Each DeCo cubin
-# uses architecture-specific MMA, so advertise only images compiled here.
-set(deco_archs "")
-set(deco_ccs "")
-foreach(cc IN ITEMS 120 121)
-    if(COMFY_CUDA_ARCHS MATCHES "(^|;)(${cc}[af]?|120f)(-real)?(;|$)" AND
-       comfy_gpu_codes MATCHES "sm_${cc}([^0-9]|$)")
-        list(APPEND deco_archs "${cc}a-real")
-        list(APPEND deco_ccs "${cc}")
-    endif()
-endforeach()
-
 if(deco_archs AND EXISTS "${COMFY_CUTLASS_DIR}/cutlass/version.h")
-    set(deco_dir "${CMAKE_CURRENT_SOURCE_DIR}/deco_attention")
+    list(REMOVE_DUPLICATES deco_archs)
     add_library(comfy_deco_attention OBJECT
-        deco_attention/prep_basis.cu
-        deco_attention/prep_qk.cu
-        deco_attention/prep_tags.cu
-    )
-    # One translation unit per geometry keeps NVCC peak memory bounded and
-    # lets incremental and parallel builds reuse the same cached objects.
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${deco_dir}/core_shapes.inc")
-    file(STRINGS "${deco_dir}/core_shapes.inc" shapes REGEX "^DECO_SHAPE")
-    foreach(shape IN LISTS shapes)
-        if(NOT shape MATCHES "^DECO_SHAPE[(]([0-9]+), *([0-9]+)[)]$")
-            message(FATAL_ERROR "Malformed DeCo attention shape: ${shape}")
-        endif()
-        set(DECO_SEQUENCE "${CMAKE_MATCH_1}")
-        set(DECO_HEADS "${CMAKE_MATCH_2}")
-        set(unit "${CMAKE_CURRENT_BINARY_DIR}/deco_attention/core_${DECO_SEQUENCE}_${DECO_HEADS}.cu")
-        configure_file("${deco_dir}/core_shape.cu.in" "${unit}" @ONLY)
-        target_sources(comfy_deco_attention PRIVATE "${unit}")
-    endforeach()
-
+        deco_attention/core.cu deco_attention/prep_basis.cu
+        deco_attention/prep_qk.cu deco_attention/prep_tags.cu)
     set_target_properties(comfy_deco_attention PROPERTIES CUDA_ARCHITECTURES "${deco_archs}"
         CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
     # The softmax encoding uses subnormals and preprocessing relies on RN arithmetic.
@@ -309,7 +285,8 @@ if(deco_archs AND EXISTS "${COMFY_CUTLASS_DIR}/cutlass/version.h")
     list(REMOVE_ITEM deco_flags --use_fast_math)
     target_compile_options(comfy_deco_attention PRIVATE ${deco_flags})
     target_include_directories(comfy_deco_attention PRIVATE
-        "${deco_dir}" "${COMFY_CUTLASS_DIR}" ${CUDAToolkit_INCLUDE_DIRS})
+        "${COMFY_CUTLASS_DIR}" ${CUDAToolkit_INCLUDE_DIRS})
+    list(TRANSFORM deco_archs REPLACE "a-real$" "" OUTPUT_VARIABLE deco_ccs)
     list(JOIN deco_ccs "," deco_ccs)
     target_compile_definitions(_C PRIVATE "COMFY_DECO_CCS=${deco_ccs}")
     target_sources(_C PRIVATE deco_attention_bindings.cpp $<TARGET_OBJECTS:comfy_deco_attention>)

@@ -5,16 +5,13 @@
 
 #pragma once
 #include "prep_internal.cuh"
+#include "../float_utils.cuh"
+#include "../sage_attention/math.cuh"
 
 namespace comfy_deco::v_pack {
 
 __device__ __forceinline__ float low_bf16(uint32_t word) { return __uint_as_float(word << 16); }
 __device__ __forceinline__ float high_bf16(uint32_t word) { return __uint_as_float(word & 0xffff0000u); }
-__device__ __forceinline__ float reciprocal(float x) {
-    float y;
-    asm("rcp.approx.ftz.f32 %0,%1;" : "=f"(y) : "f"(x));
-    return y;
-}
 __device__ __forceinline__ void accumulate(float &lo, float &hi, uint32_t x) {
     const float a = low_bf16(x), b = high_bf16(x);
     asm("{ .reg .b64 v,w; mov.b64 v,{%0,%1}; mov.b64 w,{%2,%3}; "
@@ -30,33 +27,16 @@ __device__ __forceinline__ unsigned warp_max(float value) {
 }
 constexpr int slots_per_sm = 4;
 
-__device__ __forceinline__ unsigned char encode_scale(float sf,float &decoded) {
-    uint16_t step;
-    const float zero = 0;
-    asm("cvt.rn.satfinite.e4m3x2.f32 %0,%2,%1;" : "=h"(step) : "f"(sf), "f"(zero));
-    asm("{ .reg .b32 h; .reg .f16 l,u; cvt.rn.f16x2.e4m3x2 h,%1; "
-        "mov.b32 {l,u},h; cvt.f32.f16 %0,l; }" : "=f"(decoded) : "h"(step));
-    return static_cast<unsigned char>(step);
-}
-
-__device__ __forceinline__ uint32_t encode_eight(const float (&x)[8]) {
-    uint32_t u;
-    asm("{ .reg .b8 a,b,c,d; cvt.rn.satfinite.e2m1x2.f32 a,%2,%1; "
-        "cvt.rn.satfinite.e2m1x2.f32 b,%4,%3; cvt.rn.satfinite.e2m1x2.f32 c,%6,%5; "
-        "cvt.rn.satfinite.e2m1x2.f32 d,%8,%7; mov.b32 %0,{a,b,c,d}; }"
-        : "=r"(u) : "f"(x[0]),"f"(x[1]),"f"(x[2]),"f"(x[3]),"f"(x[4]),"f"(x[5]),"f"(x[6]),"f"(x[7]));
-    return u;
-}
-
 __device__ __forceinline__ float tensor_scale(float maximum) {
     const float required=fmaxf(1.e-30f,__fdiv_rn(maximum,2688.f));
     return __uint_as_float((__float_as_uint(required)+0x7fffffu)&0x7f800000u);
 }
 
 __device__ __forceinline__ float quantization_multiplier(float dev, float inv, unsigned char& code) {
-    float sf;
-    code = encode_scale(__fdiv_rn(dev*inv,6.0f),sf);
-    return (sf>0.f ? reciprocal(sf) : 1.0f)*inv;
+    const __nv_fp8_e4m3 encoded(__fdiv_rn(dev*inv,6.0f));
+    code = encoded.__x;
+    const float sf = float(encoded);
+    return (sf>0.f ? math::ptx_rcp(sf) : 1.0f)*inv;
 }
 __device__ __forceinline__ unsigned char* mean_address(unsigned char* dest, int tile, int tiles, int group, int ch) {
     // Adjacent even/odd tiles share the next odd tile's 4 KiB mean region.
@@ -83,8 +63,9 @@ __device__ __forceinline__ uint2 pack16(const uint32_t(&vals)[16], float m,float
             float v=High ? high_bf16(vals[row]) : low_bf16(vals[row]);
             x[k]=(!Tail || row<count) ? (v-m)*mul : 0.f;
         }
-        if (side == 0) packed.x = encode_eight(x);
-        else packed.y = encode_eight(x);
+        const uint32_t lo = comfy::pack_fp4x4<false>(x[0], x[1], x[2], x[3]);
+        const uint32_t hi = comfy::pack_fp4x4<false>(x[4], x[5], x[6], x[7]);
+        (side == 0 ? packed.x : packed.y) = lo | (hi << 16);
     }
     return packed;
 }
@@ -122,7 +103,7 @@ __device__ __forceinline__ float pack_warp_group(PrepGeometry shape, InputView v
     const float divisor = float(max(count, 1));
     #pragma unroll
     for(int p=0;p<2;++p) {
-        uint32_t bf=round_bf16(__fdiv_rn(sums[2*p], divisor), __fdiv_rn(sums[2*p+1], divisor));
+        uint32_t bf=comfy::pack_bf2(__fdiv_rn(sums[2*p], divisor), __fdiv_rn(sums[2*p+1], divisor));
         float m0=low_bf16(bf), m1=high_bf16(bf);
         mean[2*p]=m0;
         mean[2*p+1]=m1;
@@ -145,14 +126,14 @@ __device__ __forceinline__ float pack_warp_group(PrepGeometry shape, InputView v
         const bool use_headroom = exact > minimum && isfinite(exact) && exact <= 0x1p126f;
         const float scale = use_headroom ? 2.f * exact : exact;
         if (lane==0) chosen[unit*8+group]=scale;
-        inv=reciprocal(scale);
+        inv=math::ptx_rcp(scale);
     }
     auto* dst=img+size_t(unit)*layout::tile_bytes;
     uint2 scaled;
     #pragma unroll
     for (int p=0;p<2;++p) {
         const float m0=mean[2*p],m1=mean[2*p+1];
-        (p ? scaled.y : scaled.x)=round_bf16(m0*inv,m1*inv);
+        (p ? scaled.y : scaled.x)=comfy::pack_bf2(m0*inv,m1*inv);
         unsigned char sf0,sf1;
         float a=quantization_multiplier(dev[2*p],inv,sf0);
         float b=quantization_multiplier(dev[2*p+1],inv,sf1);
@@ -209,11 +190,9 @@ __device__ __forceinline__ void prepack_cta(PrepGeometry shape, InputView v, Pre
     }
 }
 __device__ __forceinline__ float decode_positive_e4m3(unsigned code) {
-    float result;
-    unsigned short packed=static_cast<unsigned short>(code);
-    asm("{ .reg .b32 h; .reg .f16 a,b; cvt.rn.f16x2.e4m3x2 h,%1; "
-        "mov.b32 {a,b},h; cvt.f32.f16 %0,a; }" : "=f"(result) : "h"(packed));
-    return result;
+    __nv_fp8_e4m3 value;
+    value.__x = static_cast<uint8_t>(code);
+    return float(value);
 }
 
 // All accepted paths derive the final packed fields from the first-pass
@@ -223,7 +202,7 @@ __device__ __forceinline__ bool renormalize_lane(unsigned char* img,int unit,int
                                                  float local,float global) {
     const int ch=(threadIdx.x&31)*4;
     unsigned char* tile=img+size_t(unit)*layout::tile_bytes;
-    float local_inv=reciprocal(local), global_inv=reciprocal(global);
+    float local_inv=math::ptx_rcp(local), global_inv=math::ptx_rcp(global);
     if (!(local_inv>0.f && isfinite(local_inv) && global_inv>0.f && isfinite(global_inv))) return false;
     const int shift=int(__float_as_uint(global)>>23)-int(__float_as_uint(local)>>23);
     if (shift<=0) return false;
@@ -248,8 +227,8 @@ __device__ __forceinline__ bool renormalize_lane(unsigned char* img,int unit,int
         if(old_exp-shift>=2) {
             // Both RNE cells and their neighbors stay in the E4M3 normal range.
             sf[j]=static_cast<unsigned char>(code-8*shift);
-            float old_a=reciprocal(decode_positive_e4m3(code))*local_inv;
-            float new_a=reciprocal(decode_positive_e4m3(sf[j]))*global_inv;
+            float old_a=math::ptx_rcp(decode_positive_e4m3(code))*local_inv;
+            float new_a=math::ptx_rcp(decode_positive_e4m3(sf[j]))*global_inv;
             if (!(isfinite(old_a) && __float_as_uint(old_a)==__float_as_uint(new_a))) return false;
             zero[j]=false;
         } else {
@@ -257,14 +236,14 @@ __device__ __forceinline__ bool renormalize_lane(unsigned char* img,int unit,int
             // Use margin below the subnormal midpoint. The centered values
             // also fall well below 0.25, the first FP4 rounding midpoint.
             if (!(decode_positive_e4m3(code+1)*ratio < 0x1p-12f)) return false;
-            float old_a=code ? reciprocal(decode_positive_e4m3(code))*local_inv : local_inv;
+            float old_a=code ? math::ptx_rcp(decode_positive_e4m3(code))*local_inv : local_inv;
             if (!(isfinite(old_a) && old_a>0.f)) return false;
             sf[j]=0;
             zero[j]=code!=0;
         }
     }
-    *means=make_uint2(round_bf16(result_mean[0],result_mean[1]),
-                      round_bf16(result_mean[2],result_mean[3]));
+    *means=make_uint2(comfy::pack_bf2(result_mean[0],result_mean[1]),
+                      comfy::pack_bf2(result_mean[2],result_mean[3]));
     #pragma unroll
     for(int j=0;j<4;++j) {
         tile[layout::value_scale_offset+scale_offset(ch+j,group)]=sf[j];
@@ -283,7 +262,7 @@ __device__ __forceinline__ void finish_grouped_tile(PrepGeometry shape, InputVie
     float global=*scale;
     float local=chosen[unit*8+group];
     if (local==global || renormalize_lane(img,unit,shape.tiles,group,local,global)) return;
-    float inv=reciprocal(global);
+    float inv=math::ptx_rcp(global);
     if(unit%shape.tiles==shape.tiles-1) pack_warp_group<true,false>(shape,v,img,nullptr,unit,inv,nullptr);
     else pack_warp_group<false,false>(shape,v,img,nullptr,unit,inv,nullptr);
 }
