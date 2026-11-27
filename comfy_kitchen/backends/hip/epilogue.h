@@ -4,6 +4,12 @@
 // GEMM epilogues. Each holds device pointers only and is passed to the tile
 // kernel by value. init() runs once per thread before the writeback loop, so
 // scalar scales are loaded once rather than per output element.
+//
+// The row_scale / col_scale / col_bias accessors and the six-argument
+// operator() let the gfx1103 int8 writeback hoist its loads: the stores go
+// through OutT*, so the compiler must assume aliasing and re-issue every load
+// in the loop. The three-argument form keeps the mainline spelling for every
+// other kernel.
 #pragma once
 
 #include <hip/hip_fp16.h>
@@ -42,9 +48,22 @@ struct EpiTensorwise {
 
     __forceinline__ __device__ void init() { alpha = scale_a[0] * scale_b[0]; }
 
+    __forceinline__ __device__ float row_scale(int) const { return alpha; }
+    __forceinline__ __device__ float col_scale(int) const { return 1.0f; }
+    __forceinline__ __device__ float col_bias(int col) const {
+        return bias ? load_scalar(bias, bias_code, col) : 0.0f;
+    }
+
     __forceinline__ __device__ float operator()(int, int col, float acc) const {
         float v = acc * alpha;
         if (bias) v += load_scalar(bias, bias_code, col);
+        return v;
+    }
+
+    __forceinline__ __device__ float operator()(int, int, float acc, float rs, float cs,
+                                                float cb) const {
+        float v = acc * rs * cs;
+        if (bias) v += cb;
         return v;
     }
 };
@@ -60,9 +79,27 @@ struct EpiRowwise {
 
     __forceinline__ __device__ void init() {}
 
+    __forceinline__ __device__ float row_scale(int row) const { return scale_a[row]; }
+    __forceinline__ __device__ float col_scale(int col) const {
+        return scale_b[col * scale_b_stride];
+    }
+    __forceinline__ __device__ float col_bias(int col) const {
+        return bias ? load_scalar(bias, bias_code, col) : 0.0f;
+    }
+
     __forceinline__ __device__ float operator()(int row, int col, float acc) const {
         float v = acc * scale_a[row] * scale_b[col * scale_b_stride];
         if (bias) v += load_scalar(bias, bias_code, col);
+        return v;
+    }
+
+    // Not bit-identical to the three-argument form under -ffast-math: hoisting
+    // changes which multiply clang pairs first. Both are at the output dtype's
+    // rounding floor, and this form is used only on the gfx1103 device pass.
+    __forceinline__ __device__ float operator()(int, int, float acc, float rs, float cs,
+                                                float cb) const {
+        float v = acc * rs * cs;
+        if (bias) v += cb;
         return v;
     }
 };
@@ -76,8 +113,17 @@ struct EpiRowwiseNoBias {
 
     __forceinline__ __device__ void init() {}
 
+    __forceinline__ __device__ float row_scale(int row) const { return scale_a[row]; }
+    __forceinline__ __device__ float col_scale(int col) const { return scale_b[col]; }
+    __forceinline__ __device__ float col_bias(int) const { return 0.0f; }
+
     __forceinline__ __device__ float operator()(int row, int col, float acc) const {
         return acc * scale_a[row] * scale_b[col];
+    }
+
+    __forceinline__ __device__ float operator()(int, int, float acc, float rs, float cs,
+                                                float) const {
+        return acc * rs * cs;
     }
 };
 
@@ -92,12 +138,31 @@ struct EpiFp16 {
 
     __forceinline__ __device__ void init() {}
 
+    __forceinline__ __device__ float row_scale(int) const { return 1.0f; }
+    __forceinline__ __device__ float col_scale(int col) const {
+        return rscale ? __half2float(rscale[col]) : 1.0f;
+    }
+    __forceinline__ __device__ float col_bias(int col) const {
+        return bias ? __half2float(bias[col]) : 0.0f;
+    }
+
     __forceinline__ __device__ float operator()(int row, int col, float acc) const {
         float v = acc;
         if (bias) v += __half2float(bias[col]);
         if (resid) {
             v = __half2float(resid[static_cast<int64_t>(row) * resid_stride + col]) +
                 (rscale ? __half2float(rscale[col]) * v : v);
+        }
+        return v;
+    }
+
+    __forceinline__ __device__ float operator()(int row, int col, float acc, float rs, float cs,
+                                                float cb) const {
+        float v = acc * rs;
+        if (bias) v += cb;
+        if (resid) {
+            v = __half2float(resid[static_cast<int64_t>(row) * resid_stride + col]) +
+                (rscale ? cs * v : v);
         }
         return v;
     }

@@ -99,7 +99,13 @@ class TestGroupNormSiluPad3d:
         if not cuda_available:
             pytest.skip("CUDA required")
         x = torch.randn(1, 64, 3, 8, 8, dtype=torch.float16, device="cuda")
-        for backend in ("cuda", "eager"):
+        # The compiled extension is "cuda" on a CUDA build and "hip" on ROCm,
+        # where PyTorch still reports the device as "cuda". Ask the registry
+        # which of them is present instead of naming one.
+        compiled = [name for name in ("cuda", "hip")
+                    if ck.list_backends().get(name, {}).get("available", False)]
+        assert compiled, "no compiled backend available"
+        for backend in [*compiled, "eager"]:
             for kwargs in ({}, {"out": torch.empty_like(x)}):
                 with ck.use_backend(backend), pytest.raises(ValueError, match="non-negative"):
                     ck.group_norm_silu_pad3d(x, None, None, 1, 0.0, (0, 0, 0, 0, -1), silu=False, **kwargs)
@@ -248,6 +254,26 @@ class TestOutParameter:
         buf = torch.full((1, 128, 5, 42, 58), 7.0, dtype=torch.float16, device="cuda").contiguous(memory_format=CL3D)
         ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), True, zero_pad=True, out=buf[:, :, 2:])
         assert torch.equal(buf[:, :, 2:], ref) and bool((buf[:, :, :2] == 7.0).all())
+
+    @pytest.mark.parametrize("c,t,h,w", [(128, 3, 40, 56), (96, 2, 33, 17), (192, 1, 9, 9)])
+    def test_ncdhw_out_matches_the_channels_last_result(self, c, t, h, w, seed, cuda_available):
+        """An NCDHW out gets the same values as the channels_last one.
+
+        The kernel writes channels_last, so the NCDHW out is filled by the
+        backend's own transpose: a plain copy into an NCDHW destination is the
+        scattered-write direction and runs at 2.3 GB/s on this part. The shapes
+        cover the transpose's tails: a pixel count that is not a multiple of its
+        tile, a channel count that is not a multiple of its tile, and both.
+        """
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        x, weight, bias = _inputs(c, t, h, w, torch.float16)
+        ref = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), silu=True, zero_pad=True)
+        out = torch.empty(ref.shape, dtype=ref.dtype, device=ref.device)
+        got = ck.group_norm_silu_pad3d(x, weight, bias, 32, 1e-6, (1, 1, 1, 1, 0), silu=True,
+                                       zero_pad=True, out=out)
+        assert got.data_ptr() == out.data_ptr()
+        assert torch.equal(out, ref)
 
     def test_wrong_shape_is_rejected(self, cuda_available):
         if not cuda_available:

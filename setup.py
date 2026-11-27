@@ -139,6 +139,11 @@ class CMakeBuildExt(build_ext):
         cuda_archs = self.cuda_archs
         enable_lineinfo = self.lineinfo
 
+        # CMake itself does not read the ROCm root from an argument alone, so
+        # backends that pull in torch's Caffe2 LoadHIP.cmake are handed it through
+        # the environment as well. See the ROCM_PATH note below.
+        cmake_env = os.environ.copy()
+
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={cmake_path(ext_dir)}",
             f"-DCMAKE_BUILD_TYPE={config}",
@@ -183,6 +188,19 @@ class CMakeBuildExt(build_ext):
                 rocm_posix = pathlib.Path(rocm_home).as_posix()
                 cmake_args.append(f"-DCMAKE_PREFIX_PATH={rocm_posix}")
                 cmake_args.append(f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={rocm_posix}")
+
+                # torch's Caffe2 LoadHIP.cmake ignores both arguments above: it
+                # re-derives ROCM_PATH by running whichever `rocm-sdk` comes first
+                # on PATH, then overwrites CMAKE_HIP_COMPILER with that install's
+                # clang++. Two interpreters with rocm-sdk installed is enough to
+                # make it pick the other one. The overwrite lands after project()
+                # has already determined HIP, so CMake treats the compiler as
+                # changed, wipes the cache and re-configures -- and that re-run
+                # loses the CXX/RC compilers pinned above, dying in project() with
+                # "No CMAKE_CXX_COMPILER could be found". LoadHIP takes ROCM_PATH
+                # from the environment before probing anything, so pass the root
+                # that resolved the compiler here and the two agree.
+                cmake_env["ROCM_PATH"] = rocm_posix
 
             # --hip-archs beats the environment, which beats what setup_hip_extension
             # resolved from the visible devices. The CLI value is raw, so normalize it
@@ -266,6 +284,7 @@ class CMakeBuildExt(build_ext):
                 cwd=build_temp,
                 check=True,
                 capture_output=False,
+                env=cmake_env,
             )
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"CMake configuration failed for {ext.name}") from e
@@ -279,6 +298,7 @@ class CMakeBuildExt(build_ext):
                 cwd=build_temp,
                 check=True,
                 capture_output=False,
+                env=cmake_env,
             )
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"CMake build failed for {ext.name}") from e
@@ -804,7 +824,7 @@ if BUILD_NO_CUDA and not extensions:
     readme_path = pathlib.Path("README.md")
     if readme_path.exists():
         setup_kwargs.update({
-            "long_description": readme_path.read_text(),
+            "long_description": readme_path.read_text(encoding="utf-8"),
             "long_description_content_type": "text/markdown",
         })
 
