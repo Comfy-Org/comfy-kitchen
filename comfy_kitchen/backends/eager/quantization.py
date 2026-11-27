@@ -6,6 +6,8 @@
 #   Copyright (c) Meta Platforms, Inc. and affiliates.
 #   Licensed under the BSD 3-Clause License (see NOTICE file for details)
 
+import logging
+
 import torch
 
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
@@ -26,6 +28,8 @@ from comfy_kitchen.float_utils import (
 from comfy_kitchen.registry import registry
 from comfy_kitchen.scaled_mm_v2 import ScalingType, SwizzleType, scaled_mm_v2
 from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_activation, _rotate_weight
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Dtype Code Mappings (shared between custom ops and backends)
@@ -747,12 +751,36 @@ def _round_up(value: int, alignment: int) -> int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+# Set once ``torch._int_mm`` has failed with a hipBLASLt error. Some ROCm builds/architectures
+# (e.g. RDNA2 / gfx103x) ship no hipBLASLt integer GEMM, so every call raises
+# HIPBLAS_STATUS_INVALID_VALUE even though the op is registered.
+_int_mm_unsupported = False
+
+
+def _int_mm_via_float(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """INT8 x INT8 -> INT32 product through a float32 GEMM (slow, but works everywhere)."""
+    return (lhs.float() @ rhs.float()).to(torch.int32)
+
+
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-        if hasattr(torch, "int8_mm"):
-            return torch.int8_mm(lhs, rhs)
-        return torch._int_mm(lhs, rhs)
+        global _int_mm_unsupported
+        if not _int_mm_unsupported:
+            try:
+                if hasattr(torch, "int8_mm"):
+                    return torch.int8_mm(lhs, rhs)
+                return torch._int_mm(lhs, rhs)
+            except RuntimeError as e:
+                if torch.version.hip is None or "HIPBLAS" not in str(e):
+                    raise
+                _int_mm_unsupported = True
+                logger.warning(
+                    "torch._int_mm is not supported on this AMD GPU (%s); "
+                    "falling back to a slower float32 matmul for INT8 linears.",
+                    str(e).splitlines()[0][:120],
+                )
+        return _int_mm_via_float(lhs, rhs)
 
     orig_m = a.size(0)
     orig_n = b.size(1)
