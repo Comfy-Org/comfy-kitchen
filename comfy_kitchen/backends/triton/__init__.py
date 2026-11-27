@@ -127,6 +127,32 @@ def _build_constraints() -> dict:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
         return ValidationResult.ok()
 
+    def _rms_rope_call_rule(kwargs):
+        # only the norm_over_heads form has extra layout needs; the per-head form is unchanged
+        if not kwargs.get("norm_over_heads"):
+            return ValidationResult.ok()
+        q, k, freqs = kwargs.get("q"), kwargs.get("k"), kwargs.get("freqs_cis")
+        q_scale = kwargs.get("q_scale")
+        k_scale = kwargs.get("k_scale") if kwargs.get("k_scale") is not None else q_scale
+        if q is None or k is None or freqs is None or q_scale is None:
+            return ValidationResult.ok()
+        if q.dim() != 4 or k.shape != q.shape or k.dtype != q.dtype:
+            return ValidationResult.fail("k", "norm_over_heads: q and k must be [B, S, H, head_dim] of one shape and dtype")
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return ValidationResult.fail("q", f"norm_over_heads: fp16/bf16 only, got {q.dtype}")
+        if not q.is_contiguous() or not k.is_contiguous():
+            return ValidationResult.fail("q", "norm_over_heads: q and k must be contiguous")
+        _, seq_len, heads, head_dim = q.shape
+        if head_dim % 2 or heads * head_dim > 16384:
+            return ValidationResult.fail("q", f"norm_over_heads: H * head_dim {heads * head_dim} too wide or head_dim odd")
+        if (freqs.dim() != 6 or freqs.dtype != torch.float32 or freqs.shape[0] != 1
+                or freqs.shape[1] not in (1, seq_len) or freqs.shape[2] != 1
+                or freqs.shape[3:] != (head_dim // 2, 2, 2)):
+            return ValidationResult.fail("freqs_cis", "norm_over_heads: freqs must be float32 [1, S | 1, 1, head_dim/2, 2, 2]")
+        if q_scale.numel() != heads * head_dim or k_scale.numel() != heads * head_dim:
+            return ValidationResult.fail("q_scale", "norm_over_heads: scales need H * head_dim elements")
+        return ValidationResult.ok()
+
     cuda_devices = frozenset({"cuda"})
     triton_devices = frozenset({"cuda", "xpu"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
@@ -235,6 +261,7 @@ def _build_constraints() -> dict:
                 "k_scale": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=triton_devices,
+            call_rules=(_rms_rope_call_rule,),
         ),
         "int8_linear": FunctionConstraints(
             params={

@@ -3363,6 +3363,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ParamConstraint,
         ValidationResult,
         na3d_common_call_rule,
+        rms_rope_norm_over_heads_call_rule,
         sol_attn_common_call_rule,
         window_attention_common_call_rule,
         with_out_param,
@@ -3799,6 +3800,7 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 "k_scale": ParamConstraint(dtypes=floats, shape_rules=(ExactDims(1),)),
             },
             default_devices=dev,
+            call_rules=(rms_rope_norm_over_heads_call_rule,),
         ),
         "rms_rope1": FunctionConstraints(
             params={
