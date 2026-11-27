@@ -27,6 +27,8 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
+    "depth_to_space3d_residual_add",
+    "depth_to_space3d_residual_add_",
 ]
 
 # Try to import triton and register if available
@@ -54,6 +56,10 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .depth_to_space3d_residual_add import (
+        depth_to_space3d_residual_add,
+        depth_to_space3d_residual_add_,
+    )
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -126,6 +132,34 @@ def _build_constraints() -> dict:
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
         return ValidationResult.ok()
+
+    def _depth_to_space3d_residual_add_call_rule(kwargs):
+        # No size threshold. The forms the kernels do not cover go to eager.
+        x, residual = kwargs.get("x"), kwargs.get("residual")
+        if x is None or residual is None:
+            return ValidationResult.ok()
+        if x.dtype != residual.dtype:
+            return ValidationResult.fail("residual", "x and residual must have the same dtype")
+        if x.numel() == 0 or residual.numel() == 0:
+            return ValidationResult.fail("x", "empty tensors are not supported by triton")
+        factors_first = kwargs.get("factors_first", False)
+        if factors_first != kwargs.get("residual_packed", False):
+            return ValidationResult.fail(
+                "residual_packed", "needs residual_packed == factors_first"
+            )
+        if factors_first and (kwargs.get("factor_s") != 2 or kwargs.get("first_chunk", False)):
+            return ValidationResult.fail(
+                "factor_s", "factors_first needs factor_s 2, no first_chunk"
+            )
+        return ValidationResult.ok()
+
+    def _depth_to_space3d_residual_add_inplace_call_rule(kwargs):
+        x, residual = kwargs.get("x"), kwargs.get("residual")
+        if x is None or residual is None:
+            return ValidationResult.ok()
+        if x.untyped_storage().data_ptr() == residual.untyped_storage().data_ptr():
+            return ValidationResult.fail("residual", "residual must not share storage with x")
+        return _depth_to_space3d_residual_add_call_rule(kwargs)
 
     cuda_devices = frozenset({"cuda"})
     triton_devices = frozenset({"cuda", "xpu"})
@@ -326,6 +360,20 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    d2s_params = {
+        "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+        "residual": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(5),)),
+    }
+    out["depth_to_space3d_residual_add"] = FunctionConstraints(
+        params=d2s_params,
+        default_devices=cuda_devices,
+        call_rules=(_depth_to_space3d_residual_add_call_rule,),
+    )
+    out["depth_to_space3d_residual_add_"] = FunctionConstraints(
+        params=d2s_params,
+        default_devices=cuda_devices,
+        call_rules=(_depth_to_space3d_residual_add_inplace_call_rule,),
+    )
     out["na3d"] = FunctionConstraints(
         params={
             "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
