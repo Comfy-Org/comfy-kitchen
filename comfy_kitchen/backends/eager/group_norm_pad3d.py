@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
+import typing
 from torch import Tensor
 from torch.nn import functional
 
@@ -22,7 +23,7 @@ def group_norm_silu_pad3d(
     bias: Tensor | None,
     num_groups: int,
     eps: float,
-    pad: list[int],
+    pad: typing.List[int],
     silu: bool,
     zero_pad: bool = False,
     stats: Tensor | None = None,
@@ -73,7 +74,7 @@ def group_norm_silu_pad3d_out(
     bias: Tensor | None,
     num_groups: int,
     eps: float,
-    pad: list[int],
+    pad: typing.List[int],
     silu: bool,
     zero_pad: bool,
     out: Tensor,
@@ -102,7 +103,7 @@ def _op_group_norm_silu_pad3d_out(
     bias: torch.Tensor | None,
     num_groups: int,
     eps: float,
-    pad: list[int],
+    pad: typing.List[int],
     silu: bool,
     zero_pad: bool,
     out: torch.Tensor,
@@ -133,7 +134,7 @@ def _op_group_norm_silu_pad3d(
     bias: torch.Tensor | None,
     num_groups: int,
     eps: float,
-    pad: list[int],
+    pad: typing.List[int],
     silu: bool,
     zero_pad: bool,
     stats: torch.Tensor | None,
