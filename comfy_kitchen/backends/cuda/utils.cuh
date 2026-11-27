@@ -72,8 +72,8 @@ __device__ __forceinline__ int modulation_row(int row, int group, int n_rows) {
 
 /* Use CUDA const memory to store scalar 1 and 0 for cublas usage
  */
-__device__ __constant__ float one_device;
-__device__ __constant__ float zero_device;
+__device__ __constant__ float one_device = 1.0f;
+__device__ __constant__ float zero_device = 0.0f;
 
 // Helper macro for CUDA error checking (replaces C10_CUDA_CHECK)
 #define CUDA_CHECK(call) \
@@ -85,11 +85,6 @@ __device__ __constant__ float zero_device;
   } while (0)
 
 inline float* GetScalarOne() {
-  static std::once_flag init_flag;
-  std::call_once(init_flag, []() {
-    float one = 1.0f;
-    CUDA_CHECK(cudaMemcpyToSymbol(one_device, &one, sizeof(float)));
-  });
   // return address by cudaGetSymbolAddress
   float* dev_ptr;
   CUDA_CHECK(cudaGetSymbolAddress((void**)&dev_ptr, one_device));
@@ -97,11 +92,6 @@ inline float* GetScalarOne() {
 }
 
 inline float* GetScalarZero() {
-  static std::once_flag init_flag;
-  std::call_once(init_flag, []() {
-    float zero = 0.0f;
-    CUDA_CHECK(cudaMemcpyToSymbol(zero_device, &zero, sizeof(float)));
-  });
   // return address by cudaGetSymbolAddress
   float* dev_ptr;
   CUDA_CHECK(cudaGetSymbolAddress((void**)&dev_ptr, zero_device));
