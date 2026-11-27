@@ -54,6 +54,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
+from comfy_kitchen.tensor.int8_utils import _build_hadamard as _int8_hadamard
 
 logger = logging.getLogger("comfy_kitchen.hip")
 
@@ -136,34 +137,40 @@ __all__ = [
     "w4a8_int8_linear",
 ]
 
-_C = None
-_EXT_AVAILABLE = False
-_EXT_ERROR = None
+def _load_extension(name: str):
+    """Load backends/hip/<name>.*; returns (module, None), or (None, why) if it is absent or broken."""
+    module = None
+    try:
+        _dir = os.path.dirname(__file__)
+        _module_path = None
+        for _fn in os.listdir(_dir):
+            if _fn.startswith(f"{name}.") and _fn.endswith((".so", ".pyd")):
+                _module_path = os.path.join(_dir, _fn)
+                break
 
-try:
-    _dir = os.path.dirname(__file__)
-    _module_path = None
-    for _fn in os.listdir(_dir):
-        if _fn.startswith("_C.") and _fn.endswith((".so", ".pyd")):
-            _module_path = os.path.join(_dir, _fn)
-            break
+        if _module_path is None:
+            return None, f"HIP extension not built (no {name} module in backends/hip)"
+        qualname = f"comfy_kitchen.backends.hip.{name}"
+        _spec = importlib.util.spec_from_file_location(qualname, _module_path)
+        module = importlib.util.module_from_spec(_spec)
+        sys.modules[qualname] = module
+        _spec.loader.exec_module(module)
+        return module, None
+    except Exception as e:  # a broken extension must not break import
+        # exec_module can fail after the module was cached above, leaving a
+        # half-initialized module importable from sys.modules. Drop it so a later
+        # import does not pick up the broken object.
+        qualname = f"comfy_kitchen.backends.hip.{name}"
+        if module is not None and sys.modules.get(qualname) is module:
+            del sys.modules[qualname]
+        return None, f"Failed to load HIP extension: {e}"
 
-    if _module_path is None:
-        _EXT_ERROR = "HIP extension not built (no _C module in backends/hip)"
-    else:
-        _spec = importlib.util.spec_from_file_location("comfy_kitchen.backends.hip._C", _module_path)
-        _C = importlib.util.module_from_spec(_spec)
-        sys.modules["comfy_kitchen.backends.hip._C"] = _C
-        _spec.loader.exec_module(_C)
-        _EXT_AVAILABLE = True
-except Exception as e:  # a broken extension must not break import
-    # exec_module can fail after the module was cached above, leaving a
-    # half-initialized _C importable from sys.modules. Drop it so a later import
-    # does not pick up the broken object.
-    if _C is not None and sys.modules.get("comfy_kitchen.backends.hip._C") is _C:
-        del sys.modules["comfy_kitchen.backends.hip._C"]
-    _EXT_ERROR = f"Failed to load HIP extension: {e}"
-    _C = None
+
+_C, _EXT_ERROR = _load_extension("_C")
+_EXT_AVAILABLE = _C is not None
+# Wave64-only (CDNA) targets get the geometry kernels and the MFMA INT8 linear as their
+# own module, see CMakeLists.txt.
+_CDNA, _CDNA_ERROR = _load_extension("_cdna")
 
 
 def _gfx_arch(device: torch.device | int | None = None) -> str | None:
@@ -205,6 +212,13 @@ _ARCH_WMMA_GFX117 = frozenset(_ARCH_GROUPS.get("wmma_gfx117", []))
 _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
 _ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX117 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
+# CDNA runs wave64 only, and every kernel but the geometry ones and the MFMA INT8
+# linear assumes wave32.
+_ARCH_CDNA = frozenset(_ARCH_GROUPS.get("cdna", []))
+_GEOMETRY_OPS = frozenset({
+    "delaunay3d", "mesh_bvh", "closest_point_on_mesh", "closest_hit_on_mesh",
+    "connected_components", "edge_collapse_checks", "min_cut",
+})
 
 def _has_nonduplicated_wmma(device: torch.device | int | None = None) -> bool:
     """Whether WMMA operands use the gfx12 128-bit layout."""
@@ -248,6 +262,37 @@ def _unsupported_arch_reason(arches: Sequence[str | None]) -> str | None:
         return f"architecture is not in the validated target manifest: {', '.join(unsupported)}"
     return None
 
+
+def _geometry_unsupported_reason(arches: Sequence[str | None]) -> str | None:
+    """Why the geometry ops must not register for this set of devices, or None if they may.
+
+    They run on every target _unsupported_arch_reason accepts and also on the
+    cdna targets, provided the extension for each device loaded.
+    """
+    if not arches:
+        return "no HIP device available"
+    if any(a is None for a in arches):
+        return "could not read the architecture of every visible device"
+    unsupported = sorted({a for a in arches if a not in _ARCH_SUPPORTED | _ARCH_CDNA})
+    if unsupported:
+        return f"architecture is not in the validated target manifest: {', '.join(unsupported)}"
+    if _CDNA is None and any(a in _ARCH_CDNA for a in arches):
+        return _CDNA_ERROR or "HIP CDNA extension not built"
+    if _C is None and any(a in _ARCH_SUPPORTED for a in arches):
+        return _EXT_ERROR or "HIP extension not built"
+    return None
+
+
+def _geometry_ext(device: torch.device):
+    """The extension holding the geometry kernels for ``device``: _cdna on CDNA, else _C."""
+    return _CDNA if _gfx_arch(device) in _ARCH_CDNA else _C
+
+
+def _is_cdna(device: torch.device) -> bool:
+    """Whether ``device`` is a CDNA target. Reads the cached arch list: this is on the per-GEMM path."""
+    arches = _visible_gfx_arches()
+    index = torch.cuda.current_device() if device.index is None else device.index
+    return 0 <= index < len(arches) and arches[index] in _ARCH_CDNA
 
 def _has_wmma(arches: Sequence[str | None]) -> bool:
     """Whether every visible device has matrix cores.
@@ -919,12 +964,18 @@ def int8_linear(
     residual_scale: torch.Tensor | None = None,
     weight_tiled: bool = False,
 ) -> torch.Tensor:
-    """INT8 linear with dynamic row-wise activation quantization, on WMMA.
+    """INT8 linear with dynamic row-wise activation quantization, on WMMA (MFMA on CDNA).
 
     weight_tiled: weight bytes are in the big-tile GEMM's B order (see
     TensorWiseINT8Layout.optimize_for_gemm); the kernel is selected from M at
     execution time without changing the weight layout.
     """
+    if _is_cdna(x.device):
+        if weight_tiled:
+            raise ValueError("tiled INT8 weights are a WMMA layout; CDNA reads the row-major weight")
+        return _int8_linear_cdna(
+            x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+            input_act, input_act_weight, input_act_eps, residual, residual_scale)
     x, input_act, act_weight = _split_input_act(
         x, input_act, input_act_weight, input_act_eps, convrot, convrot_groupsize)
     # k_act is the activated (quantized) row width: swiglu and situ halve the raw row.
@@ -1000,6 +1051,73 @@ def int8_linear(
     # Unlike CUDA, the residual is not folded into the epilogue: the per-element
     # residual reads there cost more than a separate addcmul at the output widths
     # pre-norm blocks apply it to.
+    return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale)
+
+
+def _int8_linear_cdna(
+    x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+    input_act, input_act_weight, input_act_eps, residual, residual_scale,
+) -> torch.Tensor:
+    """int8_linear on wave64 CDNA, bit-identical to the eager backend.
+
+    The input activation and the rotation are eager's; the row-wise quantizer and
+    the GEMM with its dequant epilogue are MFMA kernels that round as eager does.
+    They take bf16 in and out, which is what ComfyUI runs; other dtypes go to eager.
+    """
+    if x.dtype != torch.bfloat16 or out_dtype != torch.bfloat16:
+        return _eager.int8_linear(
+            x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+            input_act=input_act, input_act_weight=input_act_weight, input_act_eps=input_act_eps,
+            residual=residual, residual_scale=residual_scale,
+        )
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    k = x.shape[-1]
+    if k % 16 != 0 or k != weight.shape[-1]:
+        return _eager.int8_linear(
+            x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
+            residual=residual, residual_scale=residual_scale,
+        )
+
+    # For ComfyUI's operands every conversion below is a no-op. This runs once per
+    # linear call and the denoisers are host-bound at small M, so keep it lean.
+    weight = _aligned(weight.to(device=x.device).contiguous())
+    weight_scale = weight_scale.to(device=x.device, dtype=torch.float32).reshape(-1).contiguous()
+    n = weight.shape[0]
+    if weight_scale.numel() not in (1, n):
+        raise ValueError(
+            f"INT8 weight scale must be scalar or per-output-channel, got {tuple(weight_scale.shape)}"
+        )
+    if bias is not None:
+        # eager adds the bias in the output dtype
+        bias = _bias_operand(bias, n, x.device).to(torch.bfloat16)
+
+    orig_shape = x.shape
+    if convrot:
+        if k % convrot_groupsize != 0:
+            raise ValueError(f"ConvRot group size {convrot_groupsize} does not divide input features {k}")
+        h = _int8_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
+        # eager's matmul over [rows, groups, G] folds to this mm, so the bits match;
+        # calling mm directly skips matmul's host-side shape handling.
+        x2d = torch.mm(x.reshape(-1, convrot_groupsize), h).view(-1, k)
+    else:
+        x2d = x.reshape(-1, k).contiguous()
+    m = x2d.shape[0]
+    # int8 rows, padded to 16 bytes, then the float32 row scales
+    q_bytes = (m * k + 15) // 16 * 16
+    workspace = torch.empty(q_bytes + 4 * m, dtype=torch.int8, device=x.device)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+    args = (
+        _dl(x2d), _dl(weight), _dl(weight_scale), 0 if weight_scale.numel() == 1 else 1,
+        None if bias is None else _dl(bias), _dl(workspace), _dl(out), m, n, k, _stream(x2d),
+    )
+    # The stream handle does not name a device (each device's default stream is null), so
+    # the operands' device must be current. Entering torch.cuda.device costs ~4 us per call,
+    # so only switch when it is not.
+    if x2d.device.index == torch.cuda.current_device():
+        _CDNA.int8_linear_mfma(*args)
+    else:
+        with torch.cuda.device(x2d.device):
+            _CDNA.int8_linear_mfma(*args)
     return _apply_residual(out.reshape(*orig_shape[:-1], n), residual, residual_scale)
 
 
@@ -2101,6 +2219,7 @@ _DELAUNAY_MAX_TETS = 2**29  # adjacency is stored as (tet << 2 | face) in int32
 def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """See comfy_kitchen.delaunay3d. Rounds and flip passes loop here because each
     launch is sized by the step before it."""
+    ext = _geometry_ext(points.device)
     _check_shape("points", points, (None, 3))
     if not torch.isfinite(points).all():
         raise ValueError("points must be finite")
@@ -2164,10 +2283,10 @@ def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
             cand_info, cand_n, cand_m = (torch.empty(n_cand, **i32) for _ in range(3))
             owner = torch.full((n_tets,), _INT32_MAX, **i32)
             active = torch.zeros(cap, **u8)
-            _C.delaunay_flip_detect(active_list.numel(), w(active_list), w(active_flag), w(tet_v), w(tet_opp),
+            ext.delaunay_flip_detect(active_list.numel(), w(active_list), w(active_flag), w(tet_v), w(tet_opp),
                                     w(verts), w(cand_info), w(cand_n), w(cand_m), w(owner), w(active), stream)
             run = torch.empty(n_cand, **i32)
-            _C.delaunay_flip_decide(n_cand, w(active_list), w(cand_info), w(cand_n), w(cand_m), w(owner), w(run),
+            ext.delaunay_flip_decide(n_cand, w(active_list), w(cand_info), w(cand_n), w(cand_m), w(owner), w(run),
                                     w(active), stream)
             ran = run != 0
             is23 = (run & 3) == 1
@@ -2181,11 +2300,11 @@ def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
             flipped = torch.zeros(n_tets, **i32)
             redirect = torch.empty(4 * n_tets, **i32)
             new_tets = torch.empty(3 * n_run, **i32)
-            _C.delaunay_flip_execute(n_cand, w(active_list), w(run), w(cand_n), w(cand_m), w(slot_rank), w(run_rank),
+            ext.delaunay_flip_execute(n_cand, w(active_list), w(run), w(cand_n), w(cand_m), w(slot_rank), w(run_rank),
                                      n_tets, w(verts), w(tet_v), w(tet_opp), w(alive), w(flipped), w(redirect),
                                      w(pend), w(new_tets), w(active), stream)
-            _C.delaunay_flip_fixup(n_run, w(new_tets), w(flipped), w(redirect), w(tet_opp), w(pend), stream)
-            _C.delaunay_relocate_flip(n, w(flipped), w(new_tets), w(tet_v), w(verts), w(pt_tet), stream)
+            ext.delaunay_flip_fixup(n_run, w(new_tets), w(flipped), w(redirect), w(tet_opp), w(pend), stream)
+            ext.delaunay_relocate_flip(n, w(flipped), w(new_tets), w(tet_v), w(verts), w(pt_tet), stream)
             n_tets += n23
 
     def compacted(rows):
@@ -2193,12 +2312,12 @@ def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
         new_index = torch.cumsum(alive[:n_tets], 0, dtype=torch.int32) - 1
         out_v = torch.full((rows, 4), -1, **i32)
         out_o = torch.full((rows, 4), -1, **i32)
-        _C.delaunay_compact(n_tets, w(alive), w(new_index), w(tet_v), w(tet_opp), w(out_v), w(out_o), stream)
+        ext.delaunay_compact(n_tets, w(alive), w(new_index), w(tet_v), w(tet_opp), w(out_v), w(out_o), stream)
         return new_index, out_v, out_o
 
     while True:
         vote = torch.full((n_tets,), _INT32_MAX, **i32)
-        _C.delaunay_vote(w(pt_tet), w(prio), n, w(vote), stream)
+        ext.delaunay_vote(w(pt_tet), w(prio), n, w(vote), stream)
         split = vote != _INT32_MAX
         n_split = int(split.sum())
         if n_split == 0:
@@ -2206,9 +2325,9 @@ def delaunay3d(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.
         split_rank = torch.cumsum(split, 0, dtype=torch.int32) - split.int()
         grow(n_tets + 3 * n_split)
         active = torch.zeros(cap, **u8)
-        _C.delaunay_split(n_tets, w(vote), w(split_rank), w(prio_to_pt), w(tet_v), w(tet_opp), w(alive),
+        ext.delaunay_split(n_tets, w(vote), w(split_rank), w(prio_to_pt), w(tet_v), w(tet_opp), w(alive),
                           w(pt_tet), w(active), stream)
-        _C.delaunay_relocate_split(n, w(vote), w(split_rank), n_tets, w(tet_v), w(verts), w(pt_tet), stream)
+        ext.delaunay_relocate_split(n, w(vote), w(split_rank), n_tets, w(tet_v), w(verts), w(pt_tet), stream)
         n_tets += 3 * n_split
         flip(active)
         n_alive = int(alive[:n_tets].sum())
@@ -2249,6 +2368,7 @@ def _check_float32(**tensors: torch.Tensor) -> None:
 
 
 def mesh_bvh(triangles: torch.Tensor) -> MeshBVH:
+    ext = _geometry_ext(triangles.device)
     _check_shape("triangles", triangles, (None, 3, 3))
     _check_float32(triangles=triangles)
     device = triangles.device
@@ -2269,7 +2389,7 @@ def mesh_bvh(triangles: torch.Tensor) -> MeshBVH:
     visits = torch.zeros(max(n - 1, 1), dtype=torch.int32, device=device)
     box = torch.empty((2 * n - 1, 6), dtype=torch.float32, device=device)
     w = _dl
-    _C.mesh_bvh_build(w(codes), w(tris), n, w(child), w(parent), w(visits), w(box),
+    ext.mesh_bvh_build(w(codes), w(tris), n, w(child), w(parent), w(visits), w(box),
                       torch.cuda.current_stream(device).cuda_stream)
     return MeshBVH(tris, order.int(), child[: n - 1], box)
 
@@ -2277,6 +2397,7 @@ def mesh_bvh(triangles: torch.Tensor) -> MeshBVH:
 def closest_point_on_mesh(
     bvh: MeshBVH, points: torch.Tensor, max_dist: float = float("inf")
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ext = _geometry_ext(points.device)
     _check_shape("points", points, (None, 3))
     _check_float32(points=points, triangles=bvh.triangles)
     if bvh.triangles.device != points.device:
@@ -2290,7 +2411,7 @@ def closest_point_on_mesh(
     closest = torch.empty((n, 3), dtype=torch.float32, device=points.device)
     face = torch.empty(n, dtype=torch.int64, device=points.device)
     w = _dl
-    _C.closest_point_on_mesh(w(points), n, w(bvh.triangles), w(bvh.index), bvh.triangles.shape[0], w(bvh.child),
+    ext.closest_point_on_mesh(w(points), n, w(bvh.triangles), w(bvh.index), bvh.triangles.shape[0], w(bvh.child),
                              w(bvh.box), float(max_dist), w(dist), w(closest), w(face),
                              torch.cuda.current_stream(points.device).cuda_stream)
     return dist, closest, face
@@ -2300,6 +2421,7 @@ def closest_hit_on_mesh(
     bvh: MeshBVH, origins: torch.Tensor, directions: torch.Tensor, tmin: float = 0.0, tmax: float = float("inf"),
     cull_backface: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    ext = _geometry_ext(origins.device)
     _check_shape("origins", origins, (None, 3))
     _check_shape("directions", directions, (origins.shape[0], 3))
     _check_float32(origins=origins, directions=directions, triangles=bvh.triangles)
@@ -2310,7 +2432,7 @@ def closest_hit_on_mesh(
     t = torch.empty(n, dtype=torch.float32, device=origins.device)
     face = torch.empty(n, dtype=torch.int64, device=origins.device)
     w = _dl
-    _C.closest_hit_on_mesh(w(origins.contiguous()), w(directions.contiguous()), n, w(bvh.triangles), w(bvh.index),
+    ext.closest_hit_on_mesh(w(origins.contiguous()), w(directions.contiguous()), n, w(bvh.triangles), w(bvh.index),
                            bvh.triangles.shape[0], w(bvh.child), w(bvh.box), float(tmin), float(tmax),
                            bool(cull_backface), w(t), w(face), torch.cuda.current_stream(origins.device).cuda_stream)
     return t, face
@@ -2353,13 +2475,14 @@ def _check_indices(name: str, index: torch.Tensor, n: int, lowest: int = 0) -> N
 
 
 def connected_components(edges: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    ext = _geometry_ext(edges.device)
     num_nodes = _check_count("num_nodes", num_nodes)
     _check_shape("edges", edges, (None, 2))
     _check_indices("edges", edges, num_nodes)
     edges = edges.contiguous()
     parent = torch.arange(num_nodes, dtype=torch.int32, device=edges.device)
     labels = torch.empty(num_nodes, dtype=torch.int64, device=edges.device)
-    _C.connected_components(_dl(edges), edges.shape[0], edges.dtype == torch.int64, num_nodes,
+    ext.connected_components(_dl(edges), edges.shape[0], edges.dtype == torch.int64, num_nodes,
                             _dl(parent), _dl(labels),
                             torch.cuda.current_stream(edges.device).cuda_stream)
     return labels
@@ -2369,6 +2492,7 @@ def edge_collapse_checks(
     vertices: torch.Tensor, faces: torch.Tensor, edges: torch.Tensor, positions: torch.Tensor,
     cos_threshold: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ext = _geometry_ext(vertices.device)
     device = vertices.device
     _check_same_device(device, faces=faces, edges=edges, positions=positions)
     n_verts, n_edges = vertices.shape[0], edges.shape[0]
@@ -2388,7 +2512,7 @@ def edge_collapse_checks(
     flips = torch.empty(n_edges, dtype=torch.int32, device=device)
     skinny = torch.empty(n_edges, dtype=torch.float32, device=device)
     link_ok = torch.empty(n_edges, dtype=torch.bool, device=device)
-    _C.edge_collapse_checks(_dl(vertices.contiguous()), _dl(faces), _dl(offsets),
+    ext.edge_collapse_checks(_dl(vertices.contiguous()), _dl(faces), _dl(offsets),
                             _dl(cursor), _dl(fan),
                             _dl(edges.to(torch.int32).contiguous()), _dl(positions.contiguous()),
                             corners.numel(), n_edges, cos_threshold,
@@ -2399,6 +2523,7 @@ def edge_collapse_checks(
 
 def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: torch.Tensor,
             relabel_every: int = 64) -> torch.Tensor:
+    ext = _geometry_ext(nbr.device)
     if relabel_every <= 0:
         raise ValueError(f"relabel_every must be positive, got {relabel_every}")
     device = nbr.device
@@ -2439,21 +2564,21 @@ def min_cut(nbr: torch.Tensor, cap: torch.Tensor, s_cap: torch.Tensor, t_cap: to
     big = n + 2
     stream = torch.cuda.current_stream(device).cuda_stream
     w = _dl
-    _C.min_cut_init(n, k, w(nbr), w(cap), w(r), w(rev), stream)
+    ext.min_cut_init(n, k, w(nbr), w(cap), w(r), w(rev), stream)
     cur, it = 0, 0
     while True:
         if it % relabel_every == 0:
-            _C.min_cut_global_relabel(n, k, w(nbr), w(rev), w(r), w(rt), tol, big, w(h), w(bfs_lists), w(bfs_counts), stream)
-            _C.min_cut_rebuild_active(n, w(e), w(h), tol, big, w(lists[cur]), w(counts[cur]), w(queued), stream)
+            ext.min_cut_global_relabel(n, k, w(nbr), w(rev), w(r), w(rt), tol, big, w(h), w(bfs_lists), w(bfs_counts), stream)
+            ext.min_cut_rebuild_active(n, w(e), w(h), tol, big, w(lists[cur]), w(counts[cur]), w(queued), stream)
             if int(counts[cur].item()) == 0:
                 break
-        _C.min_cut_iterate(n, k, w(nbr), w(rev), w(r), w(e), w(rt), w(h), w(inc), w(hn), tol, big, w(lists[cur]),
+        ext.min_cut_iterate(n, k, w(nbr), w(rev), w(r), w(e), w(rt), w(h), w(inc), w(hn), tol, big, w(lists[cur]),
                            w(counts[cur]), w(lists[1 - cur]), w(counts[1 - cur]), w(queued), w(active), stream)
         cur = 1 - cur
         it += 1
         if int(active.item()) == 0:
             break
-    _C.min_cut_global_relabel(n, k, w(nbr), w(rev), w(r), w(rt), tol, big, w(h), w(bfs_lists), w(bfs_counts), stream)
+    ext.min_cut_global_relabel(n, k, w(nbr), w(rev), w(r), w(rt), tol, big, w(h), w(bfs_lists), w(bfs_counts), stream)
     return h >= big
 
 
@@ -4341,6 +4466,23 @@ def sage_int8_attend(
     return output
 
 
+def _cdna_int8_constraints() -> dict:
+    """The CDNA int8_linear kernels are bf16 in and out; other dtypes route to triton/eager."""
+    from comfy_kitchen.constraints import DivisibleBy, FunctionConstraints, ParamConstraint
+
+    bf16 = frozenset({torch.bfloat16})
+    return {
+        "int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=bf16, shape_rules=(DivisibleBy(-1, 16),)),
+                "weight": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "out_dtype": ParamConstraint(dtypes=bf16),
+            },
+            default_devices=frozenset({"cuda", "hip"}),
+        ),
+    }
+
+
 def _register():
     from comfy_kitchen.registry import registry
 
@@ -4350,7 +4492,7 @@ def _register():
         registry.mark_unavailable("hip", "disabled by COMFY_KITCHEN_DISABLE_HIP=1")
         return
 
-    if not _EXT_AVAILABLE:
+    if not _EXT_AVAILABLE and _CDNA is None:
         registry.mark_unavailable("hip", _EXT_ERROR or "HIP extension not built")
         return
 
@@ -4359,8 +4501,19 @@ def _register():
         return
 
     arches = _visible_gfx_arches()
-    reason = _unsupported_arch_reason(arches)
+    reason = _unsupported_arch_reason(arches) if _EXT_AVAILABLE else (_EXT_ERROR or "HIP extension not built")
     if reason is not None:
+        # A CDNA device (alone or next to RDNA ones) still runs the geometry kernels.
+        if _geometry_unsupported_reason(arches) is None:
+            capabilities = {k: v for k, v in _build_constraints(False).items() if k in _GEOMETRY_OPS}
+            # The MFMA int8_linear is advertised only when every device has it.
+            cdna_only = all(a in _ARCH_CDNA for a in arches)
+            if cdna_only:
+                capabilities.update(_cdna_int8_constraints())
+            registry.register(name="hip", module=sys.modules[__name__], capabilities=capabilities)
+            logger.debug("registered HIP backend for %s (%s)", ", ".join(sorted(set(arches))),
+                         "CDNA: geometry ops and int8_linear" if cdna_only else "geometry ops only")
+            return
         registry.mark_unavailable("hip", reason)
         return
 

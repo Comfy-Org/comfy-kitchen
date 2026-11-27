@@ -211,7 +211,7 @@ def test_hip_rejects_invalid_capacities(name, bad):
 def test_hip_bindings_reject_undersized_and_wrong_dtype_buffers():
     from comfy_kitchen.backends import hip
 
-    w, c = hip._dl, hip._C
+    w, c = hip._dl, hip._geometry_ext(torch.device("cuda"))
     stream = torch.cuda.current_stream().cuda_stream
     nbr = torch.tensor([[1], [0]], dtype=torch.int32).cuda()
     cap = torch.ones(2, 1).cuda()

@@ -58,8 +58,11 @@ if getattr(torch.version, "hip", None):
     # and advertises only the ops that device can run; prefer it where it registers.
     if registry.is_available("hip"):
         registry.set_priority(["hip", "cuda", "triton", "eager"])
-        sol_attn_chunked = _hip_backend.sol_attn_chunked
-        _memmove_ = _hip_backend.memmove_
+        # On wave64 CDNA the backend registers only the geometry ops and has no _C,
+        # so these keep their defaults there.
+        if _hip_backend.is_available():
+            sol_attn_chunked = _hip_backend.sol_attn_chunked
+            _memmove_ = _hip_backend.memmove_
 else:
     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
 
@@ -259,7 +262,11 @@ def sol_attn(
 
 def memmove(dst: torch.Tensor, src: torch.Tensor):
     """Copy src's bytes into dst in place; the two ranges may overlap."""
-    if dst.device.type == "cuda" and registry.is_available("hip" if torch.version.hip else "cuda"):
+    if torch.version.hip:
+        native = registry.is_available("hip") and _hip_backend.is_available()
+    else:
+        native = registry.is_available("cuda")
+    if dst.device.type == "cuda" and native:
         return _memmove_(dst, src)
     dst.copy_(src.clone())
 
