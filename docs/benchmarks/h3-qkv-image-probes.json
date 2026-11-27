@@ -1,0 +1,10 @@
+{
+  "sm80_only": {
+    "available": 0,
+    "subsequent_cuda_ok": true
+  },
+  "no_cutlass": {
+    "available": 0,
+    "subsequent_cuda_ok": true
+  }
+}
