@@ -4,6 +4,12 @@
 #include "layout.h"
 
 namespace comfy_deco {
+__device__ __forceinline__ uint32_t round_bf16(float lo, float hi) {
+    uint32_t word;
+    asm("cvt.rn.bf16x2.f32 %0,%2,%1;" : "=r"(word) : "f"(lo), "f"(hi));
+    return word;
+}
+
 struct PrepGeometry {
     int sequence, heads, tiles;
 };
@@ -27,6 +33,4 @@ struct PrepBuffers {
 cudaError_t basis_and_v(PrepGeometry shape, InputView q, InputView k, InputView v,
                         const int32_t* rows, const void* rotation, PrepBuffers out,
                         int sms, cudaStream_t stream);
-cudaError_t pack_operands(PrepGeometry shape, InputView q, InputView k, InputView v,
-                          const void* rotation, PrepBuffers out, int sms, cudaStream_t stream);
 } // namespace comfy_deco

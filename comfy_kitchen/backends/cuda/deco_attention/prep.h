@@ -17,7 +17,7 @@ PrepLayout prep_layout(int sequence, int heads, int sms);
 // BF16 Q/K/V each have D=128 contiguous channels. All six strides are in
 // bytes. Rows contains max(64, sequence / 256) sample indices on the device.
 // Rotation is the signed, unnormalized 128x128 BF16 Hadamard matrix.
-cudaError_t prepare(const void* q, const void* k, const void* v, const int32_t* rows,
+cudaError_t prepare(const PrepLayout& layout, const void* q, const void* k, const void* v, const int32_t* rows,
                     const void* rotation, void* workspace, int sequence, int heads, int sms,
                     int64_t q_token_bytes, int64_t q_head_bytes,
                     int64_t k_token_bytes, int64_t k_head_bytes,

@@ -66,23 +66,15 @@ corresponding operator is available.
 
 ## DeCo FP4 attention
 
-`comfy_kitchen.deco_attention(q, k, v)` accepts the same BHND layout and SDPA
-arguments as PyTorch. On SM120 and SM121 it can run rank-32 compensated NVFP4
-inference, including basis estimation, Q/K/V packing, attention and BF16 output.
-The kernels build against Kitchen's CUTLASS submodule. Check
-`comfy_kitchen.deco_attention_is_available(device)` for native device support.
+`comfy_kitchen.deco_attention(q, k, v)` runs rank-32 NVFP4 attention on SM120
+and SM121 for batch-one dense BF16 inference with 128 channels per head.
+Other shapes and SDPA modes use PyTorch. Check native device support with
+`comfy_kitchen.deco_attention_is_available(device)`. [Supported BHND shapes](comfy_kitchen/backends/cuda/deco_attention/core_shapes.inc)
 
-The native path handles 13 captured or benchmarked sequence-length/head-count
-pairs for batch-one dense BF16 self-attention with 128 channels per head. Both
-contiguous BHND and token-major projection views are supported. Other shapes,
-masks, causal attention, dropout, custom scales, GQA and gradient-tracked calls
-use PyTorch SDPA. An optional integer `token_tags` tensor of shape `[N]` or
-`[1, N]` balances the compensation samples between image/video (zero) and
-other modalities (positive). Negative tags exclude tokens from the sample.
-Every invocation prepares its own Q/K/V. Before CUDA graph capture, warm up
-once for each native sequence length and tag mode.
-
-[Supported sequence lengths and head counts](comfy_kitchen/backends/cuda/deco_attention/core_shapes.inc)
+Optional integer `token_tags` of shape `[N]` or `[1,N]` balance compensation
+samples between image/video (zero) and other modalities (positive). Negative
+tags exclude tokens from basis sampling. For CUDA graphs, warm up once per
+native sequence length and tag mode.
 
 ## Huawei Ascend backend
 

@@ -10,11 +10,6 @@ namespace comfy_deco::v_pack {
 
 __device__ __forceinline__ float low_bf16(uint32_t word) { return __uint_as_float(word << 16); }
 __device__ __forceinline__ float high_bf16(uint32_t word) { return __uint_as_float(word & 0xffff0000u); }
-__device__ __forceinline__ uint32_t round_bf16(float lo, float hi) {
-    uint32_t word;
-    asm("cvt.rn.bf16x2.f32 %0,%2,%1;" : "=r"(word) : "f"(lo), "f"(hi));
-    return word;
-}
 __device__ __forceinline__ float reciprocal(float x) {
     float y;
     asm("rcp.approx.ftz.f32 %0,%1;" : "=f"(y) : "f"(x));

@@ -165,8 +165,6 @@ set(CUDA_SOURCES
 set(CPP_SOURCES
     dlpack_bindings.cpp
     int8_decode_bindings.cpp
-    deco_attention_bindings.cpp
-    deco_attention/launch.cpp
 )
 
 # Keep CUDA compilation independent of the Python extension target. The
@@ -220,11 +218,13 @@ endif()
 
 target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_cuda_kernels>)
 
-# NVCC reports the actual members of architecture families (e.g. 120f).
-execute_process(COMMAND "${CMAKE_CUDA_COMPILER}" --list-gpu-code
-    OUTPUT_VARIABLE comfy_gpu_codes RESULT_VARIABLE comfy_gpu_list_status)
-if(NOT comfy_gpu_list_status EQUAL 0)
-    message(FATAL_ERROR "Cannot query NVCC architecture support")
+# ConvRot and DeCo both need the exact images supported by this NVCC.
+if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1" OR COMFY_CUDA_ARCHS MATCHES "(^|;)12[01][af]?(-real)?(;|$)")
+    execute_process(COMMAND "${CMAKE_CUDA_COMPILER}" --list-gpu-code
+        OUTPUT_VARIABLE comfy_gpu_codes RESULT_VARIABLE comfy_gpu_list_status)
+    if(NOT comfy_gpu_list_status EQUAL 0)
+        message(FATAL_ERROR "Cannot query NVCC architecture support")
+    endif()
 endif()
 
 # The packed converter requires architecture-specific images.
@@ -268,30 +268,23 @@ if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.1")
     endif()
 endif()
 
-# FP4 attention uses architecture-specific Blackwell MMA instructions. Build
-# exact cubins only for the requested devices supported by the active toolkit.
-set(COMFY_DECO_ARCHS "")
-foreach(arch IN LISTS COMFY_CUDA_ARCHS)
-    if(NOT arch MATCHES "^(120|121)([af]?)(-real)?$")
-        continue()
+# 120f includes SM120 and newer members of its family. Each DeCo cubin
+# uses architecture-specific MMA, so advertise only images compiled here.
+set(deco_archs "")
+set(deco_ccs "")
+foreach(cc IN ITEMS 120 121)
+    if(COMFY_CUDA_ARCHS MATCHES "(^|;)(${cc}[af]?|120f)(-real)?(;|$)" AND
+       comfy_gpu_codes MATCHES "sm_${cc}([^0-9]|$)")
+        list(APPEND deco_archs "${cc}a-real")
+        list(APPEND deco_ccs "${cc}")
     endif()
-    set(base "${CMAKE_MATCH_1}")
-    set(family "${CMAKE_MATCH_2}")
-    foreach(cc IN ITEMS 120 121)
-        if((cc EQUAL base OR (family STREQUAL "f" AND cc GREATER base))
-           AND comfy_gpu_codes MATCHES "sm_${cc}([^0-9]|$)")
-            list(APPEND COMFY_DECO_ARCHS "${cc}a-real")
-        endif()
-    endforeach()
 endforeach()
-list(REMOVE_DUPLICATES COMFY_DECO_ARCHS)
 
-if(COMFY_DECO_ARCHS AND EXISTS "${COMFY_CUTLASS_DIR}/cutlass/version.h")
+if(deco_archs AND EXISTS "${COMFY_CUTLASS_DIR}/cutlass/version.h")
     set(deco_dir "${CMAKE_CURRENT_SOURCE_DIR}/deco_attention")
-    set(deco_sources
+    add_library(comfy_deco_attention OBJECT
         deco_attention/prep_basis.cu
         deco_attention/prep_qk.cu
-        deco_attention/prep_launch.cu
         deco_attention/prep_tags.cu
     )
     # One translation unit per geometry keeps NVCC peak memory bounded and
@@ -306,25 +299,21 @@ if(COMFY_DECO_ARCHS AND EXISTS "${COMFY_CUTLASS_DIR}/cutlass/version.h")
         set(DECO_HEADS "${CMAKE_MATCH_2}")
         set(unit "${CMAKE_CURRENT_BINARY_DIR}/deco_attention/core_${DECO_SEQUENCE}_${DECO_HEADS}.cu")
         configure_file("${deco_dir}/core_shape.cu.in" "${unit}" @ONLY)
-        list(APPEND deco_sources "${unit}")
+        target_sources(comfy_deco_attention PRIVATE "${unit}")
     endforeach()
 
-    add_library(comfy_deco_attention OBJECT ${deco_sources})
-    set_target_properties(comfy_deco_attention PROPERTIES CUDA_ARCHITECTURES "${COMFY_DECO_ARCHS}"
+    set_target_properties(comfy_deco_attention PROPERTIES CUDA_ARCHITECTURES "${deco_archs}"
         CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
     # The softmax encoding uses subnormals and preprocessing relies on RN arithmetic.
     set(deco_flags ${CUDA_NVCC_FLAGS})
     list(REMOVE_ITEM deco_flags --use_fast_math)
     target_compile_options(comfy_deco_attention PRIVATE ${deco_flags})
     target_include_directories(comfy_deco_attention PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}" "${deco_dir}" "${COMFY_CUTLASS_DIR}" ${CUDAToolkit_INCLUDE_DIRS})
-    target_compile_definitions(_C PRIVATE COMFY_HAVE_DECO_FP4)
-    foreach(arch IN LISTS COMFY_DECO_ARCHS)
-        string(REPLACE "a-real" "" cc "${arch}")
-        target_compile_definitions(_C PRIVATE "COMFY_DECO_SM${cc}")
-    endforeach()
-    target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_deco_attention>)
-    message(STATUS "DeCo FP4 attention architectures: ${COMFY_DECO_ARCHS}")
+        "${deco_dir}" "${COMFY_CUTLASS_DIR}" ${CUDAToolkit_INCLUDE_DIRS})
+    list(JOIN deco_ccs "," deco_ccs)
+    target_compile_definitions(_C PRIVATE "COMFY_DECO_CCS=${deco_ccs}")
+    target_sources(_C PRIVATE deco_attention_bindings.cpp $<TARGET_OBJECTS:comfy_deco_attention>)
+    message(STATUS "DeCo FP4 attention architectures: ${deco_archs}")
 endif()
 
 target_compile_definitions(_C PRIVATE NB_STATIC)

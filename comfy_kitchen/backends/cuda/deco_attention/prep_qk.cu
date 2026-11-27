@@ -27,12 +27,6 @@ struct alignas(64) ScaleSidePlane {
 static_assert(sizeof(ScaleSidePlane) == layout::scale_side_bytes);
 
 
-__device__ __forceinline__ unsigned pack_bf16(float a, float b) {
-    unsigned word;
-    asm("cvt.rn.bf16x2.f32 %0,%2,%1;" : "=r"(word) : "f"(a), "f"(b));
-    return word;
-}
-
 __device__ __forceinline__ void mma(float (&acc)[4], const unsigned (&a)[4], uint2 b) {
     cute::SM80_16x8x16_F32BF16BF16F32_TN::fma(
         acc[0], acc[1], acc[2], acc[3], a[0], a[1], a[2], a[3], b.x, b.y,
@@ -223,8 +217,8 @@ __device__ __forceinline__ void encode_item(float (&y)[8][2][4], bool key,
             unpack_fp4(x.codes, da, db);
             unpack_fp4(x.codes >> 8, dc, dd);
             da *= x.scale; db *= x.scale; dc *= x.scale; dd *= x.scale;
-            aq[r] = pack_bf16(da, db); aq[2+r] = pack_bf16(dc, dd);
-            ad[r] = pack_bf16(a-da, b-db); ad[2+r] = pack_bf16(c-dc, d-dd);
+            aq[r] = round_bf16(da, db); aq[2+r] = round_bf16(dc, dd);
+            ad[r] = round_bf16(a-da, b-db); ad[2+r] = round_bf16(c-dc, d-dd);
         }
         #pragma unroll
         for (int n = 0; n < 4; ++n) {
@@ -431,11 +425,53 @@ __global__ void encode_scales(PrepGeometry shape, PrepBuffers out) {
 }
 } // namespace
 
-cudaError_t pack_operands(PrepGeometry shape, InputView q, InputView k, InputView v,
-                          const void* rotation, PrepBuffers out, int sms, cudaStream_t stream) {
+PrepLayout prep_layout(int sequence, int heads, int sms) {
+    const size_t units = size_t(heads) * ((sequence + 127) / 128);
+    size_t end = 0;
+    auto reserve = [&](size_t bytes) {
+        const size_t start = (end + 255) & ~size_t(255);
+        end = start + bytes;
+        return start;
+    };
+    PrepLayout w{};
+    w.q4 = reserve(size_t(sequence) * heads * layout::query_row_bytes);
+    w.q_sf = reserve(units * layout::query_scale_bytes);
+    w.img = reserve(units * layout::tile_bytes);
+    w.score_scale = reserve(sizeof(float));
+    w.ut = reserve(size_t(heads) * 32 * 128 * sizeof(uint16_t));
+    w.side = reserve(2 * units * layout::scale_side_bytes);
+    w.chosen_scales = reserve(units * 8 * sizeof(float));
+    w.split = reserve((units % sms) * (layout::split_pair_bytes + sizeof(uint32_t)));
+    // The core's split counters follow its partial records. Group all reductions
+    // at the end so one stream-ordered memset initializes each invocation.
+    w.v4_scale = reserve(sizeof(float));
+    w.maxima = reserve(6 * sizeof(uint32_t));
+    w.bytes = reserve(0);
+    return w;
+}
+
+cudaError_t prepare(const PrepLayout& w, const void* q, const void* k, const void* v, const int32_t* rows,
+                    const void* rotation, void* workspace, int sequence, int heads, int sms,
+                    int64_t qt, int64_t qh, int64_t kt, int64_t kh, int64_t vt, int64_t vh,
+                    cudaStream_t stream) {
+    auto* p = static_cast<unsigned char*>(workspace);
+    PrepBuffers out{p + w.q4, p + w.q_sf, p + w.img,
+                    reinterpret_cast<uint16_t*>(p + w.ut), reinterpret_cast<uint16_t*>(p + w.side),
+                    reinterpret_cast<float*>(p + w.score_scale), reinterpret_cast<float*>(p + w.v4_scale),
+                    reinterpret_cast<float*>(p + w.chosen_scales), reinterpret_cast<uint32_t*>(p + w.maxima)};
+    const PrepGeometry shape{sequence, heads, (sequence + 127) / 128};
+    const InputView query{static_cast<const char*>(q), qt, qh};
+    const InputView key{static_cast<const char*>(k), kt, kh};
+    const InputView value{static_cast<const char*>(v), vt, vh};
+    const int splits = heads * shape.tiles % sms;
+    const size_t counters = w.split + splits * layout::split_pair_bytes;
+    auto err = cudaMemsetAsync(p + counters, 0, w.bytes - counters, stream);
+    if (err != cudaSuccess) return err;
+    err = basis_and_v(shape, query, key, value, rows, rotation, out, sms, stream);
+    if (err != cudaSuccess) return err;
     repair_v_and_pack_qk<<<2 * stripes_per_head * shape.heads, threads, 0, stream>>>(
-        shape, q, k, v, static_cast<const U16*>(rotation), out);
-    auto err = cudaGetLastError();
+        shape, query, key, value, static_cast<const U16*>(rotation), out);
+    err = cudaGetLastError();
     if (err != cudaSuccess) return err;
     encode_scales<<<dim3(4 * sms, 2), 192, 0, stream>>>(shape, out);
     return cudaGetLastError();

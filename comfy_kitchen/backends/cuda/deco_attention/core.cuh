@@ -6,7 +6,7 @@
 #include <climits>
 #include <cutlass/arch/barrier.h>
 
-#include "launch_detail.h"
+#include "launch.h"
 #include "layout.h"
 #include "math.cuh"
 #include "softmax.cuh"
