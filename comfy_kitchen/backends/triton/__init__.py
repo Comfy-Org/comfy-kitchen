@@ -24,6 +24,8 @@ __all__ = [
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "int8_linear",
+    "linear_geglu",
+    "linear_swiglu",
     "quantize_int8_rowwise",
     "quantize_and_rotate_rowwise",
     "w4a8_int8_linear",
@@ -33,6 +35,7 @@ __all__ = [
 import torch
 
 from comfy_kitchen.constraints import (
+    DivisibleBy,
     ExactDims,
     FunctionConstraints,
     ParamConstraint,
@@ -54,6 +57,7 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .linear_act import linear_geglu, linear_swiglu
     from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
@@ -126,6 +130,48 @@ def _build_constraints() -> dict:
         if q is not None and q.shape[-1] > 128:
             return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
         return ValidationResult.ok()
+
+    from .linear_act import GLU_N_MULTIPLE, K_MULTIPLE, MIN_M
+
+    def _linear_act_operands(kwargs, pairs):
+        # Shared by the linear_* epilogue ops. The kernel reads weights / biases as
+        # bare pointers sized from x and the weights, so anything it does not serve
+        # must fall through to eager here. pairs: ((weight name, bias name), ...).
+        x = kwargs.get("x")
+        if x is None or any(kwargs.get(w) is None for w, _ in pairs):
+            return ValidationResult.ok()
+        for w_name, b_name in pairs:
+            weight = kwargs[w_name]
+            if x.dim() < 1 or x.shape[-1] == 0 or x.shape[-1] != weight.shape[1]:
+                return ValidationResult.fail(
+                    "x", f"last dim must equal {w_name}.shape[1] ({weight.shape[1]}) and be > 0"
+                )
+            if weight.dtype != x.dtype or weight.device != x.device:
+                return ValidationResult.fail(w_name, "must match x's dtype and device")
+            if weight.shape[0] == 0 or weight.stride(1) != 1:
+                return ValidationResult.fail(w_name, "must be non-empty with contiguous rows")
+            bias = kwargs.get(b_name)
+            if bias is not None:
+                if bias.dtype != x.dtype or bias.device != x.device:
+                    return ValidationResult.fail(b_name, "must match x's dtype and device")
+                if bias.shape[0] != weight.shape[0] or bias.stride(0) != 1:
+                    return ValidationResult.fail(
+                        b_name, f"must be contiguous with {w_name}.shape[0] elements"
+                    )
+        if x.numel() // x.shape[-1] < MIN_M:
+            return ValidationResult.fail("x", f"fewer than {MIN_M} rows; left to the unfused path")
+        return ValidationResult.ok()
+
+    def _linear_geglu_call_rule(kwargs):
+        if kwargs.get("approximate", "none") not in ("none", "tanh"):
+            return ValidationResult.fail("approximate", "must be 'none' or 'tanh'")
+        return _linear_act_operands(kwargs, (("weight", "bias"),))
+
+    def _linear_swiglu_call_rule(kwargs):
+        w1, w3 = kwargs.get("w1"), kwargs.get("w3")
+        if w1 is not None and w3 is not None and w1.shape != w3.shape:
+            return ValidationResult.fail("w3", "must have w1's shape")
+        return _linear_act_operands(kwargs, (("w1", "b1"), ("w3", "b3")))
 
     cuda_devices = frozenset({"cuda"})
     triton_devices = frozenset({"cuda", "xpu"})
@@ -336,6 +382,44 @@ def _build_constraints() -> dict:
         # tl.dot needs Ampere matrix capability for the non-IEEE float paths
         min_compute_capability=(8, 0),
         call_rules=(_na3d_call_rule,),
+    )
+    half_floats = frozenset({torch.float16, torch.bfloat16})
+    glu_weight = ParamConstraint(
+        dtypes=half_floats,
+        shape_rules=(ExactDims(2), DivisibleBy(0, GLU_N_MULTIPLE), DivisibleBy(1, K_MULTIPLE)),
+    )
+    glu_bias = ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(1),))
+    out["linear_geglu"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=half_floats),
+            # packed [h | gate]: each half must tile evenly
+            "weight": ParamConstraint(
+                dtypes=half_floats,
+                shape_rules=(
+                    ExactDims(2),
+                    DivisibleBy(0, 2 * GLU_N_MULTIPLE),
+                    DivisibleBy(1, K_MULTIPLE),
+                ),
+            ),
+            "bias": glu_bias,
+            "approximate": ParamConstraint(dtypes=frozenset({str})),
+        },
+        default_devices=cuda_devices,
+        # fp16 / bf16 tl.dot
+        min_compute_capability=(8, 0),
+        call_rules=(_linear_geglu_call_rule,),
+    )
+    out["linear_swiglu"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=half_floats),
+            "w1": glu_weight,
+            "w3": glu_weight,
+            "b1": glu_bias,
+            "b3": glu_bias,
+        },
+        default_devices=cuda_devices,
+        min_compute_capability=(8, 0),
+        call_rules=(_linear_swiglu_call_rule,),
     )
     return out
 
