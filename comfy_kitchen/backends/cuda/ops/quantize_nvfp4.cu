@@ -62,9 +62,7 @@ quantize_nvfp4_kernel(const Input *input, const float *global_scale,
     for (int i = 0; i < V / 2; ++i) {
       const float a = float(values.values[2 * i]) * encode;
       const float b = float(values.values[2 * i + 1]) * encode;
-      packed.pairs[i] = __nv_cvt_float2_to_fp4x2(HiFirst ? make_float2(b, a)
-                                                         : make_float2(a, b),
-                                                 __NV_E2M1, cudaRoundNearest);
+      packed.pairs[i] = pack_fp4x2<HiFirst>(a, b);
     }
     if constexpr (V == 16)
       reinterpret_cast<uint64_t *>(output)[chunk] = packed.word;

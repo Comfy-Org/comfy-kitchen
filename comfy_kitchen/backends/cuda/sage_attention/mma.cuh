@@ -66,6 +66,15 @@ namespace mma {
 #define RUNTIME_ASSERT(x) assert(0 && x)
 #endif
 
+__device__ __forceinline__ void mma_bf16(float* d, const uint32_t* a, const uint32_t* b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+
 enum class MMAMode {
   kInit = 0U,
   kInplaceUpdate = 1U,

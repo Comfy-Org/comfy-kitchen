@@ -18,6 +18,7 @@
 #define COMFY_FLOAT_UTILS_CUH_
 
 #include <cstdint>
+#include <cstring>
 #include <type_traits>
 
 #include <cuda.h>
@@ -29,6 +30,13 @@
 #endif
 
 namespace comfy {
+
+__device__ __forceinline__ uint32_t pack_bf2(float lo, float hi) {
+  const __nv_bfloat162 pair = __floats2bfloat162_rn(lo, hi);
+  uint32_t bits;
+  memcpy(&bits, &pair, sizeof(bits));
+  return bits;
+}
 
 __device__ __forceinline__ float warp_reduce_fmax(float v) {
 #pragma unroll
@@ -126,30 +134,28 @@ template<typename IType>
 }
 #pragma nv_diag_default 1056
 
-// Store 2 FP4 values (1 __nv_fp4x2)
 // hi_first=true: val0 in high nibble, val1 in low nibble (default, matches cuBLAS convention)
 // hi_first=false: val0 in low nibble, val1 in high nibble
-template<typename OType, bool hi_first = true>
-__forceinline__ __device__ void store_fp4x2(OType* output, size_t idx, float val0, float val1) {
-    float2 args = hi_first ? float2{val1, val0} : float2{val0, val1};
-    *reinterpret_cast<__nv_fp4x2_storage_t*>(&output[idx]) =
-        __nv_cvt_float2_to_fp4x2(args, __NV_E2M1, cudaRoundNearest);
+template<bool hi_first = true>
+__forceinline__ __device__ uint8_t pack_fp4x2(float val0, float val1) {
+    float2 pair = hi_first ? make_float2(val1, val0) : make_float2(val0, val1);
+    return __nv_cvt_float2_to_fp4x2(pair, __NV_E2M1, cudaRoundNearest);
 }
 
-// Store 4 FP4 values (2 __nv_fp4x2) using single store
 template<typename OType, bool hi_first = true>
-__forceinline__ __device__ void store_fp4x4(OType* output, size_t idx, float val0, float val1, float val2, float val3) {
-    union {
-        uint16_t u16;
-        __nv_fp4x2_storage_t fp4x2[2];
-    } packed;
+__forceinline__ __device__ void store_fp4x2(OType* output, size_t idx, float val0, float val1) {
+    *reinterpret_cast<__nv_fp4x2_storage_t*>(&output[idx]) = pack_fp4x2<hi_first>(val0, val1);
+}
 
-    float2 args0 = hi_first ? float2{val1, val0} : float2{val0, val1};
-    float2 args1 = hi_first ? float2{val3, val2} : float2{val2, val3};
-    packed.fp4x2[0] = __nv_cvt_float2_to_fp4x2(args0, __NV_E2M1, cudaRoundNearest);
-    packed.fp4x2[1] = __nv_cvt_float2_to_fp4x2(args1, __NV_E2M1, cudaRoundNearest);
+template<bool hi_first = true>
+__forceinline__ __device__ uint16_t pack_fp4x4(float a, float b, float c, float d) {
+    return pack_fp4x2<hi_first>(a, b) | (uint16_t(pack_fp4x2<hi_first>(c, d)) << 8);
+}
 
-    *reinterpret_cast<uint16_t*>(&output[2*idx]) = packed.u16;
+// Store 4 FP4 values (2 __nv_fp4x2) using a single store.
+template<typename OType, bool hi_first = true>
+__forceinline__ __device__ void store_fp4x4(OType* output, size_t idx, float a, float b, float c, float d) {
+    *reinterpret_cast<uint16_t*>(&output[2*idx]) = pack_fp4x4<hi_first>(a, b, c, d);
 }
 
 // cuBLAS swizzled scale factor layout offset calculation

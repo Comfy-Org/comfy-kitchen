@@ -20,6 +20,7 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `na3d`                      | ✓     | ✓    | ✓      | ✓   |     |
 | `na2d`                      | ✓     | ✓    | ✓      | ✓   |     |
 | `sol_attn`                  | ✓     | ✓    |        | ✓   |     |
+| `deco_attention`            | SDPA  | ✓    |        |     |     |
 | `int8_attention`            |       | ✓    |        | ✓   |     |
 | `apply_rope`                | ✓     | ✓    | ✓      | ✓   | ✓*  |
 | `apply_rope1`               | ✓     | ✓    | ✓      | ✓   | ✓*  |
@@ -62,6 +63,18 @@ Ascend support for `quantize_and_rotate_rowwise` requires
 `convrot_w4a4_linear` requires only `torch_npu.npu_quant_matmul`.
 These capabilities are registered only when the
 corresponding operator is available.
+
+## DeCo FP4 attention
+
+`comfy_kitchen.deco_attention(q, k, v)` runs rank-32 NVFP4 attention on SM120
+and SM121 for batch-one dense BF16 inference with 128 channels per head.
+Other shapes and SDPA modes use PyTorch. Check native device support with
+`comfy_kitchen.deco_attention_is_available(device)`. [Supported BHND shapes](comfy_kitchen/backends/cuda/deco_attention/core_shapes.inc)
+
+Optional integer `token_tags` of shape `[N]` or `[1,N]` balance compensation
+samples between image/video (zero) and other modalities (positive). Negative
+tags exclude tokens from basis sampling. For CUDA graphs, warm up once per
+native sequence length and tag mode.
 
 ## Huawei Ascend backend
 

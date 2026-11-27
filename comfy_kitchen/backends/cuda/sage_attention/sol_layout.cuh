@@ -26,6 +26,7 @@
 #include <cuda_fp16.h>
 #include <cstdint>
 
+#include "../float_utils.cuh"
 #include "math.cuh"
 #include "mma.cuh"
 
@@ -296,15 +297,6 @@ __device__ __forceinline__ void mma_u8s8(int32_t* d, const uint32_t* a, const ui
 #endif
 }
 
-__device__ __forceinline__ void mma_bf16(float* d, const uint32_t* a, const uint32_t* b) {
-#if SOL_SM80
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-#endif
-}
-
 // ---- Shared 64-key tile body (exact kernel and token passes) ----
 // Staged K tile (64 x 128 int8) and V^T tile (128 x 64 int8), XOR-swizzled 16-byte
 // chunks. One warp owns 16 rows: g = lane >> 2 picks rows g and g + 8, qd = lane & 3
@@ -456,10 +448,7 @@ __device__ __forceinline__ void tile_softmax_pv(float (&p_val)[TILE_NKT][4], flo
     }
 }
 
-__device__ __forceinline__ uint32_t pack_bf2(float lo, float hi) {
-    __nv_bfloat162 p = __floats2bfloat162_rn(lo, hi);
-    return *reinterpret_cast<uint32_t*>(&p);
-}
+using comfy::pack_bf2;
 
 // ---- cp.async ----
 

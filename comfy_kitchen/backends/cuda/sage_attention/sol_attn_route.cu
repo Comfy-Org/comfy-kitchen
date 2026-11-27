@@ -273,7 +273,7 @@ __global__ void __launch_bounds__(NTHREADS) sol_route_kernel(
                 uint32_t vb[2];
                 vb[0] = *reinterpret_cast<const uint32_t*>(vcol + kk * 16 + qd * 2);
                 vb[1] = *reinterpret_cast<const uint32_t*>(vcol + kk * 16 + qd * 2 + 8);
-                mma_bf16(o_acc[nt], pa[kk], vb);
+                mma::mma_bf16(o_acc[nt], pa[kk], vb);
             }
         }
     }
