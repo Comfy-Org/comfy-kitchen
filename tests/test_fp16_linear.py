@@ -135,3 +135,36 @@ class TestFp16Linear:
         got = ck.fp16_linear(x, w, None).float()
         ref = torch.nn.functional.linear(x, w, None).float()
         assert rel_err(got, ref) < fp16_accum_tol(k)
+
+
+class TestSm75CapabilityGate:
+    """The GEMM kernels are cutlass::arch::Sm80 (cp.async multistage); on sm_75 the
+    registry and the direct entry must both decline so callers fall back to torch."""
+
+    def _gemm_kwargs(self):
+        x = torch.randn(1797, 2048, dtype=torch.float16, device="cuda")
+        weight = torch.randn(2048, 2048, dtype=torch.float16, device="cuda") * 0.02
+        return {"x": x, "weight": weight, "bias": None, "residual": None, "residual_scale": None}
+
+    def test_registry_routes_to_eager_on_sm75(self, monkeypatch, seed, cuda_available):
+        if not cuda_available:
+            pytest.skip("CUDA required")
+        monkeypatch.setitem(ck.registry.__dict__, "_compute_capability", (7, 5))
+        assert ck.registry.get_capable_backend("fp16_linear", self._gemm_kwargs()) == "eager"
+
+    def test_registry_routes_to_cuda_on_sm80_plus(self, seed, cuda_available):
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        if torch.cuda.get_device_capability() < (8, 0):
+            pytest.skip("requires an sm_80+ device")
+        assert ck.registry.get_capable_backend("fp16_linear", self._gemm_kwargs()) == "cuda"
+
+    def test_direct_entry_falls_back_to_torch_on_sm75(self, monkeypatch, seed, cuda_available):
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
+        from comfy_kitchen.backends import cuda as cuda_backend
+        monkeypatch.setitem(cuda_backend._device_capability_cache, 0, (7, 5))
+        x = torch.randn(37, 264, dtype=torch.float16, device="cuda")
+        weight = torch.randn(64, 264, dtype=torch.float16, device="cuda")
+        got = cuda_backend.fp16_linear(x, weight)
+        assert torch.equal(got, torch.nn.functional.linear(x, weight))
