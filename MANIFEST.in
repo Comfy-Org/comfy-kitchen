@@ -1,2 +1,7 @@
 include comfy_kitchen/backends/hip/CMakeLists.txt
 recursive-include comfy_kitchen/backends/hip *.cpp *.h *.hip *.in *.json
+include comfy_kitchen/backends/cuda/CMakeLists.txt
+recursive-include comfy_kitchen/backends/cuda *.cpp *.cu *.cuh *.h *.in *.inc
+include third_party/cutlass/LICENSE.txt third_party/flash-attention/LICENSE
+recursive-include third_party/cutlass/include *.h *.hpp *.inl
+recursive-include third_party/flash-attention/csrc/flash_attn/src *.h *.cuh

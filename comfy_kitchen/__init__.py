@@ -11,6 +11,8 @@ from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn
 from .backends.cuda import memmove_ as _memmove_
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
+from .deco_attention import deco_attention
+from .deco_attention import is_available as deco_attention_is_available
 from .exceptions import (
     BackendError,
     BackendNotFoundError,
@@ -72,6 +74,8 @@ __all__ = [
     "group_norm_stats3d",
     "rms_adaln",
     # Attention
+    "deco_attention",
+    "deco_attention_is_available",
     "PrequantizedInt8Attention",
     "int8_attention",
     "int8_attention_from_prequantized",

@@ -4784,10 +4784,12 @@ bool deltanet_conv_deferred(
 }
 
 void register_int8_decode(nb::module_& m);
+void register_deco_attention(nb::module_& m);
 
 NB_MODULE(_C, m) {
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
     register_int8_decode(m);
+    register_deco_attention(m);
     
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8,
           "Quantize to FP8 using nanobind ndarrays",
