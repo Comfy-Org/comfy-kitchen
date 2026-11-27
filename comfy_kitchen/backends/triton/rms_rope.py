@@ -34,9 +34,10 @@ def rms_rope_kernel(
     block_size: tl.constexpr,
     split_half: tl.constexpr,
 ):
-    batch_idx = tl.program_id(0)
+    # seq_len goes on axis 0: gridDim.y/z cap at 65535, gridDim.x does not.
+    seq_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
-    seq_idx = tl.program_id(2)
+    batch_idx = tl.program_id(2)
 
     n_pairs = head_dim // 2
     offsets = tl.arange(0, block_size)
@@ -127,7 +128,7 @@ def _rms_rope(
     }
     out = x if inplace else torch.empty_like(x)
     block_size = triton.next_power_of_2(head_dim // 2)
-    grid = (batch, num_heads, seq_len)
+    grid = (seq_len, num_heads, batch)
     rms_rope_kernel[grid](
         x,
         freqs_cis,
