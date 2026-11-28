@@ -209,6 +209,39 @@ def _handle_nvfp4_mm(qt, args, kwargs):
         return torch.mm(*dequantize_args(args))
 
 
+@register_layout_op(torch.ops.aten.addmm.default, TensorCoreNVFP4Layout)
+def _handle_nvfp4_addmm(qt, args, kwargs):
+    """Fuse the default addmm form of linear when the native bias is safe."""
+    bias, a, b = args
+    if (
+        not kwargs
+        and all(isinstance(t, QuantizedTensor) and t._layout_cls == "TensorCoreNVFP4Layout" for t in (a, b))
+        and not isinstance(bias, QuantizedTensor)
+        and a.ndim == b.ndim == 2
+        and not a._params.transposed and b._params.transposed
+        and a.shape[1] == b.shape[0]
+        and bias.ndim == 1 and bias.is_contiguous()
+        and bias.device == a.device == b.device
+        and bias.dtype == a.dtype == b.dtype
+        and bias.dtype in (torch.float16, torch.bfloat16)
+        # cuBLAS consumes the physical output width, including padding.
+        and bias.shape[0] == b.shape[1] == b._qdata.shape[0]
+    ):
+        try:
+            result = ck.scaled_mm_nvfp4(
+                a._qdata, b._qdata,
+                tensor_scale_a=a._params.scale,
+                tensor_scale_b=b._params.scale,
+                block_scale_a=a._params.block_scale,
+                block_scale_b=b._params.block_scale,
+                bias=bias, out_dtype=a.dtype,
+            )
+            return _slice_to_original_shape(result, a.shape[0], b.shape[1])
+        except (RuntimeError, TypeError):
+            pass
+    return torch.addmm(*dequantize_args(args), **dequantize_args(kwargs))
+
+
 @register_layout_op(torch.ops.aten.linear.default, TensorCoreNVFP4Layout)
 def _handle_nvfp4_linear(qt, args, kwargs):
     """NVFP4 linear: output = input @ weight.T + bias
